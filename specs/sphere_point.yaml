@@ -1,0 +1,10 @@
+﻿charges:
+  - type: point
+    q: 1.0
+    pos: [0.0, 0.0, 2.0]
+conductors:
+  - type: sphere
+    center: [0.0, 0.0, 0.0]
+    radius: 1.0
+domain:
+  bbox: [[-2,-2,-2],[2,2,4]]

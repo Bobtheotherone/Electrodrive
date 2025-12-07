@@ -1,0 +1,2 @@
+file,count,mean_rel_l2_error,max_rel_l2_error
+local_rescaling.jsonl,8,0.0,0.0

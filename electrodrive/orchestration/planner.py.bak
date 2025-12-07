@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+from electrodrive.orchestration.parser import CanonicalSpec
+from electrodrive.utils.logging import JsonlLogger
+
+
+def _classify_moi_candidate(spec: CanonicalSpec) -> bool:
+    """Return True if geometry is a candidate for method-of-images routing."""
+    ctypes = sorted({c.get("type") for c in spec.conductors})
+    n_cond = len(spec.conductors)
+    if not spec.charges:
+        return False
+    charge_types = {ch.get("type") for ch in spec.charges}
+    if charge_types - {"point"}:
+        return False
+    # Single plane
+    if ctypes == ["plane"] and n_cond == 1:
+        return True
+    # Single sphere
+    if ctypes == ["sphere"] and n_cond == 1:
+        return True
+    # Plane + sphere combo
+    if ctypes == ["plane", "sphere"] and n_cond == 2:
+        return True
+    # Wedge placeholder (will route via bem for now)
+    if "wedge" in ctypes:
+        return True
+    return False
+
+
+def _has_conductors(spec: CanonicalSpec) -> bool:
+    return bool(spec.conductors)
+
+
+def choose_mode(spec: CanonicalSpec, requested: str, logger: JsonlLogger) -> str:
+    """
+    Heuristic planner with rationale logging.
+
+    New behavior (Step 3):
+    - Compute a 'selected' mode that may be 'moi' or 'operator'.
+    - Always execute existing safe modes ('analytic', 'bem', 'pinn') so that
+      numerical behavior is unchanged.
+    - Log both selected and executed values plus rationale.
+    """
+    # 1) Honor explicit user choice (backwards-compatible).
+    if requested != "auto":
+        logger.info(
+            "Planner honoring user-requested mode.",
+            rationale="user_override",
+            selected=requested,
+            executed=requested,
+        )
+        return requested
+
+    # 2) If dielectrics present, default to PINN as before.
+    if spec.dielectrics:
+        selected = "pinn"
+        executed = "pinn"
+        logger.info(
+            "Planner selected mode.",
+            rationale="dielectrics_present",
+            selected=selected,
+            executed=executed,
+        )
+        return executed
+
+    ctypes = sorted({c.get("type") for c in spec.conductors})
+    charges = sorted({c.get("type") for c in spec.charges})
+    only_points = (not charges) or (charges == ["point"])
+
+    # 3) Analytic coverage (unchanged logic, but logged with selected/executed).
+    if only_points:
+        if ctypes == ["plane"] and len(spec.conductors) == 1:
+            selected = "analytic"
+            executed = "analytic"
+            logger.info(
+                "Planner selected mode.",
+                rationale="single_plane_images",
+                selected=selected,
+                executed=executed,
+            )
+            return executed
+        if ctypes == ["plane"] and len(spec.conductors) == 2:
+            zs = [c.get("z") for c in spec.conductors]
+            if None not in zs and zs[0] != zs[1]:
+                selected = "analytic"
+                executed = "analytic"
+                logger.info(
+                  S "Planner selected mode.",
+                    rationale="two_parallel_plates_lattice",
+                    selected=selected,
+  s                 executed=executed,
+                )
+                return executed
+        if ctypes == ["sphere"] and len(spec.conductors) == 1:
+            selected = "analytic"
+            executed = "analytic"
+            logger.info(
+                "Planner selected mode.",
+                rationale="sphere_kelvin_inversion",
+                selected=selected,
+                executed=executed,
+            )
+            return executed
+
+    # 4) New routing hints (moi/operator) but executed via safe fallbacks.
+    if _has_conductors(spec):
+        if _classify_moi_candidate(spec):
+            # Hint MOI but execute BEM for now.
+            selected = "moi"
+            executed = "bem"
+            rationale = "moi_candidate_geometry_routed_to_bem"
+s       else:
+            # Hint operator-style solver but execute BEM.
+            selected = "operator"
+            executed = "bem"
+            rationale = "general_conductor_geometry_routed_to_bem"
+        logger.info(
+            "Planner selected mode.",
+            rationale=rationale,
+            selected=selected,
+            executed=executed,
+        )
+        return executed
+
+    # 5) No conductors: fallback to PINN (unchanged).
+    selected = "operator"
+    executed = "pinn"
+    logger.info(
+        "Planner selected mode.",
+        rationale="no_conductors_routed_to_pinn",
+        selected=selected,
+        executed=executed,
+    )
+    return executed

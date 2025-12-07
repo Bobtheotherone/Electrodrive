@@ -1,0 +1,162 @@
+﻿# electrodrive/utils/config.py
+
+from __future__ import annotations
+from dataclasses import dataclass
+import math
+
+# -------------------------
+# Physics constants (SI)
+# -------------------------
+EPS_0: float = 8.854187817e-12
+K_E: float = 1.0 / (4.0 * math.pi * EPS_0)  # Coulomb's constant
+
+# -------------------------
+# Certification thresholds
+# (used by core/certify.py and CLI gating)
+# -------------------------
+EPS_BC: float = 1e-7        # boundary condition linf tolerance
+EPS_DUAL: float = 1e-8      # dual-route boundary L2 tolerance
+EPS_PDE: float = 1e-6       # Laplacian residual linf (dimensionless)
+EPS_ENERGY: float = 1e-3      # relative diff between energy routes
+EPS_MEAN_VAL: float = 1e-6    # informational mean-value check
+
+# -------------------------
+# Defaults (CLI / planners)
+# -------------------------
+DEFAULT_SEED: int = 42
+DEFAULT_SOLVE_DTYPE: str = "float64"
+
+# -------------------------
+# Solver configuration dataclasses
+# -------------------------
+
+
+@dataclass
+class BEMConfig:
+    """
+    Configuration for the BEM solver.
+
+    Notes:
+      - Keep the first three fields (use_gpu, fp64, initial_h) compatible
+        with earlier positional construction in the codebase.
+      - Extra fields have safe defaults and are typically consumed via kwargs.
+    """
+    use_gpu: bool = True
+    fp64: bool = False
+    # Start a bit finer to avoid early plateaus and improve BC/Dual
+    initial_h: float = 0.2
+
+    # Refinement / solve knobs
+    max_refine_passes: int = 3
+    # Slightly looser (still tighter than BC gate), to reduce iterations
+    gmres_tol: float = 5e-8
+    gmres_maxiter: int = 2000
+    # Larger restarted Krylov basis => more VRAM, fewer restarts
+    gmres_restart: int = 256
+    # Less chatty progress
+    gmres_log_every: int = 10
+
+    # VRAM autotune knobs (matrix-free tiling)
+    vram_autotune: bool = True
+    # Fractional cap (fallback if target_peak_gb is unset). Be aggressive.
+    target_vram_fraction: float = 0.95
+    # Hard cap if device query fails
+    vram_cap_gb: float = 24.0
+    # Ask solver to push tiles up toward this peak allocation
+    # (kept for back-compat; used only for autotune heuristics)
+    target_peak_gb: float = 20.0
+    # Safety bounds for tile sizes
+    min_tile: int = 1024
+    max_tile: int = 1 << 18  # 262,144
+    # Explicit override (0 => autotune)
+    tile_size: int = 0
+    # NEW: how much of the remaining budget to devote to source/target tiles.
+    # Smaller divisor => bigger tiles (more VRAM usage).
+    tile_mem_divisor: float = 2.0
+
+
+@dataclass
+class MOIConfig:
+    """
+    Configuration surface for future Method-of-Images planner/solver.
+
+    Currently unused in core execution; defaults are safe no-ops.
+    """
+
+    max_program_len: int = 16
+    parsimony_lambda: float = 0.0
+    enabled_ops: tuple[str, ...] = (
+        "Reflect",
+        "KelvinInvert",
+        "Translate",
+        "Rotate",
+        "Scale",
+        "Stop",
+    )
+
+
+@dataclass
+class OPConfig:
+    """
+    Configuration surface for future Operator (surrogate) models.
+
+    Fields are not consumed by the core solver yet.
+    """
+
+    fno_width: int = 64
+    fno_layers: int = 4
+    spectral_modes: int = 16
+    latent_resolution: int = 32
+    use_amp: bool = False
+    use_compile: bool = False
+
+
+@dataclass
+class CERTConfig:
+    """Configuration surface for future certification tolerances."""
+
+    max_principle_tol: float = 1e-6
+
+
+@dataclass
+class PINNConfig:
+    """
+    Minimal PINN configuration so the CLI and planners can import it even
+    when running in BEM mode. Fields are conservative defaults and should
+    be sufficient for fallback / simple runs.
+    """
+    use_gpu: bool = True
+    fp64: bool = False
+
+    # Network / training hyperparameters (safe, generic defaults)
+    width: int = 64
+    depth: int = 5
+    epochs: int = 20000
+    batch_size: int = 65536
+    lr: float = 1e-3
+
+    # Loss weights (normalized; tweak as needed in callers)
+    residual_weight: float = 1.0
+    bc_weight: float = 1.0
+    data_weight: float = 0.0
+
+
+# Public exports
+__all__ = [
+    # constants
+    "EPS_0",
+    "K_E",
+    "EPS_BC",
+    "EPS_DUAL",
+    "EPS_PDE",
+    "EPS_ENERGY",
+    "EPS_MEAN_VAL",
+    "DEFAULT_SEED",
+    "DEFAULT_SOLVE_DTYPE",
+    # configs
+    "BEMConfig",
+    "PINNConfig",
+    "MOIConfig",
+    "OPConfig",
+    "CERTConfig",
+]

@@ -1,0 +1,1 @@
+# viz subpackage (ai_solve overlays, core visualizations live in CLI helpers)

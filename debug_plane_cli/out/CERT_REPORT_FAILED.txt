@@ -1,0 +1,26 @@
+Electrostatic Discovery Engine — Certification Report
+============================================================
+Mode: bem  Run ID: 100d5181-6c55-45f3-8a03-bce6671e4084
+Solve time: 10.886 s
+DoF: 3200
+GMRES Iters: 1
+GMRES Success: True
+Governance: skipped
+
+Gating mode: STANDARD
+
+Gates:
+ BC   : 7.975e+01 <= 1.000e-06 [FAIL]
+ Dual : 1.730e+01 <= 1.000e-06 [FAIL]
+ PDE  : 0.000e+00 <= 1.000e-05 [PASS]
+ Mean : 1.060e+00 <= 1.000e-05 [FAIL]
+ Energy: 4.950e-08 <= 1.000e-05 [PASS]
+  Route A: 4.266658e-08 J (charge_minus_half_q_phi_induced)
+  Route B: 4.266657e-08 J (surface_minus_half_sigma_phi_free_plane_patch)
+  Patch L: 8.000 (finite plane extent)
+ Max principle margin: 0.000000e+00
+ Reciprocity deviation: 0.000000e+00
+
+OVERALL: FAILED
+
+See metrics.json and verification_report.json for details.

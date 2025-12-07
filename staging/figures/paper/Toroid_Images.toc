@@ -1,0 +1,27 @@
+\contentsline {section}{\numberline {1}Introduction}{2}{section.1}%
+\contentsline {section}{\numberline {2}Background and theory}{4}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Green's functions and image systems}{4}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Toroidal coordinates and harmonics}{4}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Boundary integral formulation and infinite rank}{5}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Inner-rim boundary layers}{6}{subsection.2.4}%
+\contentsline {section}{\numberline {3}Numerical methods}{6}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Geometry and axis specification}{6}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Boundary element discretisation}{6}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Image-basis primitives}{7}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}Discovery pipeline: from random seeds to high-resolution trial}{7}{subsection.3.4}%
+\contentsline {paragraph}{Random and modes-enriched exploration.}{7}{subsection.3.4}%
+\contentsline {paragraph}{Local geometry exploration.}{8}{subsection.3.4}%
+\contentsline {paragraph}{High-resolution BEM refinement and FMM sanity checks.}{8}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}Axis sweep and weight data sets}{8}{subsection.3.5}%
+\contentsline {subsection}{\numberline {3.6}Weight SVD and low-rank reconstructions}{9}{subsection.3.6}%
+\contentsline {section}{\numberline {4}Results}{9}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Discovered geometry and baseline comparison}{9}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Axis sweep behaviour}{10}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Singular values of the axis weight map}{10}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Rank truncation and BEM error}{11}{subsection.4.4}%
+\contentsline {section}{\numberline {5}Discussion}{11}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Reconciling infinite operator rank with low-rank axis behaviour}{11}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Role of geometry and inner-rim primitives}{12}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Implications for image-system design}{12}{subsection.5.3}%
+\contentsline {section}{\numberline {6}Conclusion and outlook}{13}{section.6}%
+\contentsline {section}{References}{21}{section*.13}%

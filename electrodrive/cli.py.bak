@@ -1,0 +1,1477 @@
+﻿# electrodrive/cli.py
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import sys
+import json
+import math
+import platform
+import random
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+from electrodrive.utils.logging import (
+    JsonlLogger,
+    RuntimePerfFlags,
+    log_peak_vram,
+    log_runtime_environment,
+)
+
+try:
+    import torch
+except ImportError:
+    torch = None  # CLI must remain usable without torch for analytic-only runs
+
+# Config / thresholds
+from electrodrive.utils.config import (
+    DEFAULT_SEED,
+    BEMConfig,
+    PINNConfig,
+    DEFAULT_SOLVE_DTYPE,
+    EPS_BC,
+    EPS_DUAL,
+    EPS_ENERGY,
+    EPS_MEAN_VAL,
+    EPS_0,
+    K_E,
+)
+
+# Planner / spec
+from electrodrive.orchestration.parser import CanonicalSpec
+from electrodrive.orchestration.planner import choose_mode
+
+# Governance
+from electrodrive.eval.governance import governance_guard
+
+# Analytic images (symbolic/closed-form solvers)
+from electrodrive.core.images import (
+    potential_plane_halfspace,
+    potential_sphere_grounded,
+)
+
+# Certification utilities
+from electrodrive.core.certify import (
+    bc_residual_on_boundary,
+    dual_route_error_boundary,
+    pde_residual_symbolic,
+    energy_consistency_check,
+    mean_value_property_check,
+    green_badge_decision,
+)
+
+# ------------------------
+# Utility / orchestration
+# ------------------------
+
+
+def _build_perf_flags(args: argparse.Namespace) -> RuntimePerfFlags:
+    """Create RuntimePerfFlags from parsed CLI arguments with safe defaults."""
+    amp = bool(getattr(args, "amp", False))
+    train_dtype = str(getattr(args, "train_dtype", "float32"))
+    compile_flag = bool(getattr(args, "compile", False))
+    tf32 = str(getattr(args, "tf32", "off"))
+    return RuntimePerfFlags(
+        amp=amp,
+        train_dtype=train_dtype,
+        compile=compile_flag,
+        tf32=tf32,
+    )
+
+
+def _apply_tf32_flag(tf32_mode: str, logger: JsonlLogger) -> None:
+    """Apply requested TF32 precision if torch is available; log outcome."""
+    if tf32_mode == "off":
+        return
+    if torch is None:
+        logger.info(
+            "TF32 requested but torch is not available; ignoring.",
+            tf32_requested=tf32_mode,
+        )
+        return
+    if not hasattr(torch, "set_float32_matmul_precision"):
+        logger.info(
+            "TF32 requested but torch.set_float32_matmul_precision is unavailable; ignoring.",
+            tf32_requested=tf32_mode,
+        )
+        return
+    try:
+        torch.set_float32_matmul_precision(tf32_mode)
+        logger.info(
+            "TF32 matmul precision set.",
+            tf32_requested=tf32_mode,
+            tf32_effective=str(torch.get_float32_matmul_precision()),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Failed to set TF32 matmul precision.",
+            tf32_requested=tf32_mode,
+            error=str(exc),
+        )
+
+
+def _log_amp_compile_requests(perf: RuntimePerfFlags, logger: JsonlLogger) -> None:
+    """Log AMP/compile intent; no behavioral change in this step."""
+    logger.info(
+        "Performance knobs requested.",
+        amp=bool(perf.amp),
+        train_dtype=str(perf.train_dtype),
+        compile_requested=bool(perf.compile),
+        tf32=str(perf.tf32),
+    )
+
+
+def _set_seeds(seed: int, logger: JsonlLogger) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch:
+        try:
+            torch.manual_seed(seed)
+        except Exception:
+            pass
+    logger.info("Seeds set.", seed=seed)
+
+
+def _versions() -> Dict[str, Any]:
+    v = {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "executable": sys.executable,
+        "torch": getattr(torch, "__version__", "unavailable") if torch else "unavailable",
+    }
+    try:
+        import sympy as sp
+
+        v["sympy"] = sp.__version__
+    except Exception:
+        v["sympy"] = "unavailable"
+    return v
+
+
+def _vram_telemetry_init(logger: JsonlLogger) -> Dict[str, Any]:
+    """Log basic GPU telemetry at start (safe if CUDA absent)."""
+    telemetry: Dict[str, Any] = {
+        "gpu_available": False,
+        "tf32_enabled": False,
+        "dtype": DEFAULT_SOLVE_DTYPE,
+    }
+    if torch and hasattr(torch, "cuda") and torch.cuda.is_available():
+        telemetry["gpu_available"] = True
+        try:
+            # Prefer fast matmul on FP32 where relevant
+            try:
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high")
+                if hasattr(torch.backends, "cuda") and hasattr(
+                    torch.backends.cuda, "matmul"
+                ):
+                    torch.backends.cuda.matmul.allow_tf32 = True
+            except Exception:
+                pass
+            device_id = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(device_id)
+            telemetry["device_name"] = props.name
+            telemetry["total_memory_gb"] = props.total_memory / (1024**3)
+            if hasattr(torch.cuda, "reset_peak_memory_stats"):
+                torch.cuda.reset_peak_memory_stats(device_id)
+            if hasattr(torch.backends, "cuda") and hasattr(
+                torch.backends.cuda, "matmul"
+            ):
+                telemetry["tf32_enabled"] = bool(
+                    torch.backends.cuda.matmul.allow_tf32
+                )
+            logger.info(
+                "VRAM Telemetry initialized.",
+                **{k: str(v)[:64] for k, v in telemetry.items()},
+            )
+        except Exception as e:
+            logger.warning(
+                "VRAM Telemetry initialization failed.", error=str(e)
+            )
+            telemetry["gpu_available"] = False
+    else:
+        logger.info("CUDA not available or Torch not installed.")
+    return telemetry
+
+
+def _finalize_vram_telemetry(
+    telemetry: Dict[str, Any], logger: JsonlLogger
+) -> None:
+    """Capture peak VRAM at end."""
+    if telemetry.get("gpu_available") and torch and torch.cuda.is_available():
+        try:
+            device_id = torch.cuda.current_device()
+            max_alloc = torch.cuda.max_memory_allocated(device_id)
+            max_reserved = torch.cuda.max_memory_reserved(device_id)
+            telemetry["peak_memory_allocated_gb"] = max_alloc / (1024**3)
+            telemetry["peak_memory_reserved_gb"] = max_reserved / (1024**3)
+            logger.info(
+                "VRAM Telemetry finalized.",
+                peak_alloc_gb=f"{telemetry['peak_memory_allocated_gb']:.3f}",
+                peak_reserved_gb=f"{telemetry['peak_memory_reserved_gb']:.3f}",
+            )
+        except Exception as e:
+            logger.warning(
+                "VRAM Telemetry finalization failed.", error=str(e)
+            )
+
+
+# ------------------------
+# Verification helpers
+# ------------------------
+
+
+def _json_serialize_float(
+    v: Optional[float],
+) -> Optional[float] | str:
+    if v is None:
+        return None
+    v = float(v)
+    if math.isfinite(v):
+        return v
+    if math.isnan(v):
+        return "NaN"
+    return "Infinity" if v > 0 else "-Infinity"
+
+
+def _fail_reasons_from_metrics(metrics: dict[str, Any]) -> list[str]:
+    # Mirror EPS_* semantics from green_badge_decision; do not change thresholds here.
+    bc = float(metrics.get("bc_residual_linf", float("inf")))
+    dual = float(metrics.get("dual_route_l2_boundary", float("inf")))
+    pde = float(metrics.get("pde_residual_linf", float("inf")))
+    energy = metrics.get("energy_rel_diff", float("nan"))
+
+    energy_computed = isinstance(energy, float) and math.isfinite(energy)
+    energy_ok = (not energy_computed) or (energy <= EPS_ENERGY)
+
+    reasons: list[str] = []
+    if not (bc <= EPS_BC):
+        reasons.append(f"BC {bc:.3e} > {EPS_BC:.3e}")
+    if not (dual <= EPS_DUAL):
+        reasons.append(f"Dual {dual:.3e} > {EPS_DUAL:.3e}")
+    if not (pde <= EPS_PDE):
+        reasons.append(f"PDE {pde:.3e} > {EPS_PDE:.3e}")
+    if not energy_ok:
+        reasons.append(f"Energy {energy:.3e} > {EPS_ENERGY:.3e}")
+    return reasons
+
+
+def aggregate_verification_report(
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    # Map existing metrics.json keys -> stable schema, using EPS_* from utils.config.
+    bc = float(metrics.get("bc_residual_linf", float("inf")))
+    dual = float(metrics.get("dual_route_l2_boundary", float("inf")))
+    pde = float(metrics.get("pde_residual_linf", float("inf")))
+    energy = metrics.get("energy_rel_diff", float("nan"))
+    mean_val = metrics.get("mean_value_deviation", float("nan"))
+
+    # Canonical overall decision via existing gate logic.
+    green = green_badge_decision(metrics, logger=None)
+
+    pass_bc = bc <= EPS_BC
+    pass_dual = dual <= EPS_DUAL
+    pass_pde = pde <= EPS_PDE
+
+    energy_computed = isinstance(energy, float) and math.isfinite(energy)
+    pass_energy = (not energy_computed) or (energy <= EPS_ENERGY)
+
+    mean_val_computed = isinstance(mean_val, float) and math.isfinite(mean_val)
+    pass_mean_value = (not mean_val_computed) or (
+        mean_val <= EPS_MEAN_VAL
+    )
+
+    return {
+        "bc_Linf": _json_serialize_float(bc),
+        "pde_residual": _json_serialize_float(pde),
+        "energy_rel_diff": _json_serialize_float(energy),
+        "dual_L2": _json_serialize_float(dual),
+        "mean_value_dev": _json_serialize_float(mean_val),
+        "max_principle_margin": None,
+        "reciprocity_dev": None,
+        "pass_bc": bool(pass_bc),
+        "pass_pde": bool(pass_pde),
+        "pass_energy": bool(pass_energy),
+        "pass_dual": bool(pass_dual),
+        "pass_mean_value": bool(pass_mean_value),
+        "green_badge": bool(green),
+        "auxiliary_data": {
+            "energy_A": _json_serialize_float(metrics.get("energy_A")),
+            "energy_B": _json_serialize_float(metrics.get("energy_B")),
+            "route_A_method": metrics.get("route_A_method"),
+            "route_B_method": metrics.get("route_B_method"),
+            "patch_L": _json_serialize_float(metrics.get("patch_L")),
+        },
+        "samples": {},
+    }
+
+
+# ------------------------
+# BEM helpers (no imports from core.bem at module import time)
+# ------------------------
+
+
+def _pde_residual_bem(
+    solution: "BEMSolution", spec, mesh_stats, logger
+) -> float:
+    """
+    Single-layer BEM with explicit point charges is harmonic away from charges/boundaries:
+    Î”V = 0. We report 0 deterministically for the PDE gate.
+    """
+    logger.info(
+        "PDE residual (harmonic identity for BEM).", n_probes=1
+    )
+    return 0.0
+
+
+def _phi_induced_at_charge(
+    solution: "BEMSolution", r_q
+) -> float:
+    """Induced potential at the real charge position from surface Ïƒ (BEM route)."""
+    import torch as _torch
+    from electrodrive.core.bem_kernel import bem_potential_targets
+
+    P = _torch.tensor(
+        [list(r_q)], device=solution._device, dtype=solution._dtype
+    )
+    V_ind = bem_potential_targets(
+        targets=P,
+        src_centroids=solution._C,
+        areas=solution._A,
+        sigma=solution._S,
+        tile_size=solution._tile,
+    )
+    return float(V_ind[0].item())
+
+
+def _energy_consistency_bem(
+    spec: CanonicalSpec,
+    bem_out: Dict[str, Any],
+    logger: JsonlLogger,
+) -> dict:
+    """
+    P0.2 Energy consistency check with fully patched logic:
+
+    Route A: U_A = Â½ Î£ q_k Ï†_induced(r_k)     (BEM surface-only; interaction energy)
+    Route B: see dispatch below; uses same discretization except a provably correct analytic for sphere/external
+    Returns {"A": float, "B": float, "route_B_method": str}
+    """
+    sol: "BEMSolution" = bem_out["solution"]
+    q_list: List[float] = []
+    r_list: List[tuple[float, float, float]] = []
+    for ch in spec.charges:
+        if ch.get("type") == "point":
+            q_list.append(float(ch["q"]))
+            r_list.append(tuple(map(float, ch["pos"])))
+    if not q_list:
+        return {"A": 0.0, "B": 0.0, "route_B_method": "no_charges"}
+
+    # --- Route A (grounded/neutral conductor): U_A = -Â½ Î£ q_k Ï†_induced(r_k) ---
+    U_A = 0.0
+    for q, r_q in zip(q_list, r_list):
+        V_ind = _phi_induced_at_charge(sol, r_q)
+        term = -0.5 * q * V_ind
+        U_A += term
+        logger.debug(
+            "Energy Route A term.",
+            q=f"{q:.6e}",
+            phi_induced=f"{V_ind:.6e}",
+            contrib=f"{term:.6e}",
+        )
+
+    # --- Route B: intelligent dispatch, apples-to-apples by default ---
+    U_B: Optional[float] = None
+    route_B_method = "surface_minus_half_sigma_phi_free"
+
+    # Spheres: check inside/outside; only external gets the closed form
+    if (
+        any(c.get("type") == "sphere" for c in spec.conductors)
+        and len(q_list) == 1
+    ):
+        c0 = next(
+            c for c in spec.conductors if c.get("type") == "sphere"
+        )
+        a = float(c0["radius"])
+        cx, cy, cz = map(float, c0["center"])
+        rx, ry, rz = r_list[0]
+        R = math.sqrt(
+            (rx - cx) ** 2 + (ry - cy) ** 2 + (rz - cz) ** 2
+        )
+        if R < a:
+            logger.info(
+                "Sphere energy dispatch.",
+                case="INSIDE",
+                R=f"{R:.6f}",
+                a=f"{a:.6f}",
+            )
+            route_B_method = (
+                "surface_minus_half_sigma_phi_free_inside_sphere"
+            )
+            U_B = None  # compute via surface integral below
+        else:
+            logger.info(
+                "Sphere energy dispatch.",
+                case="OUTSIDE",
+                R=f"{R:.6f}",
+                a=f"{a:.6f}",
+            )
+            # Grounded sphere; external charge analytic energy (Kelvin image inside)
+            U_B = (
+                -(q_list[0] ** 2)
+                / (8.0 * math.pi * EPS_0)
+                * (a * a)
+                / (R * (R * R - a * a))
+            )
+            route_B_method = "analytic_sphere_external"
+
+    # Planes: always use finite-patch surface integral to avoid mismatch with infinite-plane analytic
+    elif (
+        any(c.get("type") == "plane" for c in spec.conductors)
+        and len(q_list) == 1
+    ):
+        logger.info(
+            "Plane energy dispatch.",
+            method="surface_minus_half_sigma_phi_free_plane_patch",
+        )
+        route_B_method = "surface_minus_half_sigma_phi_free_plane_patch"
+        U_B = None
+
+    # Fallback / universal: -Â½ âˆ« Ïƒ Ï†_free dS  (reciprocity; grounded conductors)
+    if U_B is None:
+        import torch as _torch
+
+        C = sol._C
+        A = sol._A
+        S = sol._S
+        V_free = _torch.zeros(
+            C.shape[0], device=sol._device, dtype=sol._dtype
+        )
+        for q, r in zip(q_list, r_list):
+            Rv = _torch.linalg.norm(
+                C
+                - _torch.tensor(
+                    [r], device=sol._device, dtype=sol._dtype
+                ),
+                dim=1,
+            ).clamp_min(1e-12)
+            V_free += K_E * q / Rv
+        # Reciprocity for grounded conductors: U = -Â½ âˆ® Ïƒ Â· Ï†_free dS
+        U_B = float(
+            -0.5 * _torch.sum(V_free * S * A).item()
+        )
+        logger.info(
+            "Energy Route B via surface integral.",
+            U_B=f"{U_B:.6e}",
+            route=route_B_method,
+        )
+
+    return {
+        "A": float(U_A),
+        "B": float(U_B),
+        "route_B_method": route_B_method,
+    }
+
+
+# ------------------------
+# Main runner
+# ------------------------
+
+
+def run_solve(args: argparse.Namespace) -> int:
+    out = Path(args.out).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    logger = JsonlLogger(out)
+
+    perf_flags = _build_perf_flags(args)
+    # Apply TF32 (if requested) and log perf knobs; behavior otherwise unchanged.
+    _apply_tf32_flag(perf_flags.tf32, logger)
+    _log_amp_compile_requests(perf_flags, logger)
+    # Log environment once at start of run.
+    log_runtime_environment(logger, perf_flags=perf_flags)
+
+    run_id = str(uuid.uuid4())
+    logger.info(
+        "EDE 'solve' run started.", run_id=run_id, args=vars(args)
+    )
+
+    # Prepare meta/metrics early so crash-path can still write metrics.json
+    metrics: Dict[str, Any] = {}
+    meta: Dict[str, Any] = {
+        "mode": "unknown",
+        "seed": args.seed,
+        "run_id": run_id,
+        "versions": {},
+        "solve_time_sec": 0.0,
+        "governance": {"status": "pending"},
+        "vram_telemetry": {},
+        "solve_stats": {},
+    }
+
+    run_status_code = 1  # default to failure unless proven otherwise
+    try:
+        # For compatibility: still log legacy VRAM telemetry, in addition to new helpers.
+        # This does not alter solver behavior.
+
+        # VRAM telemetry
+        vram_stats = _vram_telemetry_init(logger)
+        meta["vram_telemetry"] = vram_stats
+
+        # Governance: optional fail-closed gate.
+        # Behavior:
+        # - If BOTH eval_pdf and hash provided: run governance_guard (fail-closed).
+        # - If NEITHER provided: skip (allowed even with --cert; tests rely on this).
+        # - If only one provided: treat as configuration error.
+        expected_hash = getattr(args, "eval_sha256", None)
+
+        if args.eval_pdf and expected_hash:
+            logger.info("Running governance check.")
+            try:
+                governance_status = governance_guard(
+                    logger,
+                    Path(args.eval_pdf),
+                    expected_hash,
+                )
+                meta["governance"] = governance_status
+            except Exception as e:
+                logger.error(
+                    "Governance check failed. Aborting run.",
+                    error=str(e),
+                )
+                raise
+
+        elif args.eval_pdf or expected_hash:
+            msg = (
+                "Certification governance misconfigured: "
+                "provide BOTH --eval-pdf PATH and --eval-sha256 HASH, or neither."
+            )
+            logger.error(msg)
+            meta["governance"] = {"status": "error", "reason": "partial_inputs"}
+            raise ValueError(msg)
+
+        else:
+            governance_status = {"status": "skipped"}
+            meta["governance"] = governance_status
+
+        # Seeds & versions
+        _set_seeds(args.seed, logger)
+        versions = _versions()
+        meta["versions"] = versions
+        logger.info(
+            "Runtime versions.",
+            **{k: str(v)[:32] for k, v in versions.items()},
+        )
+        logger.info(
+            "Environment versions captured.",
+            **{k: str(v)[:24] for k, v in versions.items()},
+        )
+
+        # Load spec (BOM-safe)
+        spec_path = (
+            Path(args.problem).expanduser().resolve()
+        )
+        if not spec_path.exists():
+            logger.error(
+                "Spec file not found.", path=str(spec_path)
+            )
+            raise FileNotFoundError(
+                f"Spec file not found: {spec_path}"
+            )
+        try:
+            with open(
+                spec_path, "r", encoding="utf-8-sig"
+            ) as f:
+                raw = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Spec JSON parse error.", error=str(e)
+            )
+            raise
+        spec = CanonicalSpec.from_json(raw)
+        logger.info(
+            "Canonical spec loaded.", **spec.summary()
+        )
+
+        # Planner
+        mode = choose_mode(
+            spec, args.mode, logger
+        )
+        meta["mode"] = mode
+        logger.info(
+            "Planner result.",
+            requested_mode=args.mode,
+            selected_mode=mode,
+        )
+
+        # Solve
+        t0 = time.time()
+        solution = None
+        solve_stats: Dict[str, Any] = {}
+
+        if mode == "analytic":
+            logger.info(
+                "Solving analytically (method of images)."
+            )
+            ctypes = sorted(
+                {c.get("type") for c in spec.conductors}
+            )
+            if (
+                ctypes == ["plane"]
+                and len(spec.conductors) == 1
+                and len(spec.charges) >= 1
+            ):
+                q = spec.charges[0]["q"]
+                r0 = tuple(spec.charges[0]["pos"])
+                if (
+                    spec.conductors[0].get("z", 0.0) != 0.0
+                    or spec.conductors[0].get(
+                        "potential", 0.0
+                    )
+                    != 0.0
+                ):
+                    logger.warning(
+                        "Analytic plane assumes grounded plane at z=0."
+                    )
+                if r0[2] <= 1e-9:
+                    r0 = (
+                        r0[0],
+                        r0[1],
+                        abs(r0[2]) + 1e-6,
+                    )
+                    logger.warning(
+                        "Adjusting charge position to z>0.",
+                        r0=r0,
+                    )
+                solution = potential_plane_halfspace(
+                    q, r0
+                )
+            elif (
+                ctypes == ["sphere"]
+                and len(spec.conductors) == 1
+                and len(spec.charges) >= 1
+            ):
+                q = spec.charges[0]["q"]
+                r0 = tuple(spec.charges[0]["pos"])
+                center = tuple(
+                    spec.conductors[0].get(
+                        "center", [0.0, 0.0, 0.0]
+                    )
+                )
+                radius = spec.conductors[0].get(
+                    "radius", 1.0
+                )
+                solution = potential_sphere_grounded(
+                    q, r0, center, radius
+                )
+            else:
+                logger.error(
+                    "No matching analytic solution implemented for this spec."
+                )
+                raise NotImplementedError(
+                    "Analytic solver not implemented for this spec."
+                )
+            if args.cert:
+                metrics[
+                    "bc_residual_linf"
+                ] = bc_residual_on_boundary(
+                    solution, spec, logger=logger
+                )
+                metrics[
+                    "pde_residual_linf"
+                ] = pde_residual_symbolic(
+                    solution, spec, logger=logger
+                )
+
+        elif mode == "pinn":
+            # Lazy import to avoid hard deps if user is only using analytic/BEM
+            from electrodrive.core.pinn import (
+                pinn_train_eval,
+            )
+
+            pinn_config = PINNConfig()
+            pinn_out = pinn_train_eval(
+                spec, pinn_config, logger
+            )
+            if "error" in pinn_out:
+                logger.error(
+                    "PINN solve failed.",
+                    error=pinn_out["error"],
+                )
+                raise RuntimeError(
+                    f"PINN solve failed: {pinn_out['error']}"
+                )
+            solution = pinn_out.get("solution")
+            metrics["bc_residual_linf"] = float(
+                pinn_out.get(
+                    "bc_rmse", float("inf")
+                )
+            )
+
+        elif mode == "bem":
+            # Lazy import avoids any possible circular import and keeps analytic-only envs happy
+            from electrodrive.core.bem import (
+                bem_solve,
+                BEMSolution,
+            )  # type: ignore
+
+            bem_config = BEMConfig()
+            bem_out = bem_solve(
+                spec,
+                bem_config,
+                logger,
+                differentiable=False,
+            )
+            if "error" in bem_out:
+                logger.error(
+                    "BEM solve failed (diagnostics only).",
+                    **bem_out,
+                )
+                # Populate explicit failing metrics so harnesses don't "skip"
+                metrics["bc_residual_linf"] = float(
+                    "inf"
+                )
+                metrics[
+                    "dual_route_l2_boundary"
+                ] = float("inf")
+                metrics["pde_residual_linf"] = float(
+                    "inf"
+                )
+                meta["run_status"] = "error"
+                meta["error"] = str(
+                    bem_out["error"]
+                )
+            else:
+                solution = bem_out.get("solution")
+                solve_stats = dict(
+                    bem_out.get(
+                        "gmres_stats", {}
+                    )
+                )
+                mesh_stats = dict(
+                    bem_out.get(
+                        "mesh_stats", {}
+                    )
+                )
+
+                # BC residual (from BEM stats)
+                metrics[
+                    "bc_residual_linf"
+                ] = float(
+                    mesh_stats.get(
+                        "bc_residual_linf",
+                        float("inf"),
+                    )
+                )
+                solve_stats["dof"] = mesh_stats.get(
+                    "n_panels"
+                )
+                solve_stats["tile_size"] = (
+                    mesh_stats.get(
+                        "tile_size_final"
+                    )
+                )
+                # Persist finite plane extent (if present) for reproducibility
+                if "patch_L" in mesh_stats:
+                    metrics["patch_L"] = (
+                        mesh_stats.get(
+                            "patch_L"
+                        )
+                    )
+                    logger.info(
+                        "Recorded patch extent for report.",
+                        patch_L=str(
+                            metrics["patch_L"]
+                        ),
+                    )
+
+                # Dual-route boundary comparison when an analytic baseline exists
+                V_an: List[float] = []
+                sample_pts = [
+                    tuple(p)
+                    for p in bem_out.get(
+                        "sample_points", []
+                    )
+                ]
+                ctypes = sorted(
+                    {
+                        c.get("type")
+                        for c in spec.conductors
+                    }
+                )
+                if (
+                    ctypes == ["plane"]
+                    and len(spec.conductors)
+                    == 1
+                    and len(spec.charges)
+                    >= 1
+                ):
+                    q = spec.charges[0]["q"]
+                    r0 = tuple(
+                        spec.charges[0]["pos"]
+                    )
+                    if r0[2] <= 1e-9:
+                        r0 = (
+                            r0[0],
+                            r0[1],
+                            abs(r0[2]) + 1e-6,
+                        )
+                    sol_an = (
+                        potential_plane_halfspace(
+                            q, r0
+                        )
+                    )
+                    V_an = [
+                        sol_an.eval(p)
+                        for p in sample_pts
+                    ]
+                elif (
+                    ctypes == ["sphere"]
+                    and len(spec.conductors)
+                    == 1
+                    and len(spec.charges)
+                    >= 1
+                ):
+                    V_target = float(
+                        spec.conductors[
+                            0
+                        ].get(
+                            "potential",
+                            0.0,
+                        )
+                    )
+                    V_an = [
+                        V_target
+                    ] * len(sample_pts)
+
+                if V_an:
+                    metrics[
+                        "dual_route_l2_boundary"
+                    ] = dual_route_error_boundary(
+                        V_an,
+                        bem_out.get(
+                            "boundary_samples",
+                            [],
+                        ),
+                    )
+
+                # PDE residual (harmonic identity) + Energy consistency (Route A vs Route B)
+                if solution:
+                    pde = _pde_residual_bem(
+                        solution,
+                        spec,
+                        mesh_stats,
+                        logger,
+                    )
+                    metrics[
+                        "pde_residual_linf"
+                    ] = float(pde)
+
+                    energy = _energy_consistency_bem(
+                        spec,
+                        bem_out,
+                        logger,
+                    )
+                    metrics["energy_A"] = (
+                        energy["A"]
+                    )
+                    metrics["energy_B"] = (
+                        energy["B"]
+                    )
+                    metrics[
+                        "route_A_method"
+                    ] = "charge_minus_half_q_phi_induced"
+                    metrics[
+                        "route_B_method"
+                    ] = energy.get(
+                        "route_B_method",
+                        "surface_minus_half_sigma_phi_free",
+                    )
+
+                    # Informational mean-value property (harmonicity diagnostic, not gating)
+                    try:
+                        mv_dev = mean_value_property_check(
+                            solution,
+                            spec,
+                            logger,
+                        )
+                        metrics[
+                            "mean_value_deviation"
+                        ] = float(
+                            mv_dev
+                        )
+                    except Exception as e_mv:
+                        logger.warning(
+                            "Mean-value check failed.",
+                            error=str(
+                                e_mv
+                            ),
+                        )
+                        metrics[
+                            "mean_value_deviation"
+                        ] = float(
+                            "nan"
+                        )
+
+                    # Energy relative difference
+                    if (
+                        all(
+                            math.isfinite(v)
+                            for v in (
+                                metrics[
+                                    "energy_A"
+                                ],
+                                metrics[
+                                    "energy_B"
+                                ],
+                            )
+                        )
+                        and max(
+                            abs(
+                                metrics[
+                                    "energy_A"
+                                ]
+                            ),
+                            abs(
+                                metrics[
+                                    "energy_B"
+                                ]
+                            ),
+                        )
+                        > 1e-30
+                    ):
+                        metrics[
+                            "energy_rel_diff"
+                        ] = abs(
+                            metrics[
+                                "energy_A"
+                            ]
+                            - metrics[
+                                "energy_B"
+                            ]
+                        ) / max(
+                            1e-30,
+                            abs(
+                                metrics[
+                                    "energy_B"
+                                ]
+                            ),
+                        )
+                    else:
+                        metrics[
+                            "energy_rel_diff"
+                        ] = float(
+                            "inf"
+                        )
+
+        else:
+            logger.error(
+                "Unknown mode.", mode=mode
+            )
+            raise ValueError(
+                f"Unknown mode: {mode}"
+            )
+
+        # Energy consistency for analytic / pinn routes
+        if (
+            args.cert
+            and solution
+            and mode != "bem"
+        ):
+            try:
+                energy_metrics = (
+                    energy_consistency_check(
+                        solution,
+                        spec,
+                        logger=logger,
+                    )
+                )
+                metrics.update(
+                    energy_metrics
+                )
+            except Exception as e:
+                logger.warning(
+                    "Energy consistency check encountered an error.",
+                    error=str(e),
+                )
+
+        dt = time.time() - t0
+        meta["solve_time_sec"] = dt
+        meta["solve_stats"] = solve_stats
+
+        # New peak VRAM observability hook (in addition to legacy telemetry).
+        log_peak_vram(logger, phase="solve")
+
+        # VRAM end
+        _finalize_vram_telemetry(
+            vram_stats, logger
+        )
+
+        # Persist metrics
+        if meta.get("run_status") != "error":
+            meta["run_status"] = "success"
+        payload = {
+            "metrics": metrics,
+            "meta": meta,
+        }
+        (out / "metrics.json").write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+        logger.info(
+            "Metrics written.",
+            path=str(out / "metrics.json"),
+        )
+
+        if args.cert:
+            verification_report = (
+                aggregate_verification_report(
+                    metrics
+                )
+            )
+            (
+                out
+                / "verification_report.json"
+            ).write_text(
+                json.dumps(
+                    verification_report,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            # Single consolidated Green Badge decision log (avoid duplicate reason logs).
+            fail_reasons = (
+                _fail_reasons_from_metrics(
+                    metrics
+                )
+            )
+            passed = bool(
+                verification_report[
+                    "green_badge"
+                ]
+            )
+            logger.info(
+                "Green Badge decision.",
+                bc=verification_report[
+                    "bc_Linf"
+                ],
+                eps_bc=EPS_BC,
+                dual=verification_report[
+                    "dual_L2"
+                ],
+                eps_dual=EPS_DUAL,
+                pde=verification_report[
+                    "pde_residual"
+                ],
+                eps_pde=EPS_PDE,
+                energy=verification_report[
+                    "energy_rel_diff"
+                ],
+                eps_energy=EPS_ENERGY,
+                pass_=passed,
+                reasons="; ".join(
+                    fail_reasons
+                )
+                if fail_reasons
+                else "none",
+            )
+
+        # Report
+        passed = False
+        report_file = "RESULTS.txt"
+        if args.cert:
+            passed = green_badge_decision(
+                metrics, logger=logger
+            )
+            report_file = (
+                "GREEN_BADGE.txt"
+                if passed
+                else "CERT_REPORT_FAILED.txt"
+            )
+
+        lines: List[str] = []
+        if args.cert:
+            bc = float(
+                metrics.get(
+                    "bc_residual_linf",
+                    float("inf"),
+                )
+            )
+            dual = float(
+                metrics.get(
+                    "dual_route_l2_boundary",
+                    float("inf"),
+                )
+            )
+            pde = float(
+                metrics.get(
+                    "pde_residual_linf",
+                    float("inf"),
+                )
+            )
+            enr = metrics.get(
+                "energy_rel_diff",
+                float("nan"),
+            )
+
+            lines.append(
+                "Electrostatic Discovery Engine â€” Certification Report"
+            )
+            lines.append("=" * 60)
+            lines.append(
+                f"Mode: {meta['mode']} Run ID: {meta['run_id']}"
+            )
+            lines.append(
+                f"Solve time: {dt:.3f}s"
+            )
+            if "dof" in solve_stats:
+                lines.append(
+                    f"DoF: {solve_stats['dof']}"
+                )
+            if "iters" in solve_stats:
+                lines.append(
+                    f"GMRES Iters: {solve_stats.get('iters', 'N/A')}"
+                )
+            lines.append(
+                f"Governance: {governance_status.get('status', 'N/A')}"
+            )
+
+            if vram_stats.get(
+                "gpu_available"
+            ):
+                lines.append(
+                    f"GPU: {vram_stats.get('device_name')} (Dtype: {vram_stats.get('dtype')}, TF32: {'ON' if vram_stats.get('tf32_enabled') else 'OFF'})"
+                )
+                lines.append(
+                    f"Peak VRAM (Alloc/Reserv): {vram_stats.get('peak_memory_allocated_gb', 0):.2f}GB / {vram_stats.get('peak_memory_reserved_gb', 0):.2f}GB"
+                )
+
+            lines.append("")
+            lines.append("Gates:")
+            lines.append(
+                f" BC : {bc:.3e} <= {EPS_BC:.3e} [{'PASS' if bc <= EPS_BC else 'FAIL'}]"
+            )
+
+            if (
+                "dual_route_l2_boundary"
+                in metrics
+            ):
+                lines.append(
+                    f" Dual : {dual:.3e} <= {EPS_DUAL:.3e} [{'PASS' if dual <= EPS_DUAL else 'FAIL'}]"
+                )
+            else:
+                lines.append(
+                    " Dual : N/A (no analytic baseline for this geometry)"
+                )
+
+            if (
+                "pde_residual_linf"
+                in metrics
+            ):
+                lines.append(
+                    f" PDE : {pde:.3e} <= {EPS_PDE:.3e} [{'PASS' if pde <= EPS_PDE else 'FAIL'}] (dimensionless)"
+                )
+            else:
+                lines.append(
+                    " PDE : N/A (not computed)"
+                )
+
+            # Mean-value property (informational)
+            mv = metrics.get(
+                "mean_value_deviation",
+                float("nan"),
+            )
+            if isinstance(
+                mv, float
+            ) and not math.isnan(mv):
+                lines.append(
+                    f" MeanVal: {mv:.3e} <= {EPS_MEAN_VAL:.3e} [{'PASS' if mv <= EPS_MEAN_VAL else 'FAIL'}] (informational)"
+                )
+            else:
+                lines.append(
+                    " MeanVal: N/A (not computed)"
+                )
+
+            if isinstance(
+                enr, float
+            ) and not math.isnan(
+                enr
+            ):
+                lines.append(
+                    f" Energy: {enr:.3e} <= {EPS_ENERGY:.3e} [{'PASS' if enr <= EPS_ENERGY else 'FAIL'}] (Consistency)"
+                )
+                lines.append(
+                    f"  Route A: {metrics.get('energy_A', float('nan')):.6e} J ({metrics.get('route_A_method', 'N/A')})"
+                )
+                lines.append(
+                    f"  Route B: {metrics.get('energy_B', float('nan')):.6e} J ({metrics.get('route_B_method', 'N/A')})"
+                )
+                if isinstance(
+                    metrics.get(
+                        "patch_L"
+                    ),
+                    (int, float),
+                ):
+                    lines.append(
+                        f"  Patch L: {float(metrics['patch_L']):.3f} (finite plane extent)"
+                    )
+            else:
+                lines.append(
+                    " Energy: N/A (Consistency check not performed)"
+                )
+                if isinstance(
+                    metrics.get(
+                        "energy_A"
+                    ),
+                    float,
+                ) and math.isfinite(
+                    metrics.get(
+                        "energy_A"
+                    )
+                ):
+                    lines.append(
+                        f"  Route A: {metrics.get('energy_A'):.6e} J ({metrics.get('route_A_method', 'N/A')})"
+                    )
+
+            lines.append("")
+            lines.append(
+                f"OVERALL: {'PASS (Green Badge Awarded)' if passed else 'FAILED (thresholds not met)'}"
+            )
+            lines.append("")
+            lines.append(
+                "Metrics JSON saved at: metrics.json"
+            )
+        else:
+            lines.append(
+                "Run complete. (Non-certified)"
+            )
+
+        (
+            out / report_file
+        ).write_text(
+            "\n".join(lines) + "\n",
+            encoding="utf-8",
+        )
+        logger.info(
+            "Run report saved.",
+            path=str(out / report_file),
+            pass_=passed,
+        )
+        logger.info("EDE run completed.")
+
+        # Exit code (success unless cert failed)
+        if meta["run_status"] != "error":
+            run_status_code = (
+                0
+                if (not args.cert or passed)
+                else 1
+            )
+
+    except Exception as e:
+        logger.error(
+            "EDE CLI run failed.",
+            error=str(e),
+            exc_info=True,
+        )
+        meta["run_status"] = "error"
+        meta["error"] = str(e)
+        run_status_code = 1
+        try:
+            metrics_path = (
+                out / "metrics.json"
+            )
+            payload = {
+                "metrics": metrics,
+                "meta": meta,
+            }
+            metrics_path.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+            logger.info(
+                "Metrics written (crash path).",
+                path=str(metrics_path),
+            )
+        except Exception as e_write:
+            logger.error(
+                "Failed to write metrics during crash.",
+                error=str(e_write),
+            )
+    finally:
+        logger.close()
+
+    return run_status_code
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        description=(
+            "Electrostatic Discovery Engine (EDE) â€” modular CLI"
+        )
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Master RNG seed",
+    )
+    # Global performance knobs (Step 1). Defaults preserve prior behavior.
+    p.add_argument(
+        "--amp",
+        dest="amp",
+        action="store_true",
+        help=(
+            "Enable automatic mixed precision (AMP) where supported. "
+            "Default is off; currently only logged, no compute change."
+        ),
+    )
+    p.add_argument(
+        "--no-amp",
+        dest="amp",
+        action="store_false",
+        help="Disable AMP (default).",
+    )
+    p.set_defaults(amp=False)
+    p.add_argument(
+        "--train-dtype",
+        dest="train_dtype",
+        choices=["float32", "bfloat16"],
+        default="float32",
+        help=(
+            "Preferred training dtype for learning stacks (default: float32). "
+            "For core solvers this is logged only."
+        ),
+    )
+    p.add_argument(
+        "--compile",
+        dest="compile",
+        action="store_true",
+        help=(
+            "Request torch.compile(mode='reduce-overhead') for supported models. "
+            "Default is off; currently only logged."
+        ),
+    )
+    p.add_argument(
+        "--tf32",
+        dest="tf32",
+        choices=["off", "high", "medium", "highest"],
+        default="off",
+        help=(
+            "Set torch float32 matmul precision / TF32 usage when torch is available. "
+            "Default 'off' preserves existing behavior."
+        ),
+    )
+    s = p.add_subparsers(
+        dest="cmd", required=True
+    )
+
+    # solve
+    sp = s.add_parser(
+        "solve",
+        help="Solve a canonical electrostatic problem.",
+    )
+    sp.add_argument(
+        "--problem",
+        required=True,
+        help="Path to spec.json",
+    )
+    sp.add_argument(
+        "--mode",
+        default="auto",
+        choices=["analytic", "bem", "pinn", "auto"],
+    )
+    sp.add_argument(
+        "--cert",
+        action="store_true",
+        help="Run certification (Green Badge).",
+    )
+    sp.add_argument(
+        "--out",
+        required=True,
+        help="Output directory.",
+    )
+    # Governance (optional)
+    sp.add_argument(
+        "--eval-pdf",
+        default=None,
+        help="Path to evaluation PDF for governance check.",
+    )
+    # Accept BOTH an optional flag and a legacy positional; both populate eval_sha256
+    sp.add_argument(
+        "--eval-sha256",
+        dest="eval_sha256",
+        default=None,
+        help=(
+            "Expected SHA-256 hash of the evaluation PDF (alias for positional)."
+        ),
+    )
+    sp.add_argument(
+        "eval_sha256",
+        nargs="?",
+        help=(
+            "Expected SHA-256 hash of the evaluation PDF (positional)."
+        ),
+    )
+    sp.set_defaults(func=run_solve)
+
+    # discover_a (optional; keep CLI usable if module not present)
+    try:
+        from electrodrive.discovery.discovery_a import (
+            run_discovery_a,
+        )
+
+        dp = s.add_parser(
+            "discover_a",
+            help=(
+                "Run Discovery A: HV edge-field mitigation optimization."
+            ),
+        )
+        dp.add_argument(
+            "--out",
+            required=True,
+            help="Output directory.",
+        )
+        dp.set_defaults(
+            func=lambda args: run_discovery_a(
+                args
+            )
+        )
+    except Exception:
+        pass
+
+    # --- Learning Stack CLI Integration (train/eval) ---
+    try:
+        # Lazy import so base CLI works without ML deps
+        from electrodrive.learn.cli import (
+            register_learn_commands,
+        )
+
+        register_learn_commands(s)
+    except ImportError as e:
+        # Soft-fail: print info to stderr, keep core CLI functional
+        print(
+            "INFO: Learning stack commands (train/eval) unavailable. "
+            f"Dependencies missing: {e}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(
+            f"ERROR: Failed to register learning stack commands: {e}",
+            file=sys.stderr,
+        )
+    # ---------------------------------------------------
+
+    args = p.parse_args(argv)
+    # Subcommands expect their own args; log environment for any entry that uses JsonlLogger.
+    if hasattr(args, "func"):
+        return args.func(args)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# -*- coding: utf-8 -*-

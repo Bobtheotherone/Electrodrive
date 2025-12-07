@@ -1,0 +1,35 @@
+﻿exp_name: pinn_harmonic_large_example
+seed: 42
+device: cpu
+train_dtype: float32
+
+curriculum:
+  geometry_weights: {plane: 0.5, sphere: 0.5}
+  include_pdf_sources: false
+  pdf_paths: []
+
+dataset:
+  n_train_problems: 8
+  n_val_problems: 2
+  samples_per_problem_jit: 1024
+  ratio_boundary: 0.4
+  ratio_interior: 0.6
+  supervision_mode: analytic
+
+model:
+  model_type: pinn_harmonic_large
+  params:
+    use_fourier: true
+    fourier_scale: 10.0
+
+trainer:
+  max_epochs: 2
+  batch_size: 1024
+  learning_rate: 1.0e-4
+  lr_scheduler: cosine
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  use_amp: false
+  log_every_n_steps: 1
+  val_every_n_epochs: 1
+  ckpt_every_n_epochs: 2

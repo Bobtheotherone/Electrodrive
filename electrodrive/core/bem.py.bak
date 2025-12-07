@@ -1,0 +1,514 @@
+﻿<# -*- coding: utf-8 -*-
+
+"""
+Production BEM (single-layer, Dirichlet) with matrix-free tiled matvec,
+analytic diagonal (self) replacement, adaptive refinement, and safe outputs
+for certification wiring in the CLI.
+
+Public API:
+- bem_solve(spec: CanonicalSpec, cfg: BEMConfig, logger: JsonlLogger,
+            differentiable: bool = False) -> Dict[str, Any]
+- BEMSolution: evaluator with .eval(...) and .eval_V_E_batched(...)
+
+This module is intentionally free of any CLI imports to avoid cycles.
+"""
+
+from __future__ import annotations
+import math
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+
+from electrodrive.core.bem_mesh import TriMesh, generate_mesh
+from electrodrive.core.bem_kernel import (
+    bem_matvec_gpu,      # matrix-free G·sigma
+    bem_potential_targets,  # induced V at targets
+    bem_E_field_targets,    # induced E at targets
+)
+from electrodrive.core.bem_quadrature import self_integral_correction
+from electrodrive.core.bem_solver import gmres_restart
+from electrodrive.utils.config import BEMConfig, K_E
+from electrodrive.utils.logging import JsonlLogger
+from electrodrive.orchestration.parser import CanonicalSpec
+
+__all__ = ["bem_solve", "BEMSolution"]
+
+# --------------------------
+# Utilities & free-space parts
+# --------------------------
+
+def _init_device(cfg: BEMConfig) -> torch.device:
+    if getattr(cfg, "use_gpu", False) and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+def _free_space_at_points(spec: CanonicalSpec, P: torch.Tensor, dtype, device) -> torch.Tensor:
+    """Free-space potential from explicit *point* charges at points P[N,3]."""
+    V = torch.zeros(P.shape[0], device=device, dtype=dtype)
+    for ch in spec.charges:
+        if ch.get("type") != "point":
+            continue
+        q = torch.as_tensor(float(ch["q"]), device=device, dtype=dtype)
+        pos = torch.as_tensor([float(x) for x in ch["pos"]], device=device, dtype=dtype)
+        r = torch.linalg.norm(P - pos[None, :], dim=1).clamp_min(1e-12)
+        V += (K_E * q) / r
+    return V
+
+def _free_space_E_field_at_points(spec: CanonicalSpec, P: torch.Tensor, dtype, device) -> torch.Tensor:
+    """Free-space E-field from explicit *point* charges at points P[N,3]."""
+    E = torch.zeros(P.shape[0], 3, device=device, dtype=dtype)
+    for ch in spec.charges:
+        if ch.get("type") != "point":
+            continue
+        q = torch.as_tensor(float(ch["q"]), device=device, dtype=dtype)
+        pos = torch.as_tensor([float(x) for x in ch["pos"]], device=device, dtype=dtype)
+        R = P - pos[None, :]
+        r = torch.linalg.norm(R, dim=1, keepdim=True).clamp_min(1e-12)
+        E += (K_E * q) * R / (r ** 3)
+    return E
+
+def _offset_from_boundary(
+    spec: Optional[CanonicalSpec],
+    P: torch.Tensor,
+    areas: torch.Tensor,
+    centroids: torch.Tensor,
+    dtype,
+    device,
+    sign: float = 1.0,
+) -> torch.Tensor:
+    """
+    Slightly nudge points that lie exactly on simple boundaries to avoid
+    centroid coincidence in target evaluation (only for *field* eval).
+    """
+    if P.numel() == 0:
+        return P
+    P2 = P.clone()
+    # conservative geometric scale
+    if areas.numel() > 0:
+        req = float(torch.median(torch.sqrt(areas.clamp_min(1e-30) / math.pi)).item())
+    else:
+        req = 1e-3
+    delta = torch.as_tensor(sign * 1e-6 * req, device=device, dtype=dtype)
+    if spec is None:
+        return P2
+    for c in spec.conductors:
+        t = c.get("type")
+        if t == "plane":
+            z0 = float(c.get("z", 0.0))
+            mask = (torch.abs(P2[:, 2] - z0) < 10.0 * torch.finfo(dtype).eps)
+            P2[mask, 2] = z0 + delta
+        elif t == "sphere":
+            center = torch.as_tensor([float(x) for x in c.get("center", [0.0, 0.0, 0.0])],
+                                     device=device, dtype=dtype)
+            a = float(c.get("radius", 1.0))
+            r = torch.linalg.norm(P2 - center[None, :], dim=1)
+            mask = (torch.abs(r - a) < 10.0 * torch.finfo(dtype).eps * max(1.0, a))
+            if torch.any(mask):
+                v = (P2[mask] - center[None, :])
+                v = v / torch.linalg.norm(v, dim=1, keepdim=True).clamp_min(1e-24)
+                P2[mask] = center[None, :] + (a + float(delta)) * v
+    return P2
+
+def _bc_vector(spec: CanonicalSpec, mesh: TriMesh, device, dtype) -> torch.Tensor:
+    """Per-panel Dirichlet BC values (by conductor id)."""
+    bc = torch.zeros(mesh.n_panels, device=device, dtype=dtype)
+    id_to_V: Dict[int, float] = {}
+    for i, c in enumerate(spec.conductors):
+        V = float(c.get("potential", 0.0))
+        cid = int(c.get("id", i))
+        id_to_V[cid] = V
+    for i, cid in enumerate(mesh.conductor_ids):
+        bc[i] = id_to_V.get(int(cid), 0.0)
+    return bc
+
+def _free_space_potential_on_centroids(spec: CanonicalSpec, C: torch.Tensor) -> torch.Tensor:
+    """Free-space potential at panel centroids."""
+    V = torch.zeros(C.shape[0], device=C.device, dtype=C.dtype)
+    for ch in spec.charges:
+        if ch.get("type") != "point":
+            continue
+        q = torch.as_tensor(float(ch["q"]), device=C.device, dtype=C.dtype)
+        pos = torch.as_tensor([float(x) for x in ch["pos"]], device=C.device, dtype=C.dtype)
+        r = torch.linalg.norm(C - pos[None, :], dim=1).clamp_min(1e-12)
+        V += (K_E * q) / r
+    return V
+
+def _autotune_tile_size(
+    N: int,
+    dtype,
+    device,
+    logger: JsonlLogger,
+    target_vram_fraction: float = 0.8,
+    max_vram_gb: float = 24.0,
+    *,
+    min_tile: int = 512,
+    max_tile: Optional[int] = None,
+    target_peak_gb: Optional[float] = None,
+    tile_mem_divisor: float = 3.0,
+) -> int:
+    """Choose a safe tile size for T×T kernels under a VRAM budget."""
+    if device.type != "cuda" or N <= 0:
+        return 4096
+    try:
+        total_vram = torch.cuda.get_device_properties(device).total_memory
+    except Exception:
+        logger.warning("Could not query total VRAM. Falling back to configured cap.", max_vram_gb=max_vram_gb)
+        total_vram = max_vram_gb * (1024 ** 3)
+    available = total_vram * target_vram_fraction
+    bytes_per = torch.finfo(dtype).bits // 8
+    vector_mem = N * 10 * bytes_per
+    # split across (sources, targets, scratch). Smaller divisor => bigger tiles (more VRAM use)
+    divisor = float(tile_mem_divisor) if tile_mem_divisor and tile_mem_divisor > 0 else 3.0
+    memory_for_tiling = max(0, available - vector_mem) / divisor
+    # Baseline estimate (scales like T^2 buffers inside kernels)
+    T = int(math.sqrt(max(1.0, memory_for_tiling / (4 * bytes_per))))
+    T = min(N, max(min_tile, T))
+    T = 2 ** (int(math.log2(T)))
+
+    # If a peak budget is requested, try to push tiles upward toward it
+    try:
+        total_gb = total_vram / (1024 ** 3)
+        if target_peak_gb and target_peak_gb > 0:
+            budget_gb = min(target_peak_gb, total_gb * target_vram_fraction)
+            # Recompute a more aggressive tile based on the requested peak
+            mem_bytes = budget_gb * (1024 ** 3)
+            mem_for_tiles = max(0, mem_bytes - vector_mem) / 3.0
+            T2 = int(math.sqrt(max(1.0, mem_for_tiles / (4 * bytes_per))))
+            T2 = min(N, max(min_tile, T2))
+            T2 = 2 ** (int(math.log2(T2)))
+            T = max(T, T2)
+    except Exception:
+        pass
+
+    if max_tile is not None:
+        T = min(T, max_tile)
+
+    logger.info(
+        "VRAM autotune result.",
+        tile_size=T, N_dof=N,
+        total_vram_gb=f"{total_vram/(1024**3):.2f}",
+        dtype=str(dtype),
+        divisor=float(divisor),
+    )
+    return T
+
+def compute_bem_capacitive_energy(V_total: torch.Tensor, sigma: torch.Tensor, areas: torch.Tensor) -> float:
+    """
+    Capacitive energy from boundary data (Route A variant):
+    U = 1/2 ∫ V σ dS ≈ 1/2 Σ (V_i σ_i A_i)
+    """
+    try:
+        energy = 0.5 * torch.sum(V_total * sigma * areas)
+        return float(energy.item())
+    except Exception:
+        return float("nan")
+
+# --------------------------
+# Evaluator
+# --------------------------
+
+class BEMSolution:
+    """
+    Simple evaluator wrapping the solved boundary data. Provides:
+    - eval(p: (x,y,z)) -> float potential
+    - eval_V_E_batched(P: [N,3]) -> (V[N], E[N,3])
+    """
+    def __init__(
+        self,
+        spec: CanonicalSpec,
+        centroids: torch.Tensor,
+        areas: torch.Tensor,
+        sigma: torch.Tensor,
+        device,
+        dtype,
+        tile_size: int,
+        normals: Optional[torch.Tensor] = None,
+    ):
+        self._spec = spec
+        self._C = centroids
+        self._A = areas
+        self._N = normals
+        self._S = sigma
+        self._device = device
+        self._dtype = dtype
+        self._tile = tile_size
+        self.meta: Dict[str, Any] = {}
+
+    def _eval_at_points(
+        self, P: torch.Tensor, compute_V: bool, compute_E: bool
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        P = P.to(device=self._device, dtype=self._dtype)
+        P_shift = _offset_from_boundary(self._spec, P, self._A, self._C, self._dtype, self._device)
+        V_total, E_total = None, None
+        if compute_V:
+            V_free = _free_space_at_points(self._spec, P_shift, self._dtype, self._device)
+            V_ind = bem_potential_targets(
+                targets=P_shift, src_centroids=self._C, areas=self._A, sigma=self._S, tile_size=self._tile
+            )
+            V_total = V_free + V_ind
+        if compute_E:
+            E_free = _free_space_E_field_at_points(self._spec, P_shift, self._dtype, self._device)
+            E_ind = bem_E_field_targets(
+                targets=P_shift, src_centroids=self._C, areas=self._A, sigma=self._S, tile_size=self._tile
+            )
+            E_total = E_free + E_ind
+        return V_total, E_total
+
+    def eval(self, p: Tuple[float, float, float]) -> float:
+        P = torch.tensor([[float(p[0]), float(p[1]), float(p[2])]], device=self._device, dtype=self._dtype)
+        V, _ = self._eval_at_points(P, compute_V=True, compute_E=False)
+        return float(V[0].item())
+
+    def eval_V_E_batched(self, P: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        V, E = self._eval_at_points(P, compute_V=True, compute_E=True)
+        return V, E
+
+# --------------------------
+# Main solver
+# --------------------------
+
+def bem_solve(
+    spec: CanonicalSpec,
+    cfg: BEMConfig,
+    logger: JsonlLogger,
+    differentiable: bool = False,
+) -> Dict[str, Any]:
+     """
+     Single-layer BEM for Dirichlet problems with explicit point charges.
+     Returns a dict with fields consumed by the CLI:
+     - boundary_samples: List[float]
+     - sample_points: List[List[float]]
+     - solution: BEMSolution
+     - surface_charge_density: ndarray
+     - mesh_stats: Dict[str, Any] (must include 'bc_residual_linf')
+     - gmres_stats: Dict[str, Any]
+     - refinement_history: List[...]
+     """
+    # NOTE:
+    # - `differentiable` is accepted for future autograd support.
+    # - For Steps 0–4 this flag is ignored to preserve identical behavior.
+    _ = bool(differentiable)
+
+     device = _init_device(cfg)
+     dtype = torch.float64 if getattr(cfg, "fp64", False) else torch.float32
+     logger.info(
+         "BEM solver start.",
+         device=str(device),
+         fp64=bool(getattr(cfg, "fp64", False)),
+         max_refine_passes=getattr(cfg, "max_refine_passes", 3),
+     )
+
+     # Adaptive loop
+     current_h = float(getattr(cfg, "initial_h", 0.3))
+     refine_factor = float(getattr(cfg, "refine_factor", 0.5))
+     target_bc = float(getattr(cfg, "target_bc_inf_norm", 1e-7))
+     history: List[Dict[str, Any]] = []
+     best: Optional[Dict[str, Any]] = None
+     best_bc = float("inf")
+     plateau = 0
+     MAX_PLATEAU = 1
+     plateau_override_used = False
+
+     for rp in range(int(getattr(cfg, "max_refine_passes", 3))):
+         logger.info(f"Refine pass {rp+1}: target h={current_h:.4f}")
+
+         # 1) Mesh
+         try:
+             mesh: TriMesh = generate_mesh(spec, target_h=current_h, logger=logger)
+         except Exception as e:
+             logger.error("Mesh generation failed.", error=str(e))
+             break
+         N = mesh.n_panels
+         logger.info("Mesh built.", dof=N)
+
+         # 2) Tile size
+         if int(getattr(cfg, "tile_size", 0)) > 0:
+             tile_size = int(cfg.tile_size)
+         else:
+             # Use both legacy and new VRAM fields; defaults preserve behavior.
+             target_peak_gb = getattr(cfg, "target_peak_gb", None)
+             tile_mem_divisor = getattr(cfg, "tile_mem_divisor", 3.0)
+             tile_size = _autotune_tile_size(
+                N,
+                dtype,
+                device,
+                logger,
+                getattr(cfg, "target_vram_fraction", 0.8),
+                getattr(cfg, "vram_cap_gb", 24.0),
+                min_tile=getattr(cfg, "min_tile", 512),
+                max_tile=getattr(cfg, "max_tile", None),
+                target_peak_gb=target_peak_gb,
+                tile_mem_divisor=tile_mem_divisor,
+             )
+
+         # 3) Tensors
+         C = torch.as_tensor(mesh.centroids, device=device, dtype=dtype)
+         A = torch.as_tensor(mesh.areas, device=device, dtype=dtype)
+         Nrm = torch.as_tensor(mesh.normals, device=device, dtype=dtype)
+
+         # 4) Dirichlet targets and free-space term
+         bc = _bc_vector(spec, mesh, device, dtype)
+         V_free = _free_space_potential_on_centroids(spec, C)
+
+         # 5) Diagonal (self) correction ∫ dS'/|r-r'| / (4π ε0) absorbed in G·sigma
+         self_corr = torch.zeros(N, device=device, dtype=dtype)
+         for i in range(N):
+             self_corr[i] = self_integral_correction(A[i])
+
+         # 6) Operator (matrix-free)
+         def matvec_sigma(sig: torch.Tensor) -> torch.Tensor:
+             V_ind = bem_matvec_gpu(
+                 centroids=C, areas=A, sigma=sig, tile_size=tile_size, self_integrals=self_corr, use_near_quad=True
+             )
+             # NOTE: K_E and 1/|r| factors are handled in the kernel + self_corr
+             return V_ind
+
+         # 7) RHS and initial guess
+         b = (bc - V_free)
+         diag = self_corr.clamp_min(1e-18)
+         x0 = b / diag
+
+         # 8) GMRES solve
+         try:
+             sigma, info = gmres_restart(
+                 matvec_sigma,
+                 b,
+                 restart=int(getattr(cfg, "gmres_restart", 50)),
+                 tol=float(getattr(cfg, "gmres_tol", 1e-8)),
+          _       maxiter=int(getattr(cfg, "gmres_maxiter", 500)),
+                 precond="jacobi" if bool(getattr(cfg, "use_precond", True)) else None,
+                 areas=A,
+                 logger=logger,
+                 x0=x0,
+                 log_every=int(getattr(cfg, "gmres_log_every", 25)),
+             )
+         except Exception as e:
+             logger.error("GMRES failed.", error=str(e))
+             return {"error": f"GMRES failed: {e}"}
+
+         logger.info("GMRES done.", iters=info.get("iters"), resid=info.get("resid"), success=info.get("success"))
+
+         # 9) Post-process
+         V_ind = matvec_sigma(sigma)
+         V_tot = torch.nan_to_num(V_free + V_ind, nan=0.0, posinf=0.0, neginf=0.0)
+         bc_resid_linf = float(torch.max(torch.abs(V_tot - bc)).item())
+
+         # energy A variant for diagnostics
+         sigma_sane = torch.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+         energy_A = compute_bem_capacitive_energy(V_tot, sigma_sane, A)
+
+         logger.info("Pass results.", bc_residual_linf=bc_resid_linf, energy_A=f"{energy_A:.6e}")
+
+         pass_payload: Dict[str, Any] = {
+             "pass": rp + 1,
+  _          "h": current_h,
+             "dof": N,
+             "bc_residual_linf": bc_resid_linf,
+             "energy_A": energy_A,
+             "gmres_info": info,
+             "tile_size": tile_size,
+             "artifacts": (spec, C, A, Nrm, sigma, V_tot, mesh),
+         }
+         history.append(pass_payload)
+
+         # keep best by BC residual
+         if bc_resid_linf < best_bc:
+             improvement = (best_bc - bc_resid_linf) if math.isfinite(best_bc) else float("inf")
+             best = pass_payload
+             best_bc = bc_resid_linf
+             plateau = 0 if improvement > max(1e-16, 0.05 * max(best_bc, 1e-16)) else plateau + 1
+         else:
+             plateau += 1
+
+         # Stop conditions
+         stop_by_bc = (bc_resid_linf <= target_bc)
+         have_min_panels = (N >= int(getattr(cfg, "min_panels", 0)))
+         have_min_passes = ((rp + 1) >= int(getattr(cfg, "min_refine_passes", 1)))
+
+         if stop_by_bc and have_min_panels and have_min_passes:
+             logger.info(
+                 "Target BC residual reached and min_panels/min_passes satisfied.",
+                 min_panels=int(getattr(cfg, "min_panels", 0)),
+                 passes=rp + 1,
+                 dof=N,
+             )
+             break
+
+         if plateau >= MAX_PLATEAU and have_min_panels and have_min_passes:
+             # Do not force another refinement: prefer fewer passes with larger tiles.
+             logger.info("Plateau detected — stopping refinement to avoid long runs.", plateau=plateau)
+             break
+
+         current_h *= refine_factor
+
+     if best is None:
+         if not history:
+             logger.error("BEM solve produced no passes.")
+             return {"error": "BEM solve failed (no passes)"}
+         best = history[-1]
+         logger.warning("Using last pass for diagnostics (no improvement).", dof=best["dof"])
+
+     # Unpack best artifacts
+     spec_b, C_b, A_b, Nrm_b, sigma_b, Vtot_b, mesh_b = best["artifacts"]
+     N_b = best["dof"]
+     tile_b = best["tile_size"]
+
+     # Build evaluator
+     solution = BEMSolution(spec_b, C_b, A_b, sigma_b, C_b.device, C_b.dtype, tile_b, normals=Nrm_b)
+     solution.meta["energy_A"] = best["energy_A"]
+    # Record VRAM-related config for observability (no behavioral impact).
+    solution.meta["bem_vram_config"] = {
+        "target_peak_gb": float(getattr(cfg, "target_peak_gb", 0.0) or 0.0),
+        "tile_mem_divisor": float(
+            getattr(cfg, "tile_mem_divisor", 3.0) or 3.0
+  s       ),
+        "fp64": bool(getattr(cfg, "fp64", False)),
+    }
+
+     # Boundary samples (subsample for speed; ensure at least one sample)
+     # Denser boundary sampling improves Dual-route diagnostic stability
+     n_samples = min(1024, max(1, N_b))
+     if n_samples == 1:
+         idx = torch.tensor([0], device=C_b.device, dtype=torch.long)
+     else:
+         step = max(1, N_b // n_samples)
+         idx = torch.arange(0, N_b, step, device=C_b.device, dtype=torch.long)[:n_samples]
+     sample_points = C_b[idx].detach().cpu().numpy().tolist()
+     boundary_samples = Vtot_b[idx].detach().cpu().numpy().tolist()
+
+     # --- Plane patch extent for certification reproducibility ---
+     patch_L: Optional[float] = None
+     try:
+         if any(c.get("type") == "plane" for c in spec.conductors):
+             total_area = float(A_b.sum().item()) if N_b > 0 else 0.0
+             if total_area > 0.0:
+                 patch_L = math.sqrt(total_area)
+                 logger.info(
+                     "Plane patch extent recorded.",
+Boolean                 total_area=f"{total_area:.6f}",
+                     patch_L=f"{patch_L:.6f}",
+                 )
+             else:
+                 logger.warning("Plane patch extent unavailable (zero area).")
+     except Exception as _e:
+         logger.warning("Failed computing patch extent.", error=str(_e))
+         patch_L = None
+
+     out: Dict[str, Any] = {
+         "boundary_samples": boundary_samples,
+         "sample_points": sample_points,
+         "solution": solution,
+         "surface_charge_density": sigma_b.detach().cpu().numpy(),
+         "mesh_stats": {
+             "n_panels": N_b,
+             "total_area": float(A_b.sum().item()) if N_b > 0 else 0.0,
+             "bc_residual_linf": float(best["bc_residual_linf"]),
+  t          "h_final": float(best["h"]),
+             "tile_size_final": int(tile_b),
+             "patch_L": patch_L,
+         },
+         "gmres_stats": dict(best["gmres_info"]),
+source         "refinement_history": history,
+     }
+
+     return out

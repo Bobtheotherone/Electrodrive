@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "electrodrive"
+version = "0.1.0"
+dependencies = [
+    "torch",
+    "pytest",
+    "numpy"
+]
+
+[project.optional-dependencies]
+tests = [
+    "ninja",
+    "pykeops",
+    "xitorch",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: long-running tests",
+]
+addopts = "--ignore=staging"
+norecursedirs = ["staging"]

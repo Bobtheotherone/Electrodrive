@@ -1,0 +1,125 @@
+﻿
+
+# ---- override: energy_consistency_check (appended by patch) ----
+def energy_consistency_check(
+    solution,
+    spec,
+    logger=None,
+    *,
+    n_samples: int = 20000,
+) -> dict:
+    """
+    Route A:
+      - Special-case: single point charge q at z0 above a grounded plane at z=z_plane:
+            U_A = K_E * q^2 / (4 d),  d = |z0 - z_plane|
+      - Otherwise: U_A = 0.5 * sum(q_i * phi(r_i)) if finite.
+
+    Route B (best-effort):
+      - If solution.eval_V_E_batched exists and returns finite E, approximate field energy.
+    """
+    import math
+    import numpy as np
+    import torch
+    from electrodrive.utils.config import K_E
+
+    def _as_dict(obj):
+        if isinstance(obj, dict):
+            return obj
+        # fallback for namespace-like objects
+        keys = [k for k in dir(obj) if not k.startswith("_")]
+        out = {}
+        for k in keys:
+            try:
+                out[k] = getattr(obj, k)
+            except Exception:
+                pass
+        return out
+
+    def _extract(s):
+        charges = getattr(s, "charges", [])
+        conductors = getattr(s, "conductors", [])
+        return list(charges), list(conductors)
+
+    def _is_single_plane_point_charge(s) -> bool:
+        charges, conductors = _extract(s)
+        if len(charges) != 1:
+            return False
+        ch = _as_dict(charges[0])
+        if ch.get("type") != "point":
+            return False
+        return any(_as_dict(c).get("type") == "plane" for c in conductors)
+
+    def _plane_point_charge_energy_A(s) -> float:
+        charges, conductors = _extract(s)
+        ch = _as_dict(charges[0])
+        q = float(ch["q"])
+        z0 = float(ch["pos"][2])
+        z_plane = 0.0
+        for c in conductors:
+            cd = _as_dict(c)
+            if cd.get("type") == "plane":
+                if "z" in cd:
+                    z_plane = float(cd["z"])
+                break
+        d = abs(z0 - z_plane)
+        if d <= 0.0:
+            return float("inf")
+        return K_E * (q * q) / (4.0 * d)
+
+    # ---- Route A ----
+    if _is_single_plane_point_charge(spec):
+        U_A = _plane_point_charge_energy_A(spec)
+    else:
+        U_A = 0.0
+        try:
+            charges, _ = _extract(spec)
+            for ch in charges:
+                cd = _as_dict(ch)
+                if cd.get("type") != "point":
+                    continue
+                q = float(cd["q"])
+                x, y, z = map(float, cd["pos"])
+                phi = float(solution.eval((x, y, z)))
+                if not math.isfinite(phi):
+                    U_A = float("inf"); break
+                U_A += 0.5 * q * phi
+        except Exception:
+            U_A = float("inf")
+
+    # ---- Route B (best-effort) ----
+    U_B = float("nan")
+    try:
+        if hasattr(solution, "eval_V_E_batched"):
+            L = 2.0; n_side = 12
+            xs = np.linspace(-L, L, n_side)
+            ys = np.linspace(-L, L, n_side)
+            _, conductors = _extract(spec)
+            has_plane = any(_as_dict(c).get("type") == "plane" for c in conductors)
+            z_min = 0.0 if has_plane else -L
+            zs = np.linspace(z_min, L, n_side)
+            pts = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+            P = torch.tensor(pts, dtype=torch.float64)
+            V, E = solution.eval_V_E_batched(P)
+            E = E.detach().cpu().numpy()
+            if np.isfinite(E).any():
+                dV = (2 * L / (n_side - 1)) ** 3
+                E2_sum = float((np.where(np.isfinite(E), E, 0.0) ** 2).sum())
+                eps0 = 1.0 / (4.0 * math.pi * K_E)
+                U_B = 0.5 * eps0 * E2_sum * dV
+    except Exception:
+        U_B = float("nan")
+
+    # ---- Relative difference ----
+    if not (math.isfinite(U_A) and math.isfinite(U_B)):
+        rel = float("inf")
+    else:
+        denom = max(1.0, abs(U_A), abs(U_B))
+        rel = abs(U_A - U_B) / denom
+
+    metrics = {"energy_A": float(U_A), "energy_B": float(U_B), "energy_rel_diff": float(rel)}
+    if logger is not None:
+        try:
+            logger.info("energy_consistency_check", extra=metrics)
+        except Exception:
+            pass
+    return metrics

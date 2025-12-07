@@ -1,0 +1,30 @@
+device: ""
+dtype: float32
+
+dataset:
+  n_train: 5000
+  n_val: 500
+  n_theta: 64
+  n_phi: 128
+  seed: 123
+  ranges:
+    q: [0.5, 2.0]
+    a: [0.5, 2.0]
+    z0_over_a: [1.05, 3.0]
+    center: [0.0, 0.0, 0.0]
+
+model:
+  n_theta: 64
+  n_phi: 128
+  modes_theta: 16
+  modes_phi: 16
+  width: 64
+  n_layers: 4
+  param_hidden: 64
+
+training:
+  batch_size: 16
+  epochs: 5
+  lr: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0

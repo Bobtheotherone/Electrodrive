@@ -1,0 +1,31 @@
+﻿exp_name: pinn_harmonic_large_vram
+seed: 42
+device: cuda
+train_dtype: float32   # CLI will override to bf16 when desired
+
+dataset:
+  n_train_problems: 8
+  n_val_problems: 2
+  samples_per_problem_jit: 4096   # try 8192 later if VRAM allows
+  ratio_boundary: 0.4
+  ratio_interior: 0.6
+  supervision_mode: analytic
+
+model:
+  model_type: pinn_harmonic_large
+  params:
+    use_fourier: true
+    fourier_scale: 10.0
+    # Large defaults (width=1536, depth=16, residual_every=4) are implicit
+
+trainer:
+  max_epochs: 2
+  batch_size: 65536      # ramp: 65536 → 98304 → 131072 (watch VRAM)
+  learning_rate: 1.0e-4
+  lr_scheduler: cosine
+  weight_decay: 1.0e-5
+  grad_clip_norm: 1.0
+  use_amp: false         # CLI --amp overrides when desired
+  log_every_n_steps: 1
+  val_every_n_epochs: 1
+  ckpt_every_n_epochs: 2

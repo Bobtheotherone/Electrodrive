@@ -1,0 +1,9 @@
+﻿charges:
+  - type: point
+    q: 1.0
+    pos: [0.0, 0.0, 0.5]
+conductors:
+  - type: plane
+    z: 0.0
+domain:
+  bbox: [[-1,-1,0],[1,1,2]]

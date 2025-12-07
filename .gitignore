@@ -1,0 +1,38 @@
+# Virtual env
+.venv/
+.pytest_cache/
+
+# Python noise
+__pycache__/
+*.pyc
+*.pyd
+
+# Logs / runs / outputs
+logs/
+runs/
+run_out/
+outdir/
+*.log
+*.jsonl
+*.json
+*.tsv
+
+# Temporary / analysis artifacts
+repo_flatten.txt
+repo_flattened.txt
+
+# Zip bundles
+*.zip
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE / editors
+.vscode/
+.idea/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc

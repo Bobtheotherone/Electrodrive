@@ -1,0 +1,7 @@
+file,count,mean_rel_l2_error,max_rel_l2_error
+fmm_stress_grid.jsonl,28,,
+l2l_sweep.jsonl,18,0.5468732378725831,1.0400950068231611
+l2l_translation.jsonl,1,0.331737352734407,0.331737352734407
+l2l_usage_stats.jsonl,349,,
+local_rescaling.jsonl,16,0.0,0.0
+m2l_sweep.jsonl,18,0.2562070867616691,0.8803186737111875

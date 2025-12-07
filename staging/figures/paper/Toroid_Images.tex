@@ -1,0 +1,830 @@
+\documentclass[11pt]{article}
+
+% ======================================================================
+% Encoding, fonts, layout
+% ======================================================================
+\usepackage{iftex}
+\ifPDFTeX
+\PackageError{torus-images}
+{This document must be compiled with LuaLaTeX or XeLaTeX, not pdfLaTeX}
+{Please run `lualatex` or `xelatex` instead of `pdflatex`.}
+\fi
+
+% NOTE: Compile with lualatex or xelatex (NOT pdflatex).
+\usepackage{fontspec}
+\usepackage{unicode-math}
+
+% Robust font setup (Latin Modern family)
+\setmainfont{Latin Modern Roman}
+\setsansfont{Latin Modern Sans}
+\setmonofont{Inconsolata}
+\setmathfont{Latin Modern Math}
+
+\usepackage{geometry}
+\usepackage{setspace}
+\usepackage{microtype}
+\geometry{margin=1in}
+
+\setstretch{1.15}
+
+% ======================================================================
+% Mathematics
+% ======================================================================
+\usepackage{amsmath,amsthm,mathtools}
+\numberwithin{equation}{section}
+
+% ======================================================================
+% Lists, colors
+% ======================================================================
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\setlist{topsep=0.3em, itemsep=0.2em}
+\setlist[itemize]{leftmargin=1.5em}
+\setlist[itemize,1]{label=\textbullet}
+\setlist[itemize,2]{label=--}
+\setlist[itemize,3]{label=*}
+\setlist[description]{leftmargin=1.8em,labelsep=0.5em}
+
+% ======================================================================
+% Figures and graphics
+% ======================================================================
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+
+% ======================================================================
+% Bibliography (Harvard-style via natbib, manual thebibliography)
+% ======================================================================
+\usepackage[authoryear]{natbib}
+
+% ======================================================================
+% Hyperlinks, URLs, underscores in text
+% ======================================================================
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!40!black,
+  urlcolor=blue!40!black,
+  citecolor=blue!40!black,
+  pdfauthor={Radames Mercado-Barbosa},
+  pdftitle={Low-Rank Image Systems for Toroidal Electrostatics: A Data-Driven Study (MOI Discovery Project)},
+}
+
+\usepackage{xurl}
+\urlstyle{tt}
+
+% Allow underscores safely in text and \texttt
+\usepackage[strings]{underscore}
+
+% ======================================================================
+% Header / footer
+% ======================================================================
+\usepackage{fancyhdr}
+
+\setlength{\headheight}{15pt}
+\addtolength{\topmargin}{-3pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Low-Rank Image Systems for Toroidal Electrostatics}
+\fancyhead[R]{Radames Mercado-Barbosa}
+\fancyfoot[C]{\thepage}
+
+% ======================================================================
+% Section formatting
+% ======================================================================
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.5em}{}
+
+% ======================================================================
+% Highlighted boxes
+% ======================================================================
+\usepackage[most]{tcolorbox}
+
+\newtcolorbox{guardrailbox}[1][]{
+  enhanced,
+  breakable,
+  colback=gray!3,
+  colframe=gray!60!black,
+  boxrule=0.6pt,
+  arc=2mm,
+  left=6pt,right=6pt,top=6pt,bottom=6pt,
+  title=\textbf{#1}
+}
+
+\newtcolorbox{designbox}[1][]{
+  enhanced,
+  breakable,
+  colback=blue!1,
+  colframe=blue!50!black,
+  boxrule=0.5pt,
+  arc=2mm,
+  left=6pt,right=6pt,top=6pt,bottom=6pt,
+  title=\textbf{#1}
+}
+
+% ======================================================================
+% Inline code helpers
+% ======================================================================
+\newcommand{\cli}[1]{\texttt{#1}} % for shell commands, etc.
+\newcommand{\filepath}[1]{\href{run:#1}{\texttt{\textcolor{black}{#1}}}}
+
+% ======================================================================
+% Document
+% ======================================================================
+
+\begin{document}
+
+\hypersetup{pageanchor=false}
+
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+
+{\Large\scshape MOI Discovery Project\par}
+\vspace{1cm}
+
+{\huge\bfseries Low-Rank Image Systems for Toroidal Electrostatics\par}
+\vspace{0.4cm}
+{\Large A Data-Driven Study of Approximate Green's Functions\par}
+\vspace{1.2cm}
+
+{\Large\bfseries Radames Mercado-Barbosa\par}
+
+\vfill
+
+{\large
+\textbf{Project:}\par
+\vspace{0.15cm}
+Method of Images (MOI) Discovery Project\par
+}
+
+\vspace{1.2cm}
+
+{\large \today\par}
+
+\end{titlepage}
+
+\clearpage
+\setcounter{page}{1}
+\hypersetup{pageanchor=true}
+
+\phantomsection
+\pdfbookmark[1]{Contents}{toc}
+\tableofcontents
+\clearpage
+
+\begin{abstract}
+The classical method of images provides exact finite-basis representations of Green's functions for highly symmetric conductors such as planes and spheres, but no such image system is known for a grounded torus.\footnote{Classical discussions of image methods can be found in, for example, \citet{jackson1999,smythe1989,kellogg1929}.}
+Toroidal harmonics suggest that the associated Green's function has infinite rank, and functional-analytic results for the single-layer boundary integral operator on a torus rule out any exact finite image basis beyond trivial geometries.\footnote{See, for example, \citet{kress2014,mclean2000} for background on boundary integral operators in potential theory.}
+In this work we ask a weaker, numerical question: can a small, fixed set of image primitives act as an accurate \emph{approximate} Green's function for a grounded torus, at least along a one-parameter family of source positions?
+
+We study a mid-aspect torus with major radius $R=1$, minor radius $a=0.35$, grounded boundary, and a unit point charge constrained to the symmetry axis.\footnote{Geometry defined by \filepath{specs/torus_axis_point_mid.json}.}
+Using GPU-accelerated boundary element solvers, we discover and refine a compact image basis consisting of two order-2 poloidal rings and four near-surface point images.\footnote{See \filepath{runs/torus/discovered/mid_bem_highres_trial02} and associated diagnostics.}
+The ring radii are held fixed while the six image weights are re-optimised for axis source positions $z\in[0.4,0.9]$.
+High-resolution BEM diagnostics show that this fixed geometry attains mean relative errors of order $5$--$10$\% along most of the axis, with comparable errors on the inner rim, while the maximum relative error is dominated by rare but large spikes near sharp boundary-layer features.\footnote{Summarised in \filepath{metrics/stage4_metrics_mid_axis_sweep_bem.json} and related NPZ diagnostics.}
+
+We assemble a weight matrix $W\in\mathbb{R}^{6\times 11}$ over 11 axis positions and compute its singular value decomposition (SVD).
+The normalised singular values $\sigma_i/\sigma_1$ decay rapidly, with approximate spectrum $(1.0, 0.41, 0.06, 0.02, 0.006, 0.002)$, indicating an effective numerical rank between two and three for the axis family.\footnote{See \filepath{metrics/mid_axis_weight_svd.json}.}
+Truncating to rank $r=2$ or $r=3$ yields nearly indistinguishable BEM metrics compared with the full six-parameter system over the bulk of the axis, even though functional analysis guarantees that no finite-rank Green's function exists for the full three-dimensional problem.
+Our results thus reconcile operator-theoretic impossibility with strong low-rank structure on restricted parameter sets, and they highlight how small, data-driven image bases can provide practical, interpretable approximations for toroidal electrostatics.
+\end{abstract}
+
+% ======================================================================
+\section{Introduction}
+% ======================================================================
+
+Green's functions and the method of images are cornerstones of electrostatics and potential theory.
+For a grounded plane or sphere, the potential induced by a point charge can be written exactly as a finite sum of free-space Green's kernels centred at simple image locations, yielding closed-form solutions and powerful physical intuition for conductor--charge interactions; see, for example, the classical treatments in \citet{jackson1999,smythe1989,kellogg1929}.
+These constructions are widely used to derive capacitances, forces, and induced surface charge densities.
+
+This study forms part of a broader Method of Images (MOI) Discovery Project, which uses numerical experiments to search systematically for approximate image systems in geometries beyond the classical plane and sphere.
+
+For more complicated geometries, however, no such finite image representation is available.
+A torus is a particularly interesting case: it retains axial symmetry and admits a natural system of toroidal coordinates, but the associated harmonic functions form an infinite double sequence of toroidal harmonics indexed by both azimuthal and poloidal mode numbers.\footnote{Background on toroidal coordinates and harmonics can be found in standard references such as \citet{morsefeshbach1953,moonspencer1961}.}
+Even in the azimuthally symmetric $(m=0)$ sector, toroidal harmonic theory predicts that an infinite ladder of poloidal modes is needed to represent a point-source Green's function with a grounded toroidal boundary.
+
+Recent analysis of the single-layer boundary integral operator for a grounded torus shows that this operator is compact, positive and self-adjoint on suitable $L^2$ spaces, with a discrete spectrum accumulating only at zero, in line with general results for smooth conductors \citep[see, e.g.,][]{kress2014,mclean2000}.
+The corresponding Green's kernel is Hilbert--Schmidt and has infinite rank; consequently, no exact finite-basis representation of the Green's function exists except for trivial geometries.
+From the perspective of the method of images this rules out any globally valid, finite set of image charges, rings, or multipoles that would reproduce the toroidal Green's function for all source and field points.
+
+The guiding idea of the present work is to soften the problem.
+Instead of seeking an exact image system, we ask whether a small, \emph{fixed} collection of image primitives can act as a high-quality \emph{approximate} Green's function along a restricted one-parameter family of source locations---here, point charges constrained to lie on the symmetry axis of a torus of fixed aspect ratio.
+Concretely, we study a mid-aspect torus with major radius $R=1$ and minor radius $a=0.35$, grounded potential, and a unit axis charge whose height $z$ is varied between $0.4$ and $0.9$.
+
+We build on a data-driven discovery pipeline that couples a flexible image-basis library with GPU-accelerated boundary element (BEM) solvers.
+Randomized discovery runs search over combinations of point images, poloidal rings, ring ladders, and toroidal eigen-mode primitives for a family of torus and parallel-plane benchmarks.
+For the mid-aspect torus axis problem, these runs identify a promising 2-ring + 4-point configuration which is then refined using local geometry exploration and high-resolution BEM diagnostics.
+
+This paper has three main goals:
+\begin{enumerate}
+  \item to document and interpret the numerically discovered 2-ring + 4-point image system for a grounded mid-aspect torus;
+  \item to quantify its accuracy and robustness as an approximate Green's function along the symmetry axis by means of axis sweeps, singular value analysis and rank-truncation experiments; and
+  \item to connect these numerical observations to the underlying operator theory, clarifying why exact finite image systems remain impossible while low-rank approximations on restricted parameter sets are nevertheless natural.
+\end{enumerate}
+
+The rest of the paper is organised as follows.
+Section~\ref{sec:background} reviews toroidal coordinates, boundary integral formulations, and functional-analytic properties of the torus single-layer operator.
+Section~\ref{sec:methods} details the geometry specification, BEM solvers, image-basis primitives and discovery pipeline used in our study.
+Section~\ref{sec:results} presents BEM error maps, axis-sweep diagnostics and singular value decompositions of the axis weight map.
+Section~\ref{sec:discussion} synthesises the theoretical and numerical perspectives, and Section~\ref{sec:conclusion} summarises the main conclusions and outlines directions for future work.
+
+% ======================================================================
+\section{Background and theory}
+\label{sec:background}
+% ======================================================================
+
+\subsection{Green's functions and image systems}
+
+We work in three-dimensional free space, where the electrostatic potential $u(x)$ produced by a point charge of strength $q$ located at $x_0$ satisfies Laplace's equation away from the charge,
+\begin{equation}
+  -\Delta u(x) = q\,\delta(x - x_0), \qquad x\in\mathbb{R}^3,
+\end{equation}
+with appropriate boundary conditions on any conducting surfaces.
+In free space the Green's function is
+\begin{equation}
+  G(x,x_0) = \frac{1}{4\pi}\,\frac{1}{\lVert x - x_0\rVert},
+\end{equation}
+so that $u(x) = q\,G(x,x_0)$.
+
+When a perfectly conducting surface $\Gamma$ is grounded (Dirichlet condition $u = 0$ on $\Gamma$), the method of images seeks a representation of the form
+\begin{equation}
+  u(x) = q\,G(x,x_0) + \sum_{j=1}^N w_j(x_0)\,G(x,y_j),
+  \label{eq:image-ansatz}
+\end{equation}
+where $y_j$ are source locations of image charges and $w_j(x_0)$ are weight functions depending on the physical source $x_0$.
+For planes and spheres an appropriate choice of $N$, positions $y_j$ and weight functions $w_j$ yields an exact solution satisfying the boundary conditions for all $x_0$ in some admissible region \citep[e.g.][]{jackson1999,kellogg1929}.
+
+The key structural property for such classical cases is that the boundary integral operator induced by the Green's kernel admits a finite-dimensional invariant subspace spanned by the boundary traces of the image primitives.
+For a torus, as discussed below, no such finite invariant subspace exists; the single-layer operator has infinitely many non-zero eigenvalues.
+The best one can hope for is therefore an approximate representation like~\eqref{eq:image-ansatz}, with a small number of images capturing the dominant behaviour for a restricted set of source positions.
+
+\subsection{Toroidal coordinates and harmonics}
+
+A standard description of a torus of revolution of major radius $R$ and minor radius $a$ uses toroidal coordinates $(\eta,\theta,\phi)$ defined by
+\begin{align}
+  x &= \frac{R\sinh\eta}{\cosh\eta - \cos\theta}\,\cos\phi, &
+  y &= \frac{R\sinh\eta}{\cosh\eta - \cos\theta}\,\sin\phi, &
+  z &= \frac{R\sin\theta}{\cosh\eta - \cos\theta},
+\end{align}
+with $\eta\ge 0$, $\theta\in(-\pi,\pi]$ and $\phi\in[0,2\pi)$.
+Surfaces of constant $\eta$ are tori, and the Laplacian is separable in these coordinates.
+Toroidal harmonics provide separated solutions of Laplace's equation which, when restricted to a torus $\eta=\eta_0$, form an infinite family indexed by azimuthal and poloidal mode numbers; see \citet{morsefeshbach1953,moonspencer1961} for classical accounts.
+Even in the azimuthally symmetric sector $(m=0)$ an infinite ladder of poloidal modes is needed to represent generic boundary data; there is no natural finite truncation that preserves the boundary conditions exactly.
+
+From a practical standpoint, these toroidal harmonics offer a route to spectral discretisations of the boundary-value problem, but they are poorly adapted to data-driven image design: the physical interpretation of individual modes is indirect, and the resulting representations are not easily expressed in terms of a small number of point images or simple ring charges.
+
+\subsection{Boundary integral formulation and infinite rank}
+
+Let $\Gamma$ denote the torus surface, and let $G$ be the free-space Green's function.
+For the Dirichlet problem with a grounded torus and a unit point charge at $x_0$ outside the conductor, the single-layer potential
+\begin{equation}
+  (\mathcal{S}\sigma)(x) := \int_{\Gamma} G(x,y)\,\sigma(y)\,\mathrm{d}S_y
+\end{equation}
+represents the potential induced by a surface charge density $\sigma$.
+If we write the total potential as
+\begin{equation}
+  u(x) = G(x,x_0) + (\mathcal{S}\sigma)(x),
+\end{equation}
+then the boundary condition $u|_{\Gamma} = 0$ yields the integral equation
+\begin{equation}
+  (\mathcal{S}\sigma)(x) = -G(x,x_0),\qquad x\in\Gamma.
+  \label{eq:bie}
+\end{equation}
+
+Rigorous analysis of the operator $\mathcal{S}\colon L^2(\Gamma)\to L^2(\Gamma)$ for smooth conductors such as tori shows that $\mathcal{S}$ is compact, self-adjoint and positive, with a countable family of eigenpairs $\{(\lambda_k,\varphi_k)\}_{k=1}^\infty$ and $\lambda_k\to 0$ \citep[see, e.g.,][]{kress2014,mclean2000}.
+The kernel $G|_{\Gamma\times\Gamma}$ is therefore Hilbert--Schmidt and has infinite rank:
+\begin{equation}
+  G(x,y) = \sum_{k=1}^{\infty} \lambda_k \varphi_k(x)\,\varphi_k(y),
+  \qquad x,y\in\Gamma,
+\end{equation}
+with infinitely many non-zero singular values $\lambda_k$.
+No finite set of basis functions $\{\psi_j\}_{j=1}^N$ on $\Gamma$ can reproduce $G$ exactly for all $x,y\in\Gamma$.
+Equivalently, there is no finite image system whose boundary trace spans the range of the single-layer operator.
+
+However, when we restrict attention to a one-parameter family of boundary data $f_z(x) = -G(x,x_z)$ induced by unit point charges located at axis positions $x_z=(0,0,z)$, the set $\{f_z: z\in I\}\subset L^2(\Gamma)$ may be well-approximated by a low-dimensional subspace.
+In that case, a small number of suitably chosen image primitives might suffice to capture the axis family $u_z$ to good accuracy, even though the operator itself is infinite rank.
+Understanding this tension between global infinite rank and restricted low-rank structure is one of the main motivations for the numerical study that follows.
+
+\subsection{Inner-rim boundary layers}
+
+The geometry of a torus introduces a sharp distinction between the convex outer rim and the concave inner rim.
+Asymptotic and numerical analyses of toroidal electrostatics reveal strong boundary layers concentrated near the inner rim, where curvature effects and the local ``bottleneck'' geometry amplify field gradients; related phenomena are discussed in, for example, \citet{kellogg1929} and more recent boundary-integral work such as \citet{borachok2016}.
+Capturing these layers requires relatively high poloidal resolution, whether in toroidal harmonics or in any equivalent boundary representation.
+
+From the perspective of image design, this suggests that a small number of global primitives (for example smooth poloidal rings) may approximate the potential well away from the inner rim, but additional localised elements near the inner rim are needed to resolve steep gradients.
+This motivates the mixed basis used in our experiments: two global poloidal rings combined with four near-surface point images placed strategically near the torus surface.
+
+% ======================================================================
+\section{Numerical methods}
+\label{sec:methods}
+% ======================================================================
+
+\subsection{Geometry and axis specification}
+
+All experiments in this paper use a mid-aspect torus defined by the JSON specification
+\begin{center}
+\filepath{specs/torus_axis_point_mid.json},
+\end{center}
+which places a unit point charge on the symmetry axis at $z=0.7$ and a grounded torus of major radius $R=1.0$ and minor radius $a=0.35$ centred at the origin, with a bounding box $[-3,3]^3$.
+Axis-sweep experiments move the source charge along the $z$-axis while keeping the geometry fixed.
+
+We denote the source position by $x_z=(0,0,z)$.
+For the axis-weight data set we use a uniform grid of 11 heights
+\begin{equation}
+  z_k = 0.40 + 0.05(k-1), \qquad k=1,\dots,11,
+\end{equation}
+spanning the interval $[0.40,0.90]$.
+Most high-resolution BEM diagnostics are reported for the subset $z\in\{0.40,0.60,0.70,0.90\}$, which probes both mid-axis and near-rim regimes.
+
+\subsection{Boundary element discretisation}
+
+We solve the boundary integral equation~\eqref{eq:bie} using a GPU-accelerated boundary element method.
+The torus surface is discretised into planar panels with centroids $y_p$, areas $A_p$, and outward normals.
+A Nyström-like quadrature replaces the surface integral by a panelwise sum,
+\begin{equation}
+  (\mathcal{S} \sigma)(x_i)
+  \approx \sum_{p=1}^{P} G(x_i,y_p)\,A_p\,\sigma_p,
+\end{equation}
+where $\sigma_p$ approximates the surface charge density on panel $p$, and $x_i$ are collocation points on or near the surface.
+The resulting linear system is solved iteratively using conjugate gradients or GMRES-like solvers depending on context.
+
+The core matrix--vector operations are implemented through a routine
+\texttt{bem\_matvec\_gpu} with a choice of dense ``torch\_tiled'' backend or an external fast multipole method (FMM) backend.
+Dedicated stress tests in \filepath{code/test_stress.py} compare the FMM and dense backends on a sequence of panel counts and show relative $\ell^2$ errors below $10^{-2}$, giving confidence in the FMM-based diagnostics used in the refinement stage.
+
+For discovery and axis-weight solves we use a collocation set of size $N_{\mathrm{colloc}}=3072$ or $4096$, with approximately $80$\% of points on the conductor boundary and the remainder in off-surface ``belts'' that probe the near-field region of interest.
+High-resolution diagnostics for cross-sectional error maps use regular grids of size $n_r\times n_z$ with $n_r,n_z$ between 200 and 220 in the $(r,z)$ plane, with the potential evaluated along the vertical plane $\{(r,0,z)\}$.
+
+\subsection{Image-basis primitives}
+
+The image library includes several primitive types:
+\begin{itemize}
+  \item \textbf{Point charges} located at arbitrary positions in $\mathbb{R}^3$.
+  \item \textbf{Poloidal rings}, parameterised as continuous loops encircling the symmetry axis at radius $r$, with radial thickness $\delta r$ and polynomial order $n$ controlling the radial weight profile.
+  \item \textbf{Ring ladders} and other inner-rim primitives, which place stacks of rings near the inner rim to capture strong boundary layers.
+  \item \textbf{Toroidal eigen-mode primitives}, which encapsulate low-index toroidal harmonics as precomputed basis functions on the torus surface.
+\end{itemize}
+
+In this study we ultimately fix a geometry consisting of two order-2 poloidal rings and four point images.
+The torus geometry cross-section and the positions of the rings and points are depicted in Figure~\ref{fig:geometry}.
+The cross-sectional plotting utility \filepath{code/plot_mid_torus_geometry_cross_section.py} extracts the mean ring radii and point cylindrical coordinates from a discovered-system JSON file and overlays them on the torus outline.
+The final high-resolution configuration, referred to as \texttt{mid\_bem\_highres\_trial02}, has ring radii approximately $r_1\approx 1.06$ and $r_2\approx 0.95$ with radial half-widths $\delta r_1\approx 0.08$ and $\delta r_2\approx 0.19$, and four near-surface points clustered near the outer and inner rims.
+
+\subsection{Discovery pipeline: from random seeds to high-resolution trial}
+
+The discovery pipeline proceeds in stages.
+
+\paragraph{Random and modes-enriched exploration.}
+A general-purpose driver \filepath{code/run_grandchallenge_experiments.py} orchestrates large grids of discovery experiments across torus and parallel-plane specifications, exploring mixtures of point, ring, ring-ladder and toroidal-mode primitives under different regularisation strengths and sampling patterns.
+A late-stage diagnostic suite (hereafter referred to as ``Stage-4 metrics'')---including mean relative error on the boundary and on off-axis belts---is logged to JSON files such as \filepath{runs/torus/stage4_metrics_grandchallenge.json}.
+For the mid-aspect torus axis spec, these runs identify a promising 2-ring + 4-point seed system with significantly lower errors than a toroidal-eigenmode baseline yet comparable overall complexity.
+
+\paragraph{Local geometry exploration.}
+Starting from the 2-ring + 4-point seed, a dedicated \filepath{mid_torus_local_geometry_explorer} perturbs ring radii, thicknesses and orders, as well as point cylindrical coordinates $(\rho,\phi,z)$, within user-specified ranges.
+For each perturbed geometry, the script assembles the corresponding basis matrix, solves a weighted $\ell^1$-regularised least-squares problem for the image weights using an iterative shrinkage--thresholding algorithm (ISTA) solver, and evaluates Stage-4 metrics using the standard evaluation routine.
+Trials are ranked by mean relative error; the most promising candidates are optionally promoted to high-resolution BEM diagnostics.
+
+\paragraph{High-resolution BEM refinement and FMM sanity checks.}
+The script \filepath{code/mid_torus_bem_fmm_refine.py} takes a small set of candidate systems (baseline eigen-mode, 2-ring + 4-point seed, best local geometry trials) and performs high-resolution BEM evaluations, including cross-sectional error maps and histogram diagnostics, to select the final configuration \texttt{mid\_bem\_highres\_trial02}.
+The same script optionally performs FMM-based matvec diagnostics for selected systems and logs the relative discrepancy between FMM and dense BEM backends, confirming that FMM-based evaluations are within the tolerance budget.
+
+\subsection{Axis sweep and weight data sets}
+
+Once the geometry is frozen at \texttt{mid\_bem\_highres\_trial02}, the axis sweep script \filepath{code/mid_torus_axis_sweep.py} moves the source charge along the symmetry axis, solving for optimal image weights at each height.
+For a user-specified list of $z$ positions (default $0.4,0.5,\dots,0.9$), this script:
+\begin{enumerate}
+  \item constructs the corresponding spec by updating the axis charge height;
+  \item assembles collocation data with a boundary:off-surface ratio of $0.8:0.2$;
+  \item solves a weighted $\ell^1$-regularised problem for the six image weights, with regularisation parameters $\lambda_{\ell^1}=4\times 10^{-4}$ and a point-image multiplier of 4; and
+  \item evaluates low-resolution Stage-4 metrics and high-resolution BEM diagnostics on $n_r\times n_z$ grids with $n_r,n_z\approx 220$.
+\end{enumerate}
+The axis-sweep BEM metrics are written to \filepath{runs/torus/stage4_metrics_mid_axis_sweep_bem.json} and later aggregated into the CSV file \filepath{tables/mid_axis_sweep_bem.csv} used for Table~\ref{tab:axis-sweep}.
+
+A companion script \filepath{code/mid_torus_axis_weight_dataset.py} builds a dense axis-weight dataset by reusing the fixed geometry and solving for weights at the 11-point height grid.
+It saves
+\begin{itemize}
+  \item individual discovered-system JSON files for each $z$,
+  \item a consolidated JSON file \filepath{runs/torus/mid_axis_weights.json} containing the $6\times 11$ weight matrix $W$, metadata describing ring/point ordering, and Stage-style metrics, and
+  \item diagnostics NPZ files for selected heights.
+\end{itemize}
+The singular value decomposition and rank-truncation experiments described below are driven by this weight dataset.
+
+\subsection{Weight SVD and low-rank reconstructions}
+
+The script \filepath{code/mid_torus_axis_weight_svd.py} loads the consolidated weight dataset and computes the thin SVD
+\begin{equation}
+  W = U\Sigma V^\top, \qquad W\in\mathbb{R}^{6\times 11},
+\end{equation}
+where $\Sigma=\operatorname{diag}(\sigma_1,\dots,\sigma_6)$ stores singular values in descending order and the columns of $U$ and $V$ are left and right singular vectors.
+The singular values are normalised by $\sigma_1$ and exported as \texttt{singular\_values\_rel} to \filepath{runs/torus/mid_axis_weight_svd.json}.
+The plotter \filepath{code/plot_mid_axis_svd_singulars.py} converts this data into the semilog plot shown in Figure~\ref{fig:svd}, with reference lines at levels $10^{-1}$ and $10^{-2}$.
+
+To probe low-rank structure we form truncated reconstructions
+\begin{equation}
+  W_r = U_r \Sigma_r V_r^\top,
+\end{equation}
+for $r=2$ and $r=3$, and construct rank-$r$ weight families by replacing the original weights with those from $W_r$ at selected axis positions.
+The script \filepath{code/plot_mid_axis_rank_truncation_errors.py} then re-evaluates BEM metrics at $z\in\{0.40,0.60,0.70,0.90\}$ for the full ($r=6$) and truncated weight families, summarising the effect of rank truncation on mean and inner-mean relative errors (Figure~\ref{fig:rank-truncation}).
+
+% ======================================================================
+\section{Results}
+\label{sec:results}
+% ======================================================================
+
+\subsection{Discovered geometry and baseline comparison}
+
+Figure~\ref{fig:geometry} shows the final 2-ring + 4-point image system for the mid-aspect torus.
+The top panel depicts a three-dimensional rendering of the torus surface together with the axis charge and the image elements, while the bottom panel shows an $(r,z)$ cross-section with ring radii and point locations overlaid.
+The rings lie close to the mid-radius of the torus tube and just inside the physical surface; the points cluster near the outer and inner rim regions where the BEM error analysis indicates steep gradients.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.8\textwidth]{fig1_mid_torus_geometry.png}\\[0.8em]
+  \includegraphics[width=0.8\textwidth]{fig1b_geometry_cross_section.png}
+  \caption{Mid-aspect grounded torus ($R=1$, $a=0.35$) with the discovered image system.
+  Top: 3D rendering of the torus, axis point charge, and 2-ring + 4-point image configuration.
+  Bottom: $(r,z)$ cross-section showing the torus outline, ring radii and point positions relative to the surface.}
+  \label{fig:geometry}
+\end{figure}
+
+Table~\ref{tab:candidates} summarises high-resolution BEM metrics for four systems evaluated at $z=0.7$: the eigen-mode baseline, the 2-ring + 4-point seed, an intermediate local-geometry trial (trial003), and the final high-resolution system \texttt{mid\_bem\_highres\_trial02}.
+The toroidal eigen-mode baseline uses 12 image elements and exhibits a mean relative error above $50$\%, whereas the refined 2-ring + 4-point system achieves mean relative error $\approx 5.4$\%, inner-rim mean relative error $\approx 7.4$\% and a large but substantially reduced maximum relative error compared with the baseline.
+
+\begin{table}[t]
+  \centering
+  \caption{High-resolution BEM metrics for mid-torus candidates at $z=0.7$.
+  All errors are relative; $n_{\text{images}}$ counts the number of image primitives used in each system.
+  Data from \filepath{tables/mid_candidate_metrics_summary.csv}.}
+  \label{tab:candidates}
+  \begin{tabular}{lrrrr}
+    \toprule
+    Name & $n_{\text{images}}$ & mean\_rel & inner\_mean\_rel & max\_rel \\
+    \midrule
+    baseline          & 12 & 54.47 & 36.61 & $3.53\times 10^5$ \\
+    seed (2R+4P)      &  6 & 31.41 & 26.93 & $2.43\times 10^5$ \\
+    trial003          &  6 & 19.32 & 18.18 & $1.55\times 10^5$ \\
+    trial02 (hi-res)  &  6 &  5.39 &  7.35 & $2.25\times 10^4$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Figure~\ref{fig:candidate-metrics} provides a complementary visual summary of these candidate systems, showing how the high-resolution metrics trade off against the number of image primitives used.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.7\textwidth]{fig10_candidate_metrics_summary.png}
+  \caption{Summary of candidate systems explored for the mid-aspect torus at $z=0.7$.
+  The plot compares mean and inner-mean relative errors against the number of image primitives, highlighting the improvement from the eigen-mode baseline to the refined 2-ring + 4-point configuration.}
+  \label{fig:candidate-metrics}
+\end{figure}
+
+Figure~\ref{fig:error-maps-baseline-best} visualises the difference between the eigen-mode baseline and the refined 2-ring + 4-point system at $z=0.7$.
+Panels~(a)--(b) show absolute and relative error maps for the baseline, while panels~(c)--(d) show the corresponding maps for the high-resolution 2-ring + 4-point system.
+The baseline exhibits large, diffuse error patterns over both inner and outer rim regions, whereas the refined system concentrates residual error into thin boundary layers near the inner rim and into a handful of small ``hot spots'' near the outer surface.
+These maps motivate the rank analysis that follows: while the overall structure is captured well, a small number of persistent local features dominate the maximum relative error.
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig2a_baseline_abs.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig2b_baseline_rel.png}
+  \end{minipage}
+
+  \vspace{0.7em}
+
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig2c_best_abs.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig2d_best_rel.png}
+  \end{minipage}
+  \caption{Error maps in an $(r,z)$ cross-section for a unit axis charge at $z=0.7$.
+  Top: absolute and relative error for the toroidal eigen-mode baseline.
+  Bottom: absolute and relative error for the refined 2-ring + 4-point system \texttt{mid\_bem\_highres\_trial02}.}
+  \label{fig:error-maps-baseline-best}
+\end{figure}
+
+\subsection{Axis sweep behaviour}
+
+The axis-sweep BEM metrics from \filepath{tables/mid_axis_sweep_bem.csv} are summarised in Table~\ref{tab:axis-sweep} and Figure~\ref{fig:axis-errors}.
+The mean relative error remains in the range $5.5$--$7.5$\% over $z\in[0.4,0.7]$, with a mild increase near the outer rim at $z=0.8$, where boundary layers strengthen.
+The inner-rim mean relative error is typically somewhat higher than the global mean, reflecting the increased difficulty of resolving the concave inner region.
+Maximum relative errors are one to two orders of magnitude larger than the mean, highlighting rare but severe spikes associated with near-singular behaviour in the cross-section; these spikes occur where the reference potential is very small or local gradients are extremely steep and therefore overstate the bulk error level.
+
+\begin{table}[t]
+  \centering
+  \caption{Axis-sweep BEM metrics for the fixed 2-ring + 4-point geometry, based on high-resolution cross-sectional diagnostics.
+  \texttt{mean\_rel} and \texttt{inner\_mean\_rel} are given in percent.}
+  \label{tab:axis-sweep}
+  \begin{tabular}{rrrr}
+    \toprule
+    $z$ & mean\_rel & inner\_mean\_rel & max\_rel \\
+    \midrule
+    0.40 &  7.49 & 11.41 & $2.82\times 10^4$ \\
+    0.50 &  7.29 & 17.78 & $3.18\times 10^4$ \\
+    0.60 &  7.47 & 14.53 & $2.08\times 10^4$ \\
+    0.70 &  5.51 &  7.37 & $2.31\times 10^4$ \\
+    0.80 & 10.30 & 13.21 & $7.60\times 10^4$ \\
+    0.90 &  7.14 & 14.61 & $2.42\times 10^4$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.65\textwidth]{fig3_axis_sweep_errors_vs_z.png}
+  \caption{Axis-sweep BEM metrics versus axis height $z$ for the fixed 2-ring + 4-point geometry.
+  Solid lines: mean and inner-mean relative errors (left axis).
+  Dashed line: maximum relative error (right axis, logarithmic scale).}
+  \label{fig:axis-errors}
+\end{figure}
+
+Figure~\ref{fig:error-histogram} complements these metrics by showing a histogram of relative errors over the cross-sectional grid at $z=0.7$.
+The vast majority of grid points exhibit modest errors below $10$\%, with a long, thin tail extending to the large maximum value; this explains how low mean errors can coexist with large maxima.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.6\textwidth]{fig8_error_histogram_z0.70.png}
+  \caption{Histogram of pointwise relative errors for the 2-ring + 4-point system at $z=0.7$, based on a high-resolution $(r,z)$ cross-sectional grid.
+  Most points lie in a low-error bulk, with a long tail of rare but large errors near inner-rim boundary layers.}
+  \label{fig:error-histogram}
+\end{figure}
+
+\subsection{Singular values of the axis weight map}
+
+The singular values of the weight matrix $W\in\mathbb{R}^{6\times 11}$ convey how many independent ``weight modes'' are needed to describe the dependence of the six image weights on axis height.
+The normalised spectrum $\sigma_i/\sigma_1$ is plotted on a semilog scale in Figure~\ref{fig:svd}.
+The leading two singular values account for the vast majority of the variance, with relative magnitudes approximately
+\[
+(1.0,\; 0.41,\; 0.06,\; 0.02,\; 0.006,\; 0.002).
+\]
+Thresholding at $10^{-1}$ yields an effective rank of 2, while a more permissive threshold of $10^{-2}$ includes four singular modes.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.6\textwidth]{fig4_singular_values.png}
+  \caption{Normalised singular values $\sigma_i/\sigma_1$ of the axis weight matrix $W\in\mathbb{R}^{6\times 11}$, plotted on a semilog scale.
+  Horizontal lines mark thresholds at $10^{-1}$ and $10^{-2}$, indicating effective ranks 2 and 4, respectively.}
+  \label{fig:svd}
+\end{figure}
+
+Figure~\ref{fig:weights-vs-z} provides a more detailed view.
+Panel~(a) plots the six image weights as functions of axis height $z$, revealing smooth, nearly sinusoidal variation with modest coupling between rings and points.
+Panel~(b) shows the corresponding mode coefficients obtained from the SVD, i.e.\ the coordinates of each weight vector $w(z_k)$ in the left-singular-vector basis $U$.
+These mode coefficients are dominated by the first two modes across the entire axis range, confirming the effective rank-two behaviour suggested by Figure~\ref{fig:svd}.
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig9_weights_vs_z.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig9b_mode_coeffs_vs_z.png}
+  \end{minipage}
+  \caption{Axis-weight behaviour for the fixed 2-ring + 4-point geometry.
+  Left: six image weights as functions of axis height $z$.
+  Right: coordinates of the weight vectors in the singular-vector basis, showing that the first two modes dominate across the entire axis range.}
+  \label{fig:weights-vs-z}
+\end{figure}
+
+\subsection{Rank truncation and BEM error}
+
+To quantify how much of the BEM accuracy depends on the small singular values of $W$, we evaluate BEM errors for full ($r=6$) and truncated ($r=2,3$) weight families at $z\in\{0.40,0.60,0.70,0.90\}$.
+For the full system, typical BEM mean and inner-mean relative errors at these heights lie in the same $5$--$10$\% and $7$--$18$\% bands as the axis-sweep values reported in Table~\ref{tab:axis-sweep}.
+Rank-2 and rank-3 truncations exhibit very similar mean and inner-mean errors: on the scale of Figure~\ref{fig:rank-truncation} the curves for $r=2$, $r=3$ and $r=6$ are nearly indistinguishable, indicating that the dominant part of the axis family is captured by just two or three singular modes.
+Maximum relative errors remain dominated by the rare near-singular spikes identified earlier and change only modestly under truncation.
+
+Figure~\ref{fig:rank-truncation} visualises how mean and inner-mean relative errors vary with $z$ for full and truncated rank.
+The curves for $r=2,3,6$ are nearly indistinguishable on the scale of the plot, confirming the strong low-rank structure suggested by the SVD.
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}{0.8\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig5_rank_truncation_mean_rel.png}
+  \end{minipage}
+
+  \vspace{0.7em}
+
+  \begin{minipage}{0.8\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig5_rank_truncation_inner_mean_rel.png}
+  \end{minipage}
+  \caption{Effect of rank truncation on axis-sweep BEM metrics.
+  Top: mean relative error versus axis height $z$ for full ($r=6$) and truncated ($r=2,3$) weight families.
+  Bottom: corresponding inner-mean relative errors.
+  The curves for different ranks are nearly indistinguishable, indicating strong low-rank structure.}
+  \label{fig:rank-truncation}
+\end{figure}
+
+To illustrate where the low-rank approximation fails, Figure~\ref{fig:rank2-error-maps} shows cross-sectional error maps for full and rank-2 weights at two representative heights, $z=0.60$ (top two rows) and $z=0.90$ (bottom two rows).
+In each case, the left pair displays absolute errors for the full and rank-2 systems, and the right pair displays the corresponding relative errors.
+Away from the inner rim the maps are visually indistinguishable; discrepancies are localised near thin inner-rim layers and a few isolated outer-surface hot spots.
+
+\begin{figure}[p]
+  \centering
+  % Row 1: z = 0.60, full abs / full rel
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig6a_full_abs_z0.60.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig6b_full_rel_z0.60.png}
+  \end{minipage}
+
+  \vspace{0.6em}
+
+  % Row 2: z = 0.60, rank-2 abs / rank-2 rel
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig6c_rank2_abs_z0.60.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig6d_rank2_rel_z0.60.png}
+  \end{minipage}
+
+  \vspace{0.9em}
+
+  % Row 3: z = 0.90, full abs / full rel
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig7a_full_abs_z0.90.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig7b_full_rel_z0.90.png}
+  \end{minipage}
+
+  \vspace{0.6em}
+
+  % Row 4: z = 0.90, rank-2 abs / rank-2 rel
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig7c_rank2_abs_z0.90.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.38\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{fig7d_rank2_rel_z0.90.png}
+  \end{minipage}
+
+  \caption{Cross-sectional error maps at $z=0.60$ (top two rows) and $z=0.90$ (bottom two rows) for the full ($r=6$) and rank-2 ($r=2$) weight families.
+  Differences between the full and truncated systems are confined to narrow inner-rim boundary layers and a small number of outer-rim hot spots, consistent with the low-rank SVD structure.}
+  \label{fig:rank2-error-maps}
+\end{figure}
+
+% ======================================================================
+\section{Discussion}
+\label{sec:discussion}
+% ======================================================================
+
+\subsection{Reconciling infinite operator rank with low-rank axis behaviour}
+
+The functional-analytic results reviewed in Section~\ref{sec:background} show that the single-layer operator for a grounded torus has infinitely many non-zero singular values, so the full Green's function cannot be represented exactly by any finite image basis.
+On the other hand, our numerical experiments demonstrate that the restriction of the Green's function to an axis family of sources can be approximated extremely well by a fixed six-element basis with an effective numerical rank of two or three.
+
+One way to reconcile these facts is to distinguish between the global kernel $G(x,y)$ on $\Gamma\times\Gamma$ and the parametric family $G(x,x_z)$ for $x\in\Gamma$ and $z\in[0.4,0.9]$.
+The former spans an infinite-dimensional subspace of $L^2(\Gamma)$, while the latter traces out a low-dimensional manifold.
+In the limit of continuous $z$ this manifold may still be infinite-dimensional, but on the finite grid of 11 axis positions used here, its discrete approximation admits a rank-2 or rank-3 representation.
+
+From an operator-theoretic perspective, the axis weights can be viewed as coordinates of the restriction of the Green's kernel to a curve in the source domain, projected onto a fixed image-basis subspace.
+The rapid decay of the singular values of $W$ indicates that, once the geometry is chosen well, the dependence on $z$ is dominated by a small number of ``canonical'' weight modes.
+The remainder---captured by small singular values---accounts for subtle adjustments of inner-rim layers and other fine-scale features that contribute little to mean error but drive the long tail of maximum relative errors.
+This is closely aligned with the general picture of low-rank structure in discretised integral operators and ill-posed problems \citep[see, e.g.,][]{hansen1998}.
+
+\subsection{Role of geometry and inner-rim primitives}
+
+The discovery pipeline consistently favours geometries that include both global poloidal rings and localised points near the torus surface.
+The rings primarily control coarse, axisymmetric behaviour: they modulate the potential across the bulk of the cross-section and capture the overall shielding of the axis charge by the torus.
+The near-surface points, by contrast, are used to sharpen boundary layers and reduce residuals near the inner rim and outer surface.
+
+The importance of inner-rim primitives echoes the asymptotic analysis of toroidal boundary layers, which predicts strong localisation of field gradients near the concave region.
+In our experiments, removing or significantly moving the inner-rim points leads to substantial increases in inner-mean relative error, even when the axis weights are allowed to adjust.
+This suggests that a minimal approximate image system for a torus should always include some form of inner-rim localisation---whether as discrete points, short ring segments, or specially designed boundary-layer primitives.
+
+\subsection{Implications for image-system design}
+
+The numerical evidence points to a two-tier picture of toroidal image systems:
+\begin{itemize}
+  \item At the level of coarse behaviour along the symmetry axis, a small fixed basis---here, two poloidal rings and four points---is more than sufficient.
+  Its axis weights vary smoothly with $z$ and are well-described by two or three singular modes.
+  \item At the level of fine-scale boundary features, particularly near the inner rim, the same basis cannot capture all variation.
+  Additional degrees of freedom would be required to uniformly control the maximum relative error and to extend the approximation off-axis.
+\end{itemize}
+
+This suggests a general strategy for designing image systems for non-trivial geometries:
+\begin{enumerate}
+  \item Use operator theory and geometric insight to identify natural low-dimensional manifolds of boundary data (for example axis families or symmetry-reduced slices).
+  \item Design flexible but interpretable bases (rings, localised points, simple harmonic modes) and learn their geometry from data along these manifolds.
+  \item Analyse the resulting weight maps via SVD or related tools to identify canonical modes and effective ranks.
+  \item Introduce additional, more localised primitives only where diagnostics indicate persistent boundary-layer errors.
+\end{enumerate}
+For the torus, this leads naturally to a hierarchy of image systems: coarse, low-rank bases adequate for axis problems; enriched bases with additional inner-rim primitives for off-axis or near-surface queries; and, ultimately, fully spectral toroidal-harmonic representations as the limiting case.
+
+% ======================================================================
+\section{Conclusion and outlook}
+\label{sec:conclusion}
+% ======================================================================
+
+We have presented a numerical study of approximate image systems for a grounded torus, focusing on a mid-aspect geometry with a unit point charge constrained to the symmetry axis.
+A data-driven discovery pipeline combining randomized exploration, local geometry optimisation and high-resolution BEM diagnostics identifies a compact image basis consisting of two poloidal rings and four near-surface points.
+This basis, with geometry held fixed, yields mean relative errors of order $5$--$10$\% along most of the axis range once its six weights are optimised for each axis position.
+
+By assembling the weights over 11 axis heights into a matrix $W$ and analysing its singular values, we find that the axis family has an effective numerical rank of two or three: the first two singular modes account for the bulk of variation, and rank-2 or rank-3 truncations reproduce BEM mean and inner-mean errors almost indistinguishably from the full system.
+At the same time, standard boundary-integral theory confirms that the underlying single-layer operator is infinite rank, so no exact finite image system for the torus exists.
+The approximate image system we discover is therefore best understood as a low-rank approximant to the Green's function restricted to a one-parameter family of sources, not as a global finite-basis representation.
+
+Several directions for future work emerge naturally:
+\begin{itemize}
+  \item \textbf{Off-axis sources.} Extending the analysis to point charges that move off the symmetry axis will test how quickly the effective rank grows with the dimensionality of the source manifold.
+  \item \textbf{Aspect-ratio dependence.} Comparing thin, mid and fat tori would clarify how the effective rank and the required inner-rim localisation depend on geometry, and whether universal image-basis patterns emerge across aspect ratios.
+  \item \textbf{Richer primitive libraries.} Incorporating short ring segments, inner-rim ``patch'' primitives or low-order toroidal harmonics into the image library could further reduce inner-rim errors without greatly increasing basis size.
+  \item \textbf{Functional-analytic refinement.} A more detailed spectral analysis of the torus single-layer operator restricted to axis families could rigorously justify the observed low-rank behaviour and guide the choice of basis functions.
+\end{itemize}
+
+Overall, our findings emphasise that while tori do not admit exact finite image systems, carefully chosen low-rank bases can nonetheless provide powerful, interpretable approximations for restricted source families.
+Such bases may prove valuable as building blocks in larger multiphysics simulations, fast solvers, or learning-based surrogates for complex conductor geometries.
+
+% ======================================================================
+% References
+% ======================================================================
+
+\clearpage
+\phantomsection
+\addcontentsline{toc}{section}{References}
+
+\begin{thebibliography}{99}
+
+\bibitem[Jackson(1999)]{jackson1999}
+J.~D. Jackson.
+\newblock \emph{Classical Electrodynamics}.
+\newblock John Wiley \& Sons, 3rd edition, 1999.
+\newblock \url{https://inspirehep.net/literature/1390077}.
+
+\bibitem[Smythe(1989)]{smythe1989}
+W.~R. Smythe.
+\newblock \emph{Static and Dynamic Electricity}.
+\newblock Hemisphere Publishing, 3rd edition, 1989.
+\newblock \url{https://catalog.hathitrust.org/Record/001481455}.
+
+\bibitem[Kellogg(1929)]{kellogg1929}
+O.~D. Kellogg.
+\newblock \emph{Foundations of Potential Theory}.
+\newblock Springer, 1929.
+\newblock \href{https://doi.org/10.1007/978-3-642-90850-7}{doi:10.1007/978-3-642-90850-7}.
+
+\bibitem[Kress(2014)]{kress2014}
+R.~Kress.
+\newblock \emph{Linear Integral Equations}, volume~82 of \emph{Applied
+  Mathematical Sciences}.
+\newblock Springer, 3rd edition, 2014.
+\newblock \href{https://doi.org/10.1007/978-1-4614-9593-2}{doi:10.1007/978-1-4614-9593-2}.
+
+\bibitem[McLean(2000)]{mclean2000}
+W.~McLean.
+\newblock \emph{Strongly Elliptic Systems and Boundary Integral Equations}.
+\newblock Cambridge University Press, 2000.
+\newblock \url{https://books.google.com/books?id=RILqjEeMfK0C}.
+
+\bibitem[Morse and Feshbach(1953)]{morsefeshbach1953}
+P.~M. Morse and H.~Feshbach.
+\newblock \emph{Methods of Theoretical Physics}, volume~2.
+\newblock McGraw--Hill, 1953.
+\newblock \href{https://doi.org/10.1119/1.1933765}{doi:10.1119/1.1933765}.
+
+\bibitem[Moon and Spencer(1961)]{moonspencer1961}
+P.~Moon and D.~E. Spencer.
+\newblock \emph{Field Theory Handbook}.
+\newblock Springer, 1961.
+\newblock \href{https://doi.org/10.1007/978-3-642-53060-9}{doi:10.1007/978-3-642-53060-9}.
+
+\bibitem[Borachok et~al.(2016)Borachok, Chapko, and Johansson]{borachok2016}
+I.~Borachok, R.~Chapko, and B.~T. Johansson.
+\newblock Numerical solution of a {C}auchy problem for the {L}aplace equation
+  in a toroidal domain by a boundary integral equation method.
+\newblock \emph{International Journal of Computer Mathematics}, 93(3):359--379,
+  2016.
+\newblock \href{https://doi.org/10.1080/17415977.2015.1130042}{doi:10.1080/17415977.2015.1130042}.
+
+\bibitem[Hansen(1998)]{hansen1998}
+P.~C. Hansen.
+\newblock \emph{Rank-Deficient and Discrete Ill-Posed Problems}.
+\newblock SIAM, 1998.
+\newblock \href{https://doi.org/10.1137/1.9780898719697}{doi:10.1137/1.9780898719697}.
+
+\end{thebibliography}
+
+\end{document}

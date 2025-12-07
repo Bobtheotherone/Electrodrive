@@ -93,14 +93,22 @@ def _load_extension(device: torch.device) -> types.ModuleType:
     extra_cflags = ["-O3"]
     extra_cuda_cflags = ["-O3", "--use_fast_math"]
 
-    # Try to specialise for the active GPU (e.g. your 5090 / Blackwell)
+    # Try to specialise for the active GPU (e.g., your 5090 / Blackwell).
+    # Guard against very old or very new/bogus compute capabilities that nvcc
+    # does not support (for example, reported as compute_12 or compute_120).
     if torch.cuda.is_available():
         try:
             major, minor = torch.cuda.get_device_capability(device)
-            arch = f"{major}{minor}"
-            extra_cuda_cflags += [
-                f"-gencode=arch=compute_{arch},code=sm_{arch}",
-            ]
+            arch_int = int(f"{major}{minor}")
+            # Only add an explicit gencode for architectures in a conservative range.
+            # For current toolchains, 50–90 covers modern supported SM versions.
+            if 50 <= arch_int <= 90:
+                extra_cuda_cflags.append(
+                    f"-gencode=arch=compute_{arch_int},code=sm_{arch_int}"
+                )
+            # If arch_int is outside this range (e.g., 120 on newer GPUs),
+            # do not add an explicit gencode; fall back to the defaults chosen
+            # by torch.utils.cpp_extension / nvcc.
         except Exception:
             # Best-effort; fall back to PyTorch defaults
             pass

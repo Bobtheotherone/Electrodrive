@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <vector>
 
 namespace {
 
@@ -25,27 +26,33 @@ void ensure_cuda_int64(const torch::Tensor& t, const char* name) {
 // -----------------------------------------------------------------------------
 // CUDA implementation (defined in bem_near_cuda_kernel.cu)
 // -----------------------------------------------------------------------------
-
-// Expected signature implemented in your .cu file.
 //
-// torch::Tensor bem_near_quadrature_matvec_cuda(
-//     const torch::Tensor& V_far,
-//     const torch::Tensor& sigma,
-//     const torch::Tensor& centroids,
-//     const torch::Tensor& areas,
-//     const torch::Tensor& panel_vertices,
-//     const torch::Tensor& near_pairs,
-//     double K_E,
-//     int64_t quad_order);
-torch::Tensor bem_near_quadrature_matvec_cuda(
-    const torch::Tensor& V_far,
-    const torch::Tensor& sigma,
-    const torch::Tensor& centroids,
-    const torch::Tensor& areas,
-    const torch::Tensor& panel_vertices,
-    const torch::Tensor& near_pairs,
-    double K_E,
-    int64_t quad_order);
+// The .cu file implements a low-level routine that expects geometry, near-pair
+// indices, and a pre-built reference quadrature rule on the unit triangle, and
+// returns a *correction* vector V_corr [N]:
+//
+//   Tensor bem_near_quadrature_matvec_cuda(
+//       Tensor centroids,   // [N,3], CUDA
+//       Tensor areas,       // [N]
+//       Tensor sigma,       // [N]
+//       Tensor vertices,    // [N,3,3]
+//       Tensor near_pairs,  // [P,2], int32 or int64
+//       Tensor ref_pts,     // [Q,2] on unit triangle
+//       Tensor ref_w,       // [Q] with sum_k ref_w[k] = 1
+//       double K_E_double);
+//
+// The wrapper below builds (ref_pts, ref_w) based on quad_order, calls this
+// low-level CUDA function to get V_corr, and then returns V_out = V_far + V_corr.
+
+at::Tensor bem_near_quadrature_matvec_cuda(
+    at::Tensor centroids,   // [N,3], float32 or float64, CUDA
+    at::Tensor areas,       // [N]
+    at::Tensor sigma,       // [N]
+    at::Tensor vertices,    // [N,3,3]
+    at::Tensor near_pairs,  // [P,2], int32 or int64
+    at::Tensor ref_pts,     // [Q,2]
+    at::Tensor ref_w,       // [Q]
+    double K_E_double);
 
 // -----------------------------------------------------------------------------
 // Thin checked wrapper exposed to Python
@@ -137,23 +144,91 @@ torch::Tensor bem_near_quadrature_matvec(
     auto panel_vertices_c = panel_vertices.contiguous();
     auto near_pairs_c     = near_pairs.contiguous();
 
-    auto V_out = bem_near_quadrature_matvec_cuda(
-        V_far_c,
-        sigma_c,
-        centroids_c,
-        areas_c,
-        panel_vertices_c,
-        near_pairs_c,
-        K_E,
+    // -------------------------------------------------------------------------
+    // Build reference quadrature rule (ref_pts, ref_w) on the unit triangle.
+    // We support quad_order 1 and 2 using standard symmetric rules.
+    //
+    //  - Order 1: 1-point rule at barycenter (1/3,1/3), weight 1.
+    //  - Order 2: 3-point rule:
+    //        (1/6, 1/6), (2/3, 1/6), (1/6, 2/3), each weight 1/3.
+    // -------------------------------------------------------------------------
+    TORCH_CHECK(
+        quad_order == 1 || quad_order == 2,
+        "bem_near_quadrature_matvec: only quad_order 1 or 2 are supported, got ",
         quad_order);
 
+    const auto opts = centroids_c.options();
+    const auto opts_cpu = opts.device(torch::kCPU);
+    int64_t Q = (quad_order == 1) ? 1 : 3;
+
+    // Build quadrature rule on CPU to avoid host-side writes into CUDA memory,
+    // then transfer the tiny tensors to the target device.
+    auto ref_pts_cpu = torch::empty({Q, 2}, opts_cpu);
+    auto ref_w_cpu   = torch::empty({Q},     opts_cpu);
+
+    AT_DISPATCH_FLOATING_TYPES(
+        centroids_c.scalar_type(),
+        "build_ref_triangle_quadrature",
+        [&] {
+            using scalar_t = scalar_t;
+            auto ref_pts_ptr = ref_pts_cpu.data_ptr<scalar_t>();
+            auto ref_w_ptr   = ref_w_cpu.data_ptr<scalar_t>();
+
+            if (quad_order == 1) {
+                // Single-point rule: barycenter with weight 1.
+                ref_pts_ptr[0 * 2 + 0] = static_cast<scalar_t>(1.0 / 3.0);
+                ref_pts_ptr[0 * 2 + 1] = static_cast<scalar_t>(1.0 / 3.0);
+                ref_w_ptr[0]           = static_cast<scalar_t>(1.0);
+            } else {
+                // 3-point symmetric rule on unit triangle.
+                // Points:
+                //  p0 = (1/6, 1/6)
+                //  p1 = (2/3, 1/6)
+                //  p2 = (1/6, 2/3)
+                // Weights: each 1/3, sum to 1.
+                ref_pts_ptr[0 * 2 + 0] = static_cast<scalar_t>(1.0 / 6.0);
+                ref_pts_ptr[0 * 2 + 1] = static_cast<scalar_t>(1.0 / 6.0);
+
+                ref_pts_ptr[1 * 2 + 0] = static_cast<scalar_t>(2.0 / 3.0);
+                ref_pts_ptr[1 * 2 + 1] = static_cast<scalar_t>(1.0 / 6.0);
+
+                ref_pts_ptr[2 * 2 + 0] = static_cast<scalar_t>(1.0 / 6.0);
+                ref_pts_ptr[2 * 2 + 1] = static_cast<scalar_t>(2.0 / 3.0);
+
+                const scalar_t w = static_cast<scalar_t>(1.0 / 3.0);
+                ref_w_ptr[0] = w;
+                ref_w_ptr[1] = w;
+                ref_w_ptr[2] = w;
+            }
+        });
+
+    auto ref_pts = ref_pts_cpu.to(opts.device());
+    auto ref_w   = ref_w_cpu.to(opts.device());
+
+    // If there are no near pairs, nothing to correct.
+    if (near_pairs_c.size(0) == 0) {
+        return V_far_c;
+    }
+
+    // Call the CUDA implementation to get the near-field correction V_corr [N].
+    auto V_corr = bem_near_quadrature_matvec_cuda(
+        centroids_c,
+        areas_c,
+        sigma_c,
+        panel_vertices_c,
+        near_pairs_c,
+        ref_pts,
+        ref_w,
+        K_E);
+
     TORCH_CHECK(
-        V_out.device() == dev,
+        V_corr.device() == dev,
         "bem_near_quadrature_matvec_cuda returned tensor on wrong device");
     TORCH_CHECK(
-        V_out.sizes() == V_far_c.sizes(),
-        "bem_near_quadrature_matvec_cuda must return tensor with shape matching V_far");
+        V_corr.sizes() == V_far_c.sizes(),
+        "bem_near_quadrature_matvec_cuda must return tensor with shape [N]");
 
+    auto V_out = V_far_c + V_corr;
     return V_out;
 }
 
@@ -179,7 +254,7 @@ areas:           [N] CUDA tensor of panel areas.
 panel_vertices:  [N, 3, 3] CUDA tensor of triangle vertex positions.
 near_pairs:      [P, 2] int64 CUDA tensor of (i, j) near interaction indices.
 K_E:             Coulomb constant (double).
-quad_order:      Quadrature order (e.g. 2).
+quad_order:      Quadrature order (e.g. 1 or 2).
 
 Returns
 -------

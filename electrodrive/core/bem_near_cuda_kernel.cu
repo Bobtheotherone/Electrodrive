@@ -1,4 +1,4 @@
-// bem_near_cuda_kernel.cu
+// electrodrive/core/bem_near_cuda_kernel.cu
 //
 // Near-field quadrature corrections for single-layer BEM matvec on CUDA GPUs.
 // One thread per (target panel i, source panel j) near pair.
@@ -13,13 +13,14 @@
 //   5) Add the correction sigma_j * (I_near - I_far) to the potential at i.
 //
 // The host code is expected to:
-//   - Build near_pairs [P, 2] on CPU (int32), where each row is (i, j).
+//   - Build near_pairs [P, 2] on CPU (int64 or int32), where each row is (i, j).
 //   - Build a reference triangle quadrature rule (ref_pts [Q,2], ref_w [Q])
 //     on the *unit* triangle with Sum_k ref_w[k] = 1.
-//   - Allocate a zero-initialized V_corr [N] on CUDA and pass it in.
+//   - Allocate a zero-initialized V_corr [N] on CUDA and pass it in (this file
+//     handles that internally).
 //
-// This file is written as a PyTorch CUDA extension, but the kernels
-// themselves are plain CUDA C++ and can be reused in other contexts.
+// This file is compiled as part of a PyTorch CUDA extension. The actual Python
+// binding is defined in bem_near_cuda.cpp via pybind11.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -327,6 +328,7 @@ Tensor bem_near_quadrature_matvec_cuda(
     AT_DISPATCH_FLOATING_TYPES(centroids.scalar_type(),
                                "bem_near_quadrature_matvec_cuda",
                                [&] {
+        using scalar_t = scalar_t;
         // Correct shared-memory size for the chosen scalar_t.
         const size_t shmem =
             static_cast<size_t>(3 * Q) * sizeof(scalar_t);
@@ -358,11 +360,4 @@ Tensor bem_near_quadrature_matvec_cuda(
                 cudaGetErrorString(err));
 
     return V_corr;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(
-        "bem_near_quadrature_matvec",
-        &bem_near_quadrature_matvec_cuda,
-        "Near-field quadrature correction for single-layer BEM matvec (CUDA)");
 }

@@ -150,4 +150,10 @@ def test_keops_vs_torch_Efield_targets_double_precision():
     )
 
     max_diff = torch.max(torch.abs(E_ref - E_keops)).item()
-    assert max_diff < 1e-9
+    # Use a relative tolerance scaled by machine epsilon because the E-field
+    # magnitudes are ~1e10; differences below a few ULPs are expected between
+    # independent float64 implementations of the same kernel.
+    eps = torch.finfo(E_ref.dtype).eps
+    scale = E_ref.abs().max().item()
+    tol = 5.0 * eps * scale + 1e-12
+    assert max_diff < tol

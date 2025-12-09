@@ -33,7 +33,7 @@ This module provides:
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -219,6 +219,8 @@ def near_singular_quadrature(
     panel_vertices,
     method: str = "telles",
     order: int = 2,
+    *,
+    max_depth: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     High-resolution quadrature rule for a target close to a triangle.
@@ -260,14 +262,17 @@ def near_singular_quadrature(
     verts = _as_triangle_vertices(panel_vertices)
     tgt = np.asarray(target, dtype=float).reshape(3)
 
-    # Fixed refinement depth; small (2–3) is enough for our purposes.
-    max_depth = 3 if method.lower() == "telles" else 1
-    if max_depth <= 0:
+    # Fixed refinement depth; keep a slightly deeper tree for the Telles rule
+    # to stabilise near-singular Laplace kernels at on-/near-surface targets.
+    depth = max_depth
+    if depth is None:
+        depth = 4 if method.lower() == "telles" else 1
+    if depth <= 0:
         return standard_triangle_quadrature(verts, order=order)
 
     # Work with a Python list of (3,3) arrays.
     tris = [verts]
-    for _ in range(max_depth):
+    for _ in range(depth):
         # Find the triangle whose centroid is closest to the target.
         centroids = np.array([tri.mean(axis=0) for tri in tris])
         dists = np.linalg.norm(centroids - tgt[None, :], axis=1)

@@ -191,7 +191,7 @@ class JsonlLogger:
     # ------------- Core write -------------
     def _emit(self, level: str, msg: str, **fields: Any) -> None:
         rec: Dict[str, Any] = {
-            "ts": _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ts": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "level": level,
             "msg": msg,
         }

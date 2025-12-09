@@ -320,6 +320,18 @@ def _make_collocation_rng() -> np.random.Generator:
     return np.random.default_rng(seed)
 
 
+def _make_torch_rng(device: torch.device) -> torch.Generator:
+    """Create a deterministic torch RNG tied to the run ID without polluting global state."""
+    # Reuse the run-id seeded numpy RNG to derive a stable torch seed.
+    seed = int(_make_collocation_rng().integers(0, 2**31 - 1, dtype=np.int64))
+    try:
+        gen = torch.Generator(device=device)
+    except Exception:
+        gen = torch.Generator()
+    gen.manual_seed(seed)
+    return gen
+
+
 def _build_boundary_row_weights(
     boundary_mask: Optional[torch.Tensor],
     boundary_weight: Optional[float],
@@ -1761,6 +1773,7 @@ def cheap_discover_images_for_collocation(
     """Lightweight ISTA-based solve to seed adaptive collocation."""
     device = _get_default_device()
     dtype = _get_default_dtype()
+    cand_rng = _make_torch_rng(device)
 
     candidates = generate_candidate_basis(
         spec,
@@ -1768,6 +1781,7 @@ def cheap_discover_images_for_collocation(
         n_candidates=max(1, 4 * n_max),
         device=device,
         dtype=dtype,
+        rng=cand_rng,
     )
     if not candidates:
         logger.warning("Cheap solve skipped: no candidates generated.")
@@ -2043,6 +2057,7 @@ def discover_images(
     mode_env = os.getenv("EDE_IMAGES_BASIS_GENERATOR_MODE", "")
     mode_raw = mode_env if mode_env else basis_generator_mode
     mode = _normalize_generator_mode(mode_raw)
+    cand_rng = _make_torch_rng(device)
 
     if mode in {"diffusion", "hybrid_diffusion"} and basis_generator is None:
         try:
@@ -2067,6 +2082,7 @@ def discover_images(
             n_candidates=max(1, n_max * 4),
             device=device,
             dtype=dtype,
+            rng=cand_rng,
         )
 
     learned_candidates: List[ImageBasisElement] = []

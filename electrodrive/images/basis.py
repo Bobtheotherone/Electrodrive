@@ -972,6 +972,7 @@ def generate_candidate_basis(
     n_candidates: int,
     device: str | torch.device = "cpu",
     dtype: torch.dtype = torch.float32,
+    rng: Optional[torch.Generator] = None,
 ) -> List[ImageBasisElement]:
     """Generate a list of candidate image basis elements for a spec.
 
@@ -1223,7 +1224,7 @@ def generate_candidate_basis(
 
                     for _ in range(n_perturb):
                         perturb = (
-                            torch.randn(3, device=device, dtype=dtype) * perturb_scale
+                            torch.randn(3, device=device, dtype=dtype, generator=rng) * perturb_scale
                         )
                         p = img_pos + perturb
                         # Keep perturbed images on the opposite side of the plane
@@ -1288,7 +1289,7 @@ def generate_candidate_basis(
         base = torch.stack(
             [r_ring * cos_t, r_ring * sin_t, torch.full_like(theta, z_off)], dim=1
         )
-        jitter = torch.randn_like(base) * jitter_scale
+        jitter = torch.randn_like(base, generator=rng) * jitter_scale
         pts = base + jitter + center
         for p in pts:
             if len(candidates) >= n_candidates:

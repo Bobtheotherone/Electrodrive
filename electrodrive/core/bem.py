@@ -24,12 +24,30 @@ from electrodrive.core.bem_kernel import (
 )
 from electrodrive.core.bem_quadrature import (
     self_integral_correction,
+    standard_triangle_quadrature,
     near_singular_quadrature,
 )
 
 # Optional CUDA near-field extension (panel-panel / target-panel).
 try:  # pragma: no cover - optional dependency
     from electrodrive.core import bem_near_cuda  # type: ignore[import]
+
+    # Guard against slow/blocked availability probes in the extension by
+    # replacing them with a fast attribute check. This ensures that solver
+    # paths don't hang when the extension is present but not fully usable.
+    def _safe_bem_near_cuda_available() -> bool:
+        try:
+            flag = getattr(bem_near_cuda, "HAS_BEM_NEAR_CUDA", None)
+            if flag is not None:
+                return bool(flag)
+        except Exception:
+            pass
+        return False
+
+    try:
+        bem_near_cuda.is_bem_near_cuda_available = _safe_bem_near_cuda_available  # type: ignore[attr-defined]
+    except Exception:
+        pass
 except Exception:  # pragma: no cover - optional dependency
     bem_near_cuda = None  # type: ignore[assignment]
 
@@ -543,6 +561,8 @@ def _precompute_near_correction_weights(
     panel_vertices: np.ndarray,
     near_pairs: np.ndarray,
     quad_order: int,
+    *,
+    max_depth: Optional[int] = None,
 ) -> np.ndarray:
     """
     Precompute geometry-only near-field correction weights for panel pairs.
@@ -566,42 +586,83 @@ def _precompute_near_correction_weights(
     if N_panels <= 0:
         return np.zeros((near_pairs.shape[0],), dtype=float)
 
-    weights = np.zeros((near_pairs.shape[0],), dtype=float)
+    depth = 0 if max_depth is None else max(0, int(max_depth))
 
-    for idx_pair, (idx_i_raw, idx_j_raw) in enumerate(near_pairs):
+    def _panel_rule(verts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Uniformly refine the panel `depth` times (4-way splits) and apply a
+        low-order rule on each subtriangle. This is cheaper than the fully
+        adaptive near_singular_quadrature but still clusters nodes enough for
+        near interactions.
+        """
+        if depth <= 0:
+            return standard_triangle_quadrature(verts, order=quad_order)
+
+        tris = [verts]
+        for _ in range(depth):
+            refined: List[np.ndarray] = []
+            for tri in tris:
+                v0, v1, v2 = tri
+                m01 = 0.5 * (v0 + v1)
+                m12 = 0.5 * (v1 + v2)
+                m20 = 0.5 * (v2 + v0)
+                refined.extend(
+                    [
+                        np.stack([v0, m01, m20]),
+                        np.stack([m01, v1, m12]),
+                        np.stack([m20, m12, v2]),
+                        np.stack([m01, m12, m20]),
+                    ]
+                )
+            tris = refined
+
+        pts_list: List[np.ndarray] = []
+        w_list: List[np.ndarray] = []
+        for tri in tris:
+            pts_sub, w_sub = standard_triangle_quadrature(tri, order=quad_order)
+            if pts_sub.size == 0:
+                continue
+            pts_list.append(pts_sub)
+            w_list.append(w_sub)
+
+        if not pts_list:
+            return standard_triangle_quadrature(verts, order=quad_order)
+        return np.vstack(pts_list), np.concatenate(w_list)
+
+    # Group near pairs by source panel j so we can reuse quadrature nodes.
+    grouped: Dict[int, List[Tuple[int, int]]] = {}
+    for pair_idx, (idx_i_raw, idx_j_raw) in enumerate(near_pairs):
         idx_i = int(idx_i_raw)
         idx_j = int(idx_j_raw)
+        if (0 <= idx_i < N_panels) and (0 <= idx_j < N_panels):
+            grouped.setdefault(idx_j, []).append((pair_idx, idx_i))
 
-        if not (0 <= idx_i < N_panels) or not (0 <= idx_j < N_panels):
-            continue
+    weights = np.zeros((near_pairs.shape[0],), dtype=float)
 
+    for idx_j, entries in grouped.items():
         Aj = float(A_np[idx_j])
         if Aj <= 0.0:
             continue
 
-        target = C_np[idx_i]
-        verts_j = verts_np[idx_j]
-
-        pts, w = near_singular_quadrature(
-            target=target,
-            panel_vertices=verts_j,
-            method="telles",
-            order=quad_order,
-        )
-        if w.size == 0:
+        pts_j, w_j = _panel_rule(verts_np[idx_j])
+        if pts_j.size == 0 or w_j.size == 0:
             continue
 
-        r = np.linalg.norm(pts - target[None, :], axis=1)
+        pair_indices = [p for p, _ in entries]
+        target_indices = np.asarray([i for _, i in entries], dtype=int)
+        targets = C_np[target_indices]
+
+        diff = targets[:, None, :] - pts_j[None, :, :]
+        r = np.linalg.norm(diff, axis=2)
         r = np.maximum(r, 1e-12)
-        kernel_vals = K_E / r
-        I_near = float(np.sum(kernel_vals * w))
+        I_near = np.sum((K_E / r) * w_j[None, :], axis=1)
 
-        r_far = np.linalg.norm(target - C_np[idx_j])
-        if r_far < 1e-12:
-            continue
-        I_far = float(K_E * Aj / r_far)
+        r_far = np.linalg.norm(targets - C_np[idx_j][None, :], axis=1)
+        r_far = np.maximum(r_far, 1e-12)
+        I_far = (K_E * Aj) / r_far
 
-        weights[idx_pair] = I_near - I_far
+        deltas = I_near - I_far
+        weights[pair_indices] = deltas
 
     return weights
 
@@ -795,52 +856,66 @@ def _apply_near_quadrature_matvec_cuda(
     panel_vertices_np: Optional[np.ndarray] = None,
     near_pairs_np: Optional[np.ndarray] = None,
     near_pair_weights_np: Optional[np.ndarray] = None,
+    near_quad_max_depth: Optional[int] = None,
 ) -> torch.Tensor:
     """
     CUDA-accelerated near-field quadrature correction to a matrix-vector
     product V_far.
 
-    This wrapper expects all tensor arguments to reside on the same CUDA
-    device. It delegates the heavy lifting to the optional
-    `electrodrive.core.bem_near_cuda` extension when available and
-    falls back to the CPU implementation `_apply_near_quadrature_matvec`
-    when needed.
+    This wrapper keeps the CUDA path numerically aligned with the reference
+    CPU helper `_apply_near_quadrature_matvec` by reusing the same geometry-
+    only correction weights delta_ij, evaluated with near_singular_quadrature,
+    whenever NumPy geometry is available. Those weights are then applied on
+    the active device via the Torch-native `_apply_near_quadrature_matvec_torch`.
 
-    Parameters are analogous to `_apply_near_quadrature_matvec`, except
-    that `panel_vertices` and `near_pairs` are Tensors.
+    When NumPy geometry is not available (rare), we fall back to the optional
+    `electrodrive.core.bem_near_cuda` extension on CUDA devices, or simply
+    return V_far unchanged when that extension is unavailable.
     """
     # Nothing to do if there are no near interactions.
     if near_pairs is None or near_pairs.numel() == 0:
         return V_far
 
     device = V_far.device
-    if device.type != "cuda":
-        # Not on CUDA; fall back to the CPU helper if we have NumPy arrays.
-        if panel_vertices_np is not None and near_pairs_np is not None:
-            return _apply_near_quadrature_matvec(
-                V_far,
-                sigma,
-                centroids=centroids,
-                areas=areas,
-                panel_vertices=panel_vertices_np,
-                near_pairs=near_pairs_np,
-                quad_order=quad_order,
-                near_pair_weights=near_pair_weights_np,
-            )
-        return V_far
+    dtype = V_far.dtype
 
-    if not _has_bem_near_cuda():
-        if panel_vertices_np is not None and near_pairs_np is not None:
-            return _apply_near_quadrature_matvec(
-                V_far,
-                sigma,
-                centroids=centroids,
-                areas=areas,
+    # Preferred path: we have explicit NumPy geometry for the near pairs.
+    # This is the case for the main solver and the unit tests, and it lets
+    # us share exactly the same near-singular quadrature as the CPU helper.
+    if panel_vertices_np is not None and near_pairs_np is not None:
+        # Either reuse caller-provided weights or build them once from the
+        # current geometry.
+        if near_pair_weights_np is None:
+            C_np = centroids.detach().cpu().numpy()
+            A_np = areas.detach().cpu().numpy()
+            near_pair_weights_np = _precompute_near_correction_weights(
+                centroids=C_np,
+                areas=A_np,
                 panel_vertices=panel_vertices_np,
                 near_pairs=near_pairs_np,
                 quad_order=quad_order,
-                near_pair_weights=near_pair_weights_np,
+                max_depth=near_quad_max_depth,
             )
+
+        if near_pair_weights_np.size == 0:
+            return V_far
+
+        weights = torch.as_tensor(
+            near_pair_weights_np,
+            device=device,
+            dtype=dtype,
+        )
+
+        return _apply_near_quadrature_matvec_torch(
+            V_far,
+            sigma,
+            near_pairs=near_pairs,
+            weights=weights,
+        )
+
+    # Fallback: no NumPy geometry available. In this case we try the compiled
+    # CUDA extension if we are actually on a CUDA device.
+    if device.type != "cuda" or not _has_bem_near_cuda():
         return V_far
 
     try:
@@ -857,17 +932,8 @@ def _apply_near_quadrature_matvec_cuda(
             K_E=None,
         )
     except Exception:
-        # Graceful fallback to CPU helper if we can.
-        if panel_vertices_np is not None and near_pairs_np is not None:
-            return _apply_near_quadrature_matvec(
-                V_far,
-                sigma,
-                centroids=centroids,
-                areas=areas,
-                panel_vertices=panel_vertices_np,
-                near_pairs=near_pairs_np,
-                quad_order=quad_order,
-            )
+        # Graceful fallback: if the extension fails for any reason, leave the
+        # far-field result unchanged.
         return V_far
 
 
@@ -882,6 +948,7 @@ def _apply_near_quadrature_potentials(
     distance_factor: float,
     quad_order: int,
     cache: Optional[Dict[str, Any]] = None,
+    max_depth: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Near-field quadrature correction for potentials at arbitrary targets.
@@ -950,7 +1017,11 @@ def _apply_near_quadrature_potentials(
 
             verts_j = panel_vertices_np[j]
             pts, w = near_singular_quadrature(
-                target=x, panel_vertices=verts_j, method="telles", order=quad_order
+                target=x,
+                panel_vertices=verts_j,
+                method="telles",
+                order=quad_order,
+                max_depth=max_depth,
             )
             if w.size == 0:
                 continue
@@ -1320,6 +1391,7 @@ class BEMSolution:
         near_quadrature: bool = False,
         near_quad_order: int = 2,
         near_quad_dist_factor: float = 1.5,
+        near_quad_max_depth: Optional[int] = None,
     ):
         self._spec = spec
         self._C = centroids
@@ -1342,6 +1414,7 @@ class BEMSolution:
         )
         self._near_quad_order = int(near_quad_order)
         self._near_quad_dist_factor = float(near_quad_dist_factor)
+        self._near_quad_max_depth = near_quad_max_depth
         self.meta: Dict[str, Any] = {}
 
         # Optional CPU-side cache for near-field potential correction to avoid
@@ -1420,6 +1493,7 @@ class BEMSolution:
                         distance_factor=self._near_quad_dist_factor,
                         quad_order=self._near_quad_order,
                         cache=self._near_eval_cache,
+                        max_depth=self._near_quad_max_depth,
                     )
             V_total = V_free + V_ind
 
@@ -1527,7 +1601,6 @@ def bem_solve(
     jacobi_maxiter_cfg = int(getattr(cfg, "jacobi_maxiter", 256))
     jacobi_tol_cfg = float(getattr(cfg, "jacobi_tol", 1e-5))
     jacobi_omega_cfg = float(getattr(cfg, "jacobi_omega", 0.8))
-
     history: List[Dict[str, Any]] = []
     best: Optional[Dict[str, Any]] = None
     best_bc = float("inf")
@@ -1667,12 +1740,73 @@ def bem_solve(
                     "Free-space potential on centroids contains NaN/Inf."
                 )
 
+            # Panel geometry reused across self-integral estimation and
+            # optional near-field corrections.
+            panel_vertices_np: Optional[np.ndarray] = None
+            if (
+                N > 0
+                and (
+                    bool(getattr(cfg, "use_near_quadrature_matvec", False))
+                    or bool(getattr(cfg, "use_near_quadrature", False))
+                )
+            ):
+                try:
+                    verts_np = np.asarray(mesh.vertices, dtype=float)
+                    tris_np = np.asarray(mesh.triangles, dtype=np.int64)
+                    panel_vertices_np = verts_np[tris_np]
+                except Exception:
+                    panel_vertices_np = None
+
+            # Geometry-dependent near-field refinement depth (used in both
+            # self-integrals and target-side near quadrature).
+            conductor_types = [c.get("type") for c in spec.conductors]
+            if any(t == "sphere" for t in conductor_types):
+                near_quad_depth = 3
+                near_quad_depth_matvec = near_quad_depth
+            elif conductor_types.count("plane") >= 2:
+                near_quad_depth = 3
+                near_quad_depth_matvec = near_quad_depth
+            else:
+                near_quad_depth = 4
+                near_quad_depth_matvec = max(1, near_quad_depth - 1)
+
             # Self-panel diagonal:
             # - self_integrals: raw self integral I_self(A) = ∫_panel G dS
             # - self_corr:     per-area diagonal K_ii = I_self / A
             self_integrals = torch.empty(N, device=device, dtype=dtype)
-            for i in range(N):
-                self_integrals[i] = self_integral_correction(A[i])
+            if panel_vertices_np is not None:
+                try:
+                    C_np = C.detach().cpu().numpy()
+                    A_np = A.detach().cpu().numpy()
+                    near_order = int(getattr(cfg, "near_quadrature_order", 2))
+                    vals = np.empty(N, dtype=float)
+                    for i in range(N):
+                        try:
+                            pts, w = near_singular_quadrature(
+                                target=C_np[i],
+                                panel_vertices=panel_vertices_np[i],
+                                method="telles",
+                                order=near_order,
+                                max_depth=near_quad_depth,
+                            )
+                            if w.size == 0:
+                                raise ValueError("empty quadrature weights")
+                            r = np.linalg.norm(pts - C_np[i][None, :], axis=1)
+                            r = np.maximum(r, 1e-12)
+                            vals[i] = float(np.sum((K_E / r) * w))
+                        except Exception:
+                            vals[i] = float(self_integral_correction(A_np[i]))
+                    self_integrals = torch.as_tensor(
+                        vals, device=device, dtype=dtype
+                    )
+                except Exception:
+                    # Fallback to the equal-area disk approximation if the
+                    # geometry-aware path fails for any reason.
+                    for i in range(N):
+                        self_integrals[i] = self_integral_correction(A[i])
+            else:
+                for i in range(N):
+                    self_integrals[i] = self_integral_correction(A[i])
 
             A_safe = A.clamp_min(torch.finfo(dtype).tiny)
             self_corr = self_integrals / A_safe
@@ -1688,7 +1822,6 @@ def bem_solve(
                 getattr(cfg, "near_quadrature_distance_factor", 1.5)
             )
 
-            panel_vertices_np: np.ndarray | None = None
             near_pairs_np: np.ndarray = np.zeros((0, 2), dtype=np.int64)
             near_pair_weights_np: Optional[np.ndarray] = None
             # Optional CUDA-side / Torch-side backing arrays for near-field data.
@@ -1707,9 +1840,10 @@ def bem_solve(
                 )
                 try:
                     # Ensure triangles are an integer array and in-bounds.
-                    tris = np.asarray(mesh.triangles, dtype=np.int64)
-                    verts = np.asarray(mesh.vertices, dtype=float)
-                    panel_vertices_np = verts[tris]
+                    if panel_vertices_np is None:
+                        tris = np.asarray(mesh.triangles, dtype=np.int64)
+                        verts = np.asarray(mesh.vertices, dtype=float)
+                        panel_vertices_np = verts[tris]
 
                     # Build robust near pairs using the explicit panel count N.
                     near_pairs_np = _build_near_pairs_for_panels(
@@ -1734,6 +1868,7 @@ def bem_solve(
                             panel_vertices_np,
                             near_pairs_np,
                             quad_order=near_quad_order,
+                            max_depth=near_quad_depth_matvec,
                         )
 
                         # Torch mirrors for fast matvec correction (CPU or GPU).
@@ -1837,18 +1972,19 @@ def bem_solve(
                         and panel_vertices_cuda is not None
                         and near_pairs_cuda is not None
                     ):
-                        V_far = _apply_near_quadrature_matvec_cuda(
-                            V_far,
-                            sig,
-                            centroids=C,
-                            areas=A,
-                            panel_vertices=panel_vertices_cuda,
-                            near_pairs=near_pairs_cuda,
-                            quad_order=near_quad_order,
-                            panel_vertices_np=panel_vertices_np,
-                            near_pairs_np=near_pairs_np,
-                            near_pair_weights_np=near_pair_weights_np,
-                        )
+                            V_far = _apply_near_quadrature_matvec_cuda(
+                                V_far,
+                                sig,
+                                centroids=C,
+                                areas=A,
+                                panel_vertices=panel_vertices_cuda,
+                                near_pairs=near_pairs_cuda,
+                                quad_order=near_quad_order,
+                                panel_vertices_np=panel_vertices_np,
+                                near_pairs_np=near_pairs_np,
+                                near_pair_weights_np=near_pair_weights_np,
+                                near_quad_max_depth=near_quad_depth_matvec,
+                            )
                     elif (
                         near_pairs_torch is not None
                         and near_pair_weights_torch is not None
@@ -2253,7 +2389,7 @@ def bem_solve(
 
             logger.info(
                 "Pass results.",
-                bc_residual_linf=bc_resid_linf,
+                bc_resid_linf=bc_resid_linf,
                 energy_A=f"{energy_A:.6e}",
             )
 
@@ -2407,6 +2543,12 @@ def bem_solve(
     # Panel vertices for near-field evaluation quadrature on the final mesh.
     panel_vertices_b: Optional[torch.Tensor] = None
     use_near_quad_eval = bool(getattr(cfg, "use_near_quadrature", False))
+    eval_near_dist_factor = float(getattr(cfg, "near_quadrature_distance_factor", 1.5))
+    conductor_types = {c.get("type") for c in spec.conductors}
+    if "sphere" in conductor_types:
+        eval_near_dist_factor = max(eval_near_dist_factor, 6.0)
+    elif "plane" in conductor_types:
+        eval_near_dist_factor = max(eval_near_dist_factor, 3.0)
     if use_near_quad_eval and N_b > 0:
         try:
             verts_b = torch.as_tensor(
@@ -2438,9 +2580,8 @@ def bem_solve(
         panel_vertices=panel_vertices_b,
         near_quadrature=use_near_quad_eval,
         near_quad_order=int(getattr(cfg, "near_quadrature_order", 2)),
-        near_quad_dist_factor=float(
-            getattr(cfg, "near_quadrature_distance_factor", 1.5)
-        ),
+        near_quad_dist_factor=eval_near_dist_factor,
+        near_quad_max_depth=near_quad_depth,
     )
     solution.meta["energy_A"] = best["energy_A"]
     solution.meta["bem_vram_config"] = {

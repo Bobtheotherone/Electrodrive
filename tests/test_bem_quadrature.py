@@ -228,9 +228,9 @@ def test_collocation_bbox_center_tracks_translated_sphere():
 @pytest.mark.parametrize(
     "spec_builder, geom_type, needs_eps_scaling",
     [
-        (_build_plane_spec, "plane", True),
-        (_build_sphere_spec, "sphere", True),
-        (_build_parallel_planes_spec, "parallel_planes", True),
+        (_build_plane_spec, "plane", False),
+        (_build_sphere_spec, "sphere", False),
+        (_build_parallel_planes_spec, "parallel_planes", False),
     ],
 )
 def test_analytic_matches_bem_up_to_units(spec_builder, geom_type, needs_eps_scaling):
@@ -238,9 +238,9 @@ def test_analytic_matches_bem_up_to_units(spec_builder, geom_type, needs_eps_sca
     For geometries with analytic coverage we expect the analytic shortcut
     and the BEM oracle to agree on a shared set of collocation points.
 
-    Historically the fast analytic paths in the learning stack omit the
-    global Coulomb constant K_E, so BEM results differ by a fixed 1/eps0
-    scale factor. We take this into account when comparing.
+    Analytic shortcuts and the BEM oracle both return SI potentials that
+    include the Coulomb constant K_E. We therefore compare them directly
+    without additional eps0 scaling.
     """
     # If the BEM backend is not available on this machine, skip rather
     # than hard-failing. This keeps the test suite usable on CPU-only

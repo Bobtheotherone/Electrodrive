@@ -485,7 +485,7 @@ def _bem_potential_targets_keops(
     inv_r = 1.0 / (D2_ij + eps).sqrt()
     K_ij = K_E * inv_r  # Laplace kernel
 
-    V = (K_ij * SigmaA_j).sum(dim=1).view(M)
+    V = (K_ij * SigmaA_j).sum(dim=1, sum_scheme="direct_sum").view(M)
 
     if logger is not None:
         logger.debug(
@@ -536,9 +536,9 @@ def _bem_E_field_targets_keops(
     inv_r = 1.0 / (D2_ij + eps).sqrt()
     inv_r3 = inv_r * inv_r * inv_r  # (M,N,1)
 
-    coef_ij = K_E * SigmaA_j * inv_r3  # (M,N,1)
-    E_ij = coef_ij * D_ij  # (M,N,3)
-    E = E_ij.sum(dim=1).view(M, 3)
+    E = (D_ij * inv_r3 * SigmaA_j * K_E).sum(
+        dim=1, sum_scheme="direct_sum"
+    ).view(M, 3)
 
     if logger is not None:
         logger.debug(

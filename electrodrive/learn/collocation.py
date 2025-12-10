@@ -655,6 +655,27 @@ def _domain_valid_mask(
             return mask & (r <= (radius + pad))
         return mask & (r >= (radius - pad))
 
+    if geom == "layered_planar":
+        # Analytic three-layer reference is only valid in region 1 (z >= top interface).
+        dielectrics = getattr(spec, "dielectrics", None) or []
+        boundary_counts: Dict[float, int] = {}
+        for d in dielectrics:
+            for key in ("z_min", "z_max"):
+                val = d.get(key, None)
+                if val is None:
+                    continue
+                try:
+                    z_val = float(val)
+                except Exception:
+                    continue
+                boundary_counts[z_val] = boundary_counts.get(z_val, 0) + 1
+        shared = sorted([z for z, cnt in boundary_counts.items() if cnt >= 2], reverse=True)
+        if shared:
+            top_z = shared[0]
+            pad = 1e-9
+            return mask & (X[:, 2] >= (top_z - pad))
+        return torch.zeros_like(mask)
+
     return mask
 
 
@@ -807,6 +828,45 @@ def _infer_geom_type_from_spec(spec: CanonicalSpec) -> str:
     if ("torus" in ctypes or "toroid" in ctypes) and len(spec.conductors) == 1:
         return "torus"
     return "unknown"
+
+
+def compute_layered_reference_potential(
+    spec: CanonicalSpec,
+    points: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Homogeneous-eps1 reference potential for layered planar stacks.
+
+    V_ref(r) = sum_i K_E * q_i / (eps1 * ||r - r_i||)
+    """
+    dielectrics = getattr(spec, "dielectrics", None) or []
+    if not dielectrics:
+        raise ValueError("Layered reference requested but no dielectrics present.")
+
+    # Region1 permittivity (first dielectric entry is assumed region1).
+    eps1 = dielectrics[0].get("epsilon") or dielectrics[0].get("eps") or dielectrics[0].get("permittivity")
+    if eps1 is None:
+        raise ValueError("Layered reference requires epsilon for region1.")
+    eps1_f = float(eps1)
+
+    charges = [c for c in getattr(spec, "charges", None) or [] if c.get("type") == "point"]
+    if not charges:
+        return torch.zeros(points.shape[0], device=device, dtype=dtype)
+
+    pts = points.to(device=device, dtype=dtype)
+    V_ref = torch.zeros(pts.shape[0], device=device, dtype=dtype)
+
+    for ch in charges:
+        q = float(ch.get("q", 0.0))
+        x0, y0, z0 = map(float, ch.get("pos", (0.0, 0.0, 0.0)))
+        r0 = torch.tensor([x0, y0, z0], device=device, dtype=dtype)
+        diff = pts - r0
+        R = torch.linalg.norm(diff, dim=1).clamp_min(1e-9)
+        V_ref = V_ref + (K_E * q) / (4.0 * math.pi * eps1_f) * (1.0 / R)
+
+    return V_ref
 
 
 def _infer_bbox_for_spec(spec: CanonicalSpec) -> float:
@@ -1060,35 +1120,83 @@ def _sample_points_for_spec(
                 z_hi = 0.25 * bbox
             points_int[:, 2] = rng.uniform(z_lo, z_hi, size=N_interior)
     elif geom == "layered_planar":
-        # Keep x/y moderate; focus z sampling around layer extents and charge heights.
+        # Keep x/y moderate; focus z sampling around interfaces and across regions.
         alpha = 0.25
         points_int[:, 0] *= alpha
         points_int[:, 1] *= alpha
-        z_vals: List[float] = []
+
+        boundary_counts: Dict[float, int] = {}
         for d in dielectrics:
             for key in ("z_min", "z_max"):
                 val = d.get(key, None)
                 if val is None:
                     continue
                 try:
-                    z_vals.append(float(val))
+                    z_val = float(val)
                 except Exception:
                     continue
-        for ch in getattr(spec, "charges", None) or []:
-            if ch.get("type") == "point":
-                try:
-                    pos = ch.get("pos") or ch.get("position")
-                    if pos is not None:
-                        z_vals.append(float(pos[2]))
-                except Exception:
+                boundary_counts[z_val] = boundary_counts.get(z_val, 0) + 1
+        shared = sorted([z for z, cnt in boundary_counts.items() if cnt >= 2], reverse=True)
+        if len(shared) >= 2:
+            top_interface = shared[0]
+            bottom_interface = shared[1]
+        else:
+            boundaries = sorted(boundary_counts.keys())
+            top_interface = max(boundaries) if boundaries else 0.0
+            bottom_interface = min(boundaries) if boundaries else -0.5
+        h = max(1e-6, top_interface - bottom_interface)
+
+        # Interface-focused sampling controlled by env knob (default on).
+        focus_on = os.getenv("EDE_COLL_LAYERED_INTERFACE_FOCUS", "1").lower() not in (
+            "0",
+            "false",
+            "off",
+        )
+        band_frac = float(os.getenv("EDE_COLL_LAYERED_INTERFACE_BAND_FRAC", "0.25"))
+        band = band_frac * h
+        interface_targets = [top_interface, bottom_interface]
+
+        # Allocate z samples
+        z_samples = np.zeros(N_interior, dtype=float)
+        n_interface = int(0.5 * N_interior) if focus_on else 0
+        per_iface = max(1, n_interface // len(interface_targets)) if interface_targets and n_interface else 0
+        idx = 0
+        for z_if in interface_targets:
+            if per_iface <= 0:
+                break
+            z_low = max(-bbox / 2.0, z_if - band)
+            z_high = min(bbox / 2.0, z_if + band)
+            z_samples[idx : idx + per_iface] = rng.uniform(z_low, z_high, size=per_iface)
+            idx += per_iface
+        n_used = idx
+        n_remaining = max(0, N_interior - n_used)
+
+        if n_remaining > 0:
+            # Regions: top (region1), slab, bottom (region3)
+            z_box_min = -bbox / 2.0
+            z_box_max = bbox / 2.0
+            regions = [
+                (top_interface, z_box_max),
+                (bottom_interface, top_interface),
+                (z_box_min, bottom_interface),
+            ]
+            spans = [max(0.0, hi - lo) for lo, hi in regions]
+            total_span = sum(spans)
+            if total_span <= 0:
+                spans = [1.0, 1.0, 1.0]
+                total_span = 3.0
+            probs = [s / total_span for s in spans]
+            counts = list(np.random.multinomial(n_remaining, probs))
+            for (lo, hi), count in zip(regions, counts):
+                if count <= 0:
                     continue
-        if z_vals and N_interior > 0:
-            z_min = max(0.0, min(z_vals))
-            z_max = max(z_vals)
-            pad = 0.25 * (z_max - z_min + 1e-6)
-            z_lo = max(0.0, z_min - pad)
-            z_hi = z_max + pad
-            points_int[:, 2] = rng.uniform(z_lo, z_hi, size=N_interior)
+                if hi <= lo:
+                    continue
+                z_samples[idx : idx + count] = rng.uniform(lo, hi, size=count)
+                idx += count
+
+        if N_interior > 0:
+            points_int[:, 2] = z_samples[:N_interior]
 
     if N_interior > 0:
         points_int += bbox_center_np
@@ -1183,11 +1291,10 @@ def _sample_points_for_spec(
                         continue
                     try:
                         zv = float(val)
-                        if zv >= -1e-6:  # only upper interfaces for region-1 oracle
-                            z_candidates.append(zv)
+                        z_candidates.append(zv)
                     except Exception:
                         continue
-                for z in z_candidates:
+                for z in sorted(set(z_candidates)):
                     span = bbox / 4.0
                     xy = rng.uniform(-span, span, (max(1, N_per // 2), 2))
                     points_bnd_list.append(

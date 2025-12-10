@@ -1018,6 +1018,7 @@ def generate_candidate_basis(
     wants_inner_patch_ring = "inner_patch_ring" in basis_types
     wants_rich_inner = "rich_inner_rim" in basis_types
     wants_three_layer = "three_layer_images" in basis_types
+    wants_three_layer = wants_three_layer and bool(getattr(spec, "dielectrics", None))
 
     # Sphere Kelvin ladder: image charges inside each spherical conductor.
     if wants_sphere_kelvin and spheres and point_charges:
@@ -1219,51 +1220,85 @@ def generate_candidate_basis(
                     candidates.append(elem)
 
     if wants_three_layer:
-        layers = getattr(spec, "dielectrics", None) or []
-        charges = [
-            torch.tensor(ch["pos"], device=device, dtype=dtype)
-            for ch in getattr(spec, "charges", None) or []
-            if ch.get("type") == "point"
-        ]
-        z0 = float(charges[0][2].item()) if charges else 0.75
-        z_bounds: List[float] = []
-        for layer in layers:
-            for key in ("z_min", "z_max"):
-                val = layer.get(key, None)
-                if val is None:
+        # Geometry-aware three-layer basis (planar stratified stack).
+        dielectrics = getattr(spec, "dielectrics", None) or []
+        if getattr(spec, "BCs", None) == "dielectric_interfaces" and len(dielectrics) == 3:
+            # Identify the finite slab as the bounded layer with minimum thickness.
+            slab_layer = None
+            slab_thickness = None
+            for layer in dielectrics:
+                if layer.get("z_min") is None or layer.get("z_max") is None:
                     continue
                 try:
-                    z_bounds.append(float(val))
+                    t = float(layer["z_max"]) - float(layer["z_min"])
                 except Exception:
                     continue
-        z_bounds = sorted(set(z_bounds))
-        if len(z_bounds) >= 2:
-            z_top = max(z_bounds)
-            z_low = min(z_bounds)
-            h = abs(z_top - z_low)
-        else:
-            z_top = 0.0
-            h = 0.5
-        depths: List[float] = []
-        depths.append(-0.25 * h)
-        depths.append(-h - 0.5 * h)
-        depths.append(-h - 1.5 * h)
-        depths.append(-h - 2.5 * h)
-        depths.append(0.1 * h)
-        for idx, z_img in enumerate(depths):
-            if abs(z_img - z0) < 1e-3:
-                continue
-            pos = torch.tensor([0.0, 0.0, z_img], device=device, dtype=dtype)
-            elem = PointChargeBasis({"position": pos}, type_name="three_layer_images")
-            annotate_group_info(
-                elem,
-                conductor_id=0,
-                family_name="three_layer_images",
-                motif_index=idx,
-            )
-            candidates.append(elem)
-            if len(candidates) >= n_candidates:
-                break
+                if t <= 0:
+                    continue
+                if slab_thickness is None or t < slab_thickness:
+                    slab_thickness = t
+                    slab_layer = layer
+
+            if slab_layer is not None and slab_thickness is not None:
+                top_z = float(slab_layer.get("z_max", 0.0))
+                bottom_z = float(slab_layer.get("z_min", top_z - slab_thickness))
+                h = float(slab_thickness)
+
+                point_charges = [
+                    c for c in getattr(spec, "charges", None) or [] if c.get("type") == "point"
+                ]
+                if h > 0.0 and point_charges:
+                    for cid, charge in enumerate(point_charges):
+                        try:
+                            z0 = float(charge["pos"][2])
+                            x0 = float(charge["pos"][0])
+                            y0 = float(charge["pos"][1])
+                        except Exception:
+                            continue
+
+                        z_candidates: List[float] = []
+
+                        def _append_unique(z_val: float, acc: List[float], tol: float = 1e-6) -> None:
+                            for zv in acc:
+                                if abs(zv - z_val) < tol:
+                                    return
+                            acc.append(z_val)
+
+                        # Mirror across the top interface and its first ladder bounce.
+                        mirror_z = 2.0 * top_z - z0
+                        _append_unique(mirror_z, z_candidates)
+                        _append_unique(mirror_z - 2.0 * h, z_candidates)
+
+                        # Slab-guided / effective images near and within the slab.
+                        for frac in (0.25, 0.75):
+                            _append_unique(top_z - frac * h, z_candidates)
+
+                        # Evanescent tail below the slab to mimic guided decay.
+                        for alpha in (0.5, 1.5, 3.0):
+                            _append_unique(bottom_z - alpha * h, z_candidates)
+
+                        # Materialise candidates with grouped metadata.
+                        for idx_img, z_img in enumerate(z_candidates):
+                            if len(candidates) >= n_candidates:
+                                break
+                            pos = torch.tensor([x0, y0, z_img], device=device, dtype=dtype)
+                            elem = PointChargeBasis({"position": pos}, type_name="three_layer_images")
+                            if idx_img < 2:
+                                family = "three_layer_mirror"
+                                motif = idx_img
+                            elif idx_img < 4:
+                                family = "three_layer_slab"
+                                motif = idx_img - 2
+                            else:
+                                family = "three_layer_tail"
+                                motif = idx_img - 4
+                            annotate_group_info(
+                                elem,
+                                conductor_id=cid,
+                                family_name=family,
+                                motif_index=motif,
+                            )
+                            candidates.append(elem)
 
     # Mirror-stack candidates for parallel planes (experimental).
     planes = [c for c in conductors if c.get("type") == "plane"]
@@ -2005,6 +2040,7 @@ class BasisOperator:
 
         # Column norms can be estimated lazily when needed.
         self.col_norms: Optional[torch.Tensor] = None
+        self._inv_col_norms: Optional[torch.Tensor] = None
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -2084,7 +2120,56 @@ class BasisOperator:
             norms[i] = torch.sqrt(torch.sum(phi * phi) + 1e-12)
 
         self.col_norms = norms
+        self._inv_col_norms = 1.0 / norms.clamp_min(1e-6)
         return norms
+
+    def apply_inv_col_norms(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        Right-scale weights by precomputed inv col norms.
+
+        Used by operator-mode ISTA to avoid re-estimating norms on each call.
+        """
+        if self._inv_col_norms is None:
+            # Fallback: treat as identity scaling.
+            self._inv_col_norms = torch.ones(len(self.elements), device=self.device, dtype=self.dtype)
+        inv = self._inv_col_norms.to(self.device, dtype=self.dtype)
+        return w * inv
+
+    def inv_col_norms(self) -> torch.Tensor:
+        """Return inverse column norms (clamped) if available."""
+        if self._inv_col_norms is None:
+            self._inv_col_norms = torch.ones(len(self.elements), device=self.device, dtype=self.dtype)
+        return self._inv_col_norms
+
+    def compute_column_norms(self, points: torch.Tensor) -> torch.Tensor:
+        """
+        Materialise Φ at the given points and return per-column L2 norms.
+
+        This is intended for diagnostics / small-scale preconditioning, not
+        for full discovery runs where dense assembly would be too expensive.
+        """
+        dense = self.to_dense(max_entries=None, targets=points)
+        if dense is None:
+            raise RuntimeError("Cannot materialize dense dictionary for column norms.")
+        return torch.linalg.norm(dense, dim=0)
+
+    def normalized_dense(
+        self,
+        points: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return a dense dictionary with unit-ish column norms and inv_norms.
+
+        A_norm = A_raw * diag(inv_norms), where inv_norms = 1 / ||A_raw[:, j]||.
+        """
+        dense = self.to_dense(max_entries=None, targets=points)
+        if dense is None:
+            raise RuntimeError("Cannot materialize dense dictionary.")
+        col_norms = torch.linalg.norm(dense, dim=0).clamp_min(eps)
+        inv_norms = 1.0 / col_norms
+        A_norm = dense * inv_norms
+        return A_norm, inv_norms
 
     def to_dense(
         self,

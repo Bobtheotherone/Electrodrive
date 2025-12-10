@@ -138,6 +138,7 @@ def run_discover(args: argparse.Namespace) -> int:
             "restarts": int(args.restarts),
             "basis_generator": args.basis_generator,
             "basis_generator_mode": args.basis_generator_mode,
+            "subtract_physical": subtract_physical,
         }
         save_image_system(system, save_path, metadata=metadata)
         logger.info(

@@ -26,7 +26,11 @@ from electrodrive.images.basis import (
 from electrodrive.images.operator import BasisOperator
 # NOTE: images currently depends on learn.collocation for collocation sampling.
 # In a future refactor, this should move to a shared core.collocation module.
-from electrodrive.learn.collocation import make_collocation_batch_for_spec
+from electrodrive.learn.collocation import (
+    make_collocation_batch_for_spec,
+    _infer_geom_type_from_spec,
+    compute_layered_reference_potential,
+)
 from electrodrive.orchestration.parser import CanonicalSpec
 from electrodrive.utils.logging import JsonlLogger
 from electrodrive.utils.config import K_E
@@ -743,6 +747,10 @@ def get_collocation_data(
     """
     device = torch.device(device)
     rng = rng if rng is not None else _make_collocation_rng()
+    try:
+        geom = _infer_geom_type_from_spec(spec)
+    except Exception:
+        geom = "unknown"
 
     n_points, ratio_boundary = _resolve_collocation_params(
         n_points_override, ratio_override
@@ -781,21 +789,25 @@ def get_collocation_data(
 
     if subtract_physical_potential and X_f.numel() > 0:
         try:
-            charges = getattr(spec, "charges", []) or []
-            q_list = []
-            pos_list = []
-            for c in charges:
-                if c.get("type") != "point":
-                    continue
-                q_list.append(float(c.get("q", 0.0)))
-                pos_list.append([float(v) for v in c.get("pos", [0.0, 0.0, 0.0])])
-            if q_list:
-                Q = torch.tensor(q_list, device=device, dtype=dtype).view(1, -1)
-                P = torch.tensor(pos_list, device=device, dtype=dtype).view(len(q_list), 3)
-                diff = X_f[:, None, :] - P[None, :, :]
-                R = torch.linalg.norm(diff, dim=2).clamp_min(1e-9)
-                V_phys = (K_E * Q / R).sum(dim=1)
-                V_f = V_f - V_phys
+            if geom == "layered_planar":
+                V_ref = compute_layered_reference_potential(spec, X_f, device=device, dtype=dtype)
+                V_f = V_f - V_ref
+            else:
+                charges = getattr(spec, "charges", []) or []
+                q_list = []
+                pos_list = []
+                for c in charges:
+                    if c.get("type") != "point":
+                        continue
+                    q_list.append(float(c.get("q", 0.0)))
+                    pos_list.append([float(v) for v in c.get("pos", [0.0, 0.0, 0.0])])
+                if q_list:
+                    Q = torch.tensor(q_list, device=device, dtype=dtype).view(1, -1)
+                    P = torch.tensor(pos_list, device=device, dtype=dtype).view(len(q_list), 3)
+                    diff = X_f[:, None, :] - P[None, :, :]
+                    R = torch.linalg.norm(diff, dim=2).clamp_min(1e-9)
+                    V_phys = (K_E * Q / R).sum(dim=1)
+                    V_f = V_f - V_phys
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "Failed to subtract physical potential; leaving targets unchanged.",
@@ -981,12 +993,15 @@ def solve_l1_ista(
             A_op.col_norms = col_norms
         else:
             col_norms = torch.ones(N_k, device=device, dtype=dtype)
+            A_op._inv_col_norms = torch.ones_like(col_norms)
+
+        inv_norms = A_op.inv_col_norms()
 
         def _matvec_scaled(w: torch.Tensor) -> torch.Tensor:
-            return _matvec(A_op, w * (1.0 / col_norms), X)  # type: ignore[arg-type]
+            return _matvec(A_op, w * inv_norms, X)  # type: ignore[arg-type]
 
         def _rmatvec_scaled(r_vec: torch.Tensor) -> torch.Tensor:
-            return _rmatvec(A_op, r_vec, X) * (1.0 / col_norms)
+            return inv_norms * _rmatvec(A_op, r_vec, X)
     else:
         A_tensor = A.to(device=device, dtype=dtype)
         if normalize_columns:
@@ -1654,6 +1669,14 @@ def solve_sparse(
     except Exception:
         stats["bc_norm"] = float("nan")
         stats["int_norm"] = float("nan")
+
+    try:
+        stats["col_norm_min"] = float(col_norms.min().item())
+        stats["col_norm_max"] = float(col_norms.max().item())
+        stats["col_norm_median"] = float(col_norms.median().item())
+        stats["normalized_columns"] = bool(normalize_columns)
+    except Exception:
+        pass
 
     try:
         if torch.is_tensor(lambda_group):

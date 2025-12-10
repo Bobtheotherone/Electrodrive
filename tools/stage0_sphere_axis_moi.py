@@ -256,6 +256,7 @@ def run_single(
             n_points_override=n_collocation,
             ratio_boundary_override=ratio_boundary,
             model_checkpoint=model_ckpt_str,
+            subtract_physical_potential=True,
         )
 
         dtype = torch.float64
@@ -283,8 +284,11 @@ def run_single(
         V_img_axis = _eval_system(system, axis_pts, dtype=dtype).detach().cpu().numpy()
 
         V_free_bc = free_space_potential_at_points(spec, bc_pts)
-        bc_err = _boundary_error_with_free_space(V_an_bc, V_img_bc, V_free_bc)
-        axis_err = error_stats(V_an_axis, V_img_axis)
+        V_free_axis = free_space_potential_at_points(spec, axis_pts)
+        V_total_bc = V_img_bc + V_free_bc
+        V_total_axis = V_img_axis + V_free_axis
+        bc_err = _boundary_error_with_free_space(V_an_bc, V_total_bc, V_free_bc)
+        axis_err = error_stats(V_an_axis, V_total_axis)
 
         kelvin = _kelvin_prediction(z0, sphere.center[2], sphere.radius)
         dominant = _dominant_image(system)

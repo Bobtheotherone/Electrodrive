@@ -1,0 +1,148 @@
+sphere: no finite collection of Coulomb charges can satisfy the boundary conditions
+. Another example:
+an ellipsoidal conductor requires an infinite series of images lying along a line (the so-called Pellat’s solution
+involves an integral of line charges). Similarly, a  point charge in front of a dielectric slab cannot be
+represented by a few images – one gets a continuous charge “image” smeared along the perpendicular
+through the slab. These impossibility results stem from the uniqueness theorem: the Green’s function in
+such cases has branch-cut singularities (the continuous spectra corresponding to continuum of image
+charges). A rigorous statement is that the method of images in the form of finite discrete sources works iff
+the boundary is an equipotential of a conformal inversion of a sphere or plane (so basically plane, sphere, or
+special cases like coaxal cylinders in 2D). For arbitrary shapes or layered media, one resorts to infinite series
+or integrals. 
+Parameter  Scaling  &  Numerical  Considerations: It  is  crucial  to  nondimensionalize  lengths  by  a
+characteristic scale (sphere radius, etc.) and to form contrast parameters that govern the solution. Common
+dimensionless groups include the permivitty contrast
+ (which appeared in many formulas above
+as image-charge factors), the normalized separation
+ (distance of a charge or second object in
+units of sphere radius), and the gap ratio
+. In series expansions, small  can be used as an expansion
+parameter (for instance, for a weakly polarizable sphere, 
+). In contrast, 
+(huge contrast in either direction) is a singular limit – e.g. 
+ corresponds to a perfect conductor image.
+One often expands about those extremes: for a high-  sphere, one can write 
+ where
+ is 0 for 
+ and 
+ is proportional to 
+. This yields a small parameter 
+. Likewise, for a low-
+ inclusion, one can treat it as a small perturbation (since 
+, one might set 
+ with 
+ and
+expand). As for geometry, small gap
+ expansions often use 
+ as a parameter: e.g. capacitance of
+sphere-plane has an asymptotic expansion in powers of  
+ and  
+. For  far-field expansions, one
+uses 
+: e.g. the potential of a sphere of charge 
+ at large distance looks like 
+ dipole
+term + etc., with each successive multipole 
+. Truncating at dipole yields an error 
+.
+Many numerical schemes (method of moments, multipole accelerators) leverage such truncation for distant
+interactions. 
+When  implementing  image-based  solutions  or  series  numerically,  one  must  ensure  convergence and
+stability. For example, the Legendre series for a dielectric sphere can suffer catastrophic cancellation for
+large  if summed naively; using recurrence relations or log-scaling for the coefficients is recommended. In
+boundary element collocation, placing collocation points near sharp edges or small gaps is essential: e.g.
+for a sphere near a plane, a finer mesh (or denser sampling for the method of moments) is needed in the
+region of closest approach, because induced surface charge density behaves like 
+ near the
+contact point (a square-root singularity). Mesh grading proportional to 
+ is often used
+to capture this. In iterative image constructions, one monitors the magnitude of the last-added image
+charge: stopping when it falls below some tolerance ensures the error in potential is bounded by that
+magnitude. For instance, in the two-sphere problem, if the 
+th image has charge 
+, the error in potential
+is 
+; since 
+ (for large ) or 
+ (for small gap), one can estimate how
+many images are required. 
+Known Results Summary: To conclude this technical compendium, we list some notable special-case
+solutions and references: (1) A charge above a dielectric half-space – exact potential via one image charge
+(with magnitude 
+)
+, first derived by Sommerfeld and found in many textbooks
+(e.g. Jackson, Eq. 4.19). (2) Charge outside a grounded conducting sphere – Kelvin’s image solution (1845)
+. (3) Charge outside a dielectric sphere – infinite series solution (e.g. Stratton 1941, p. 147; Kirkwood
+41
+β = ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+s = d/a
+g/a
+β
+B ≈
+l
+β q/(4πϵ ) (a/d)
+1
+l+1
+β → ±1
+β → 1
+ϵ
+B =
+l
+B
++
+l
+(∞)
+ΔBl
+Bl
+(∞)
+l > 0
+ΔBl
+1/ϵ2
+1/ϵ2
+ϵ
+β ≈ −1
+ϵ =
+2
+ϵ δ
+1
+δ ≪ 1
+g ≪ a
+g/a
+ln(a/g)
+g/a
+a/d ≪ 1
+Q
+Q/(4πϵ r)+
+1
+∼ (a/d)l
+∼ O((a/d) )
+3
+l
+σ ∼ (g/ρ)1/2
+distance to contact
+N
+qN
+O(q /q)
+N
+q /q ∼
+N
+(a/d)N
+d
+∼ (1 − g/a)N
+q =
+′
+(ϵ −
+1
+ϵ )/(ϵ +
+2
+1
+ϵ )q
+2
+1
+26
+7

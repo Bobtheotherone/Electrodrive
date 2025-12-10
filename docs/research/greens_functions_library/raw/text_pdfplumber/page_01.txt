@@ -1,0 +1,39 @@
+Planar Stratified Media Green’s Functions (Electrostatics)
+Half‐Space (Single Interface):  For a point charge  q  at height  d  above a planar interface between
+permittivities ϵ1 (above, where the charge resides) and ϵ2 (below), the potential in the upper region can be
+written as the superposition of the original charge and an image charge. The image magnitude is 
+q′
+ϵ −ϵ
+=  ϵ1+ϵ2 q, located at the mirror point symmetrically below the plane 1 . (Notably, if ϵ2 < ϵ1, then q′ has
+1 2
+the same sign as q, implying a repulsive interaction – charges are repelled from lower-permittivity regions
+1 .) The potential for z > 0 is then:
+q 1 ϵ −ϵ 1
+V (ρ,z) = + 1 2 ,
+above 4πϵ1[ ρ2+(z−d)2 ϵ1+ϵ2 ρ2+(z+d)2]
+in cylindrical coordinates (ρ horizontal distance) 2 . This satisfies the interface conditions: continuity of V
+at z = 0 and continuity of normal ϵEz (no surface charge at the boundary) 3 2 . In the lower region 
+z < 0, the field is uniform with no internal image charge; one finds Ez<0 = (1−ν)Eorig with ν = ϵϵ22+−ϵϵ11 so
+that Ez is continuous 4 5 . Equivalently, the potential in z < 0 behaves as if the free charge were
+effectively scaled by a factor 2ϵ1/(ϵ1+ϵ2) 6  (for ϵ1 = 1 above, Vz<0 is as if charge 2q/(ϵ1+ϵ2) were in
+vacuum). In the extreme cases, (i)ϵ2 → ∞ (conducting lower half-space) gives q′ = −q and the familiar
+image method for a grounded plane 2 ; (ii)ϵ2 → 0 (infinitely “low” permittivity) gives q′ = +q (image of
+same sign, fully repulsive). The induced bound surface-charge density on the interface is σb(ρ) =
+−ν qd 7 8 , which for a conductor (ν = 1) recovers σ(ρ) = − qd 9 10 . The force on
+2π(ρ2+d2)3/2 2π(ρ2+d2)3/2
+the point charge due to the interface is Fz = −16πqϵ0qϵ′1d2 (attractive for ϵ2 > ϵ1, repulsive if ϵ2 < ϵ1). The
+image formulation above is in fact an exact solution for the static half-space problem 11 12 . 
+Spectral Integral Representation: The same result can be obtained by a Fourier/Sommerfeld integral. The
+full-space Green’s function in homogeneous medium is G0 = 4π1ϵR1. For the half-space, one finds an
+azimuthal Fourier-Bessel transform:
+1 ∞ 1
+G(ρ,z,z′) = e−k∣z−z′∣+R (k)e−k(z+z′) J (kρ)kdk,
+2π ∫ 2ϵ k[ p ] 0
+0 1
+with Rp(k) = (ϵ1−ϵ2)/(ϵ1+ϵ2) (static limit of the TM-wave reflection coefficient) 6 2 . Evaluating the
+integral yields the above image expression. The term with e−k(z+z′) corresponds to the reflected field from
+the interface. For multi-layer planar stratifications, one obtains multiple reflections: e.g. for a 3-layer (two
+interfaces) system, the Green’s function can be written as a similar Sommerfeld integral but with a 
+frequency-dependent reflection coefficient Rp(k) that is a rational function encoding multiple internal
+reflections. Barrera, Guzmán & Balaguer (1978) used the method of images to derive such integrals for a
+1

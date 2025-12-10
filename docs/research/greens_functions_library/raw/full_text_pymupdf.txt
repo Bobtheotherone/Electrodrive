@@ -1,0 +1,1313 @@
+=== Page 1 ===
+Planar Stratified Media Green’s Functions (Electrostatics)
+Half‐Space  (Single  Interface): For  a  point  charge   at  height   above  a  planar  interface  between
+permittivities 
+ (above, where the charge resides) and 
+ (below), the potential in the upper region can be
+written as the superposition of the original charge and an image charge. The image magnitude is 
+= 
+, located at the mirror point symmetrically below the plane
+. (Notably, if 
+, then 
+ has
+the same sign as , implying a repulsive interaction – charges are repelled from lower-permittivity regions
+.) The potential for 
+ is then:
+in cylindrical coordinates (ρ horizontal distance)
+. This satisfies the interface conditions: continuity of 
+at 
+ and continuity of normal 
+ (no surface charge at the boundary)
+. In the lower region 
+, the field is uniform with no internal image charge; one finds 
+ with 
+ so
+that 
+ is continuous
+. Equivalently, the potential in 
+ behaves as if the free charge were
+effectively scaled by a factor 
+ (for 
+ above, 
+ is as if charge 
+ were in
+vacuum). In the extreme cases, (i)
+ (conducting lower half-space) gives 
+ and the familiar
+image method for a grounded plane
+; (ii)
+ (infinitely “low” permittivity) gives 
+ (image of
+same sign, fully repulsive). The induced bound surface-charge density on the interface is 
+, which for a conductor (
+) recovers 
+. The force on
+the point charge due to the interface is 
+ (attractive for 
+, repulsive if 
+). The
+image formulation above is in fact an exact solution for the static half-space problem
+. 
+Spectral Integral Representation: The same result can be obtained by a Fourier/Sommerfeld integral. The
+full-space Green’s function in homogeneous medium is  
+. For the half-space, one finds an
+azimuthal Fourier-Bessel transform:
+with 
+ (static limit of the TM-wave reflection coefficient)
+. Evaluating the
+integral yields the above image expression. The term with 
+ corresponds to the reflected field from
+the interface. For multi-layer planar stratifications, one obtains multiple reflections: e.g. for a 3-layer (two
+interfaces) system, the Green’s function can be written as a similar Sommerfeld integral but with a 
+frequency-dependent reflection coefficient 
+ that is a rational function encoding multiple internal
+reflections. Barrera, Guzmán & Balaguer (1978) used the method of images to derive such integrals for a
+q
+d
+ϵ1
+ϵ2
+q′
+q
+ϵ + ϵ
+1
+2
+ϵ − ϵ
+1
+2
+1
+ϵ <
+2
+ϵ1
+q′
+q
+1
+z > 0
+V
+(ρ, z) =
+above
+[
++
+4πϵ1
+q
+ρ + (z − d)
+2
+2
+1
+],
+ϵ + ϵ
+1
+2
+ϵ − ϵ
+1
+2
+ρ + (z + d)
+2
+2
+1
+2
+V
+z = 0
+ϵEz
+3
+2
+z < 0
+E
+=
+z<0
+(1 − ν)Eorig
+ν = ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+Ez
+4
+5
+z < 0
+2ϵ /(ϵ +
+1
+1
+ϵ )
+2
+6
+ϵ =
+1
+1
+Vz<0
+2q/(ϵ +
+1
+ϵ )
+2
+ϵ →
+2
+∞
+q =
+′
+−q
+2
+ϵ →
+2
+0
+q =
+′
++q
+σ (ρ) =
+b
+−ν 2π(ρ +d )
+2
+2 3/2
+q d
+7
+8
+ν = 1
+σ(ρ) = − 2π(ρ +d )
+2
+2 3/2
+q d
+9
+10
+F =
+z
+− 16πϵ ϵ d
+0 1
+2
+q q′
+ϵ >
+2
+ϵ1
+ϵ <
+2
+ϵ1
+11
+12
+G =
+0
+4πϵ
+1
+R
+1
+G(ρ, z, z ) =
+′
+[e
++
+2π
+1 ∫
+0
+∞
+2ϵ k
+1
+1
+−k∣z−z ∣′
+R (k) e
+]J (kρ) k dk,
+p
+−k(z+z )
+′
+0
+R (k) =
+p
+(ϵ −
+1
+ϵ )/(ϵ +
+2
+1
+ϵ )
+2
+6
+2
+e−k(z+z )
+′
+R (k)
+p
+1
+
+
+=== Page 2 ===
+three-dielectric planar configuration
+. The resulting potential expressions involve piecewise-defined
+integrals (or infinite image charge series) for each region that satisfy the boundary conditions at both
+interfaces. In general, no finite number of discrete image charges can exactly represent the field in multi-
+layer dielectric media; instead one obtains either infinite image series or continuous distributions
+(integrals). For instance, a point charge between two dielectric half-spaces produces an infinite series of
+images in each layer (analogous to multiple mirror images in a Fabry–Pérot cavity) which sums to the exact
+Green’s function
+. These series/integrals converge rapidly when the source is far from the interfaces,
+but can converge slowly for near-interface sources or high-contrast interfaces. Various techniques
+(asymptotic extraction, Ewald summation, numerical steepest-descent integration) are used to accelerate
+convergence of Sommerfeld integrals
+. For quasi-static problems, it is common to partition the
+Green’s function into a “direct” term plus a rapidly decaying reflected field; e.g. one can subtract the 
+singular contribution and handle it analytically, then integrate the remainder numerically with fewer
+discretization points
+. Approximations via discrete image charges are also used: for example, Wait &
+Spies (1964) proposed complex image charges to approximate the Sommerfeld integral of a dipole field in a
+conductive half-space
+ (the complex image method), achieving high accuracy by fitting a few images to
+the continuous spectrum. Similar rational approximations exist for static/dc fields in layered media to avoid
+direct integration. However, these are approximations; the exact solution generally resides in the spectral
+integral form or an infinite series of images. 
+Planar Layer Examples: A classical example is a charge on the interface (say in medium 1 at 
+): it
+induces a surface charge of magnitude 
+ on the boundary such that the field in medium 2 is as if a charge
+ were placed at the interface
+. Another case: a charge embedded in a dielectric slab
+of finite thickness between two different dielectric half-spaces. By multiple reflections, one can sum an
+infinite geometric series of image charges in each region. If the slab is symmetric (same permittivity above
+and below), the series simplifies (even and odd image symmetry). If the slab is very thin (small thickness
+compared to source distance), asymptotic methods can treat the two interfaces as a single effective
+interface  with  an  effective  reflection  coefficient  
+ etc.,  accurate  to  
+ where   is
+thickness. If the source is very close to one interface (small gap), the first image dominates and higher-
+order images (multiple reflections) contribute corrections that can be expanded in powers of the small
+parameter. Conversely, if the source is far, one can expand the field as the free-space field plus a dipole term
+proportional to 
+ (for a distant charge, the interface effect looks like an induced dipole
+layer). 
+Key References (Planar Media): The plane interface problem was treated by Sommerfeld (1909) for EM
+fields (the static limit yields the above forms).  Landau & Lifshitz derive the image charge result for a
+dielectric half-space in Electrodynamics of Continuous Media (Problem 1 to §8). Jackson (3rd ed, §4.4) also
+covers a point charge above a dielectric half-space (leading to a surface-charge integral solution and the
+image-charge interpretation).  Ramo, Whinnery & Van Duzer (Fields and Waves, 1965) give the closed-
+form solution for the static interface using Fourier transforms
+. For multiple planar layers, Barrera
+et al, Am. J. Phys. 46, 1172 (1978) gave explicit Fourier-integral forms (corrected by Serra et al (2015) for
+sign errors
+). The general formalism for layered media Green’s functions is given in texts like Chew
+(1990) and  Kong (1986), using transmission line analogies for the reflection coefficient  
+. In static
+cases,  
+ becomes real and non-dispersive (independent of   for Laplace’s equation), which is why the
+integrals often evaluate to simple image expressions – indeed for a purely dielectric discontinuity the
+integrand  
+ is constant, allowing analytic integration to yield the simple  
+ form. This
+ceases to be true for frequency-dependent or more complicated stratifications, where 
+ is a function of
+13
+14
+13
+15
+16
+17
+k = 0
+18
+19
+20
+z = 0+
+q′
+2q/(ϵ +
+1
+ϵ )
+2
+6
+21
+R
+≈
+eff
+R
++
+12
+R23
+O(t)
+t
+(ϵ −
+2
+ϵ )/(ϵ +
+1
+2
+ϵ )
+1
+22
+23
+24
+25
+R (k)
+p
+Rp
+k
+Rp
+1/
+ρ + (z + d)
+2
+2
+R (k)
+p
+2
+
+
+=== Page 3 ===
+the spectral parameter and no closed-form point-image exists (necessitating the so-called “Sommerfeld
+integrals”). 
+Green’s Functions for Spherical Boundaries (Method of Images for
+Spheres)
+Conducting Sphere (Kelvin’s Image Charge): A point charge   in an infinite homogeneous medium at
+distance  from the center of a grounded conducting sphere (radius 
+) induces an image charge 
+ located along the line from the center through the real charge, at radius  
+ from the
+center
+. This Kelvin image produces a potential that exactly cancels 
+ on the conductor surface. The
+resulting Green’s function (Dirichlet, 
+ on sphere) is:
+for a source at 
+ outside the sphere (with 
+). The induced surface charge density is found by the
+image method as well: 
+ for a point charge on the polar axis
+, and the total induced charge is 
+ (the conductor shields the external field)
+. Kelvin (1845)
+discovered this solution
+, which was a cornerstone in the development of the method of images. The 
+reciprocal problem (charge inside a grounded sphere) also yields a single image: if  is at radius 
+inside, then an image 
+ at radius 
+ outside produces zero potential on the sphere
+.
+These classic results are given in Maxwell’s treatise and many textbooks (e.g. Smythe, Static & Dynamic
+Electricity, 1968, provides derivations). Neumann (1883) already discussed the sphere image problem and
+its relation to inversion symmetry
+. The method can be generalized to other conductor shapes that are 
+spherical inversions of a plane or sphere: e.g. a conducting spherical shell with inner/outer radii yields
+image charges for interior/exterior problems via Kelvin inversion (a charge outside a grounded spherical
+shell induces one image outside and one inside the shell). Another example: a conducting circular cylinder
+can be solved by images in 2D (line charges); Kelvin inversion maps it to a line and sphere configuration.
+These are all special cases where a finite set of image multipoles yields an exact solution. 
+Dielectric Sphere in Homogeneous Medium: For a point charge near a dielectric (non-conducting) sphere,
+no finite set of simple images exists – instead the solution can be expanded in an infinite series of
+multipoles (or interpreted as an image  distribution inside the sphere). Consider a sphere of radius  ,
+permittivity 
+, in an infinite medium 
+. Place a charge  at distance  from the center (outside the sphere).
+The potential outside (
+) can be expanded in spherical harmonics about the sphere:  
+ 
+(with
+ 
+).  Inside  the  sphere  (
+),
+ 
+. Applying the boundary conditions at 
+ (continuity of 
+ and 
+) leads to the
+coefficients (for 
+):
+For example, the dipole term
+ gives 
+, corresponding to an induced dipole
+moment 
+ (which matches the known polarizability of a dielectric sphere)
+q
+d
+a < d
+q
+=
+K
+− q a/d
+d
+=
+K
+a /d
+2
+26
+27
+V
+ϕ = 0
+G
+(r, r ) =
+sphere
+′
+(
+−
+4πϵ0
+1
+∣r − r ∣′
+1
+),
+∣r − (d /d )
+∣
+K
+2
+′ d^
+a/d
+r′
+∣r ∣ >
+′
+a
+σ(θ) = −ϵ ∂ ϕ∣
+=
+0
+n
+r=a
+− 4πa (a +d −2ad cos θ)
+2
+2
+3/2
+q (a −d )
+2
+2
+28
+29
+−q
+30
+31
+q
+p < a
+q
+=
+K
+′
+−q a/p
+a /p
+2
+32
+33
+34
+a
+ϵ2
+ϵ1
+q
+d
+r > d
+V
+(r, θ) =
+ext
++
+4πϵ1
+q
+r>
+1
+B
+P (cos θ)
+∑l=0
+∞
+l r l+1
+al
+l
+r
+=
+>
+max(r, d)
+r < a
+V
+(r, θ) =
+int
+A r P (cos θ)
+∑l=0
+∞
+l
+l
+l
+r = a
+V
+ϵ∂ V
+r
+l ≥ 0
+B
+=
+l
+( )
+,
+A
+=
+4πϵ1
+q
+ϵ l + ϵ (l + 1)
+2
+1
+ϵ − ϵ
+2
+1
+d
+a
+l+1
+l
+−
+a
+d .
+4πϵ1
+q
+ϵ l + ϵ (l + 1)
+2
+1
+ϵ − ϵ
+2
+1
+ϵ2
+l + 1
+− 2l−1
+l
+l = 1
+B =
+1
+(a /d )
+4πϵ1
+q
+2ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+2
+2
+p = 4πϵ B a =
+1
+1
+3
+q
+a /d
+2ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+3
+35
+3
+
+
+=== Page 4 ===
+. The infinite series can be summed in closed form only in limiting cases (e.g. 
+ reduces to the
+Kelvin image solution where only 
+ term survives
+). In general, the image representation is an
+infinite sequence: one can show that the same solution is obtained by replacing the sphere with an infinite
+set of point charges located on the line through the sphere center and the original charge (a convergent
+sequence approaching the center). In fact, the classic analysis by Kirkwood (1934) interprets the series as
+an infinite image charge expansion for reaction field calculations. Norris (1995)】 explicitly constructed
+the image system: a point charge 
+ at the Kelvin image point 
+plus a continuous line
+distribution of charge along the radius from the center to that image point
+. This line-charge
+density can be chosen so that each term of its multipole expansion reproduces the series coefficients
+above. (For 
+, a continuous distribution is needed – a single point image is insufficient
+.)
+The image line charge formulation is discussed by Norris and by Lindell (Radio Sci., 27:1–8, 1992)
+, who termed it an “electrostatic image theory” for the dielectric sphere. In summary, unlike the
+conducting sphere, no finite combination of discrete images can satisfy both 
+ and 
+ continuity for a
+dielectric sphere
+. The infinite-series solution (or equivalent image distribution) is the accepted
+Green’s function. The series converges for field points outside the sphere if 
+, and for field points
+inside if 
+. It converges faster when the contrast 
+ is small (since higher-order multipoles
+have coefficients 
+) and when the charge is not too close to the sphere. If the charge
+approaches the sphere (
+), the series develops a slow convergence (the terms 
+approach 1) and many multipoles are needed – this corresponds to the known strong field
+enhancement in narrow gaps. In fact, as 
+, the needed truncation order 
+ to achieve a given
+accuracy grows roughly like 
+, where  is a factor related to 
+. Practically, for 
+ (10% gap), perhaps tens of terms suffice; for 
+ (1% gap), hundreds of terms may
+be required to capture the near-contact singular field. Techniques like the use of spherical harmonics
+of the second kind (logarithmic potentials) aka “logopoles”** have been developed by Majic & Le Ru
+(2019) to accelerate convergence in this regime
+. These functions effectively capture the line-charge
+singularity inside the sphere, yielding a more rapidly convergent expansion than standard Legendre series. 
+If the point charge is  inside a dielectric sphere (radius  , permittivity  
+) embedded in medium  
+, one
+similarly expands in harmonics. The roles of interior/exterior solutions swap: inside we have a Coulomb plus
+reflected series, outside purely multipole series. The coefficients become 
+ for 
+, etc. When 
+ (sphere in a conducting medium), only the 
+ term survives inside (uniform field),
+consistent with the image-charge result that a dielectric sphere in a conducting host induces a single image
+outside at 
+ (for a charge at radius 
+)
+. A curious fact noted by van Siclen (AJP 56, 1142
+(1988)) is that if one places the Kelvin image charge inside a dielectric sphere (instead of the proper infinite
+series), the external field it produces together with the real external charge is independent of 
+. In
+other words, the combination “external charge + Kelvin image” yields the correct outside potential for any
+sphere permittivity (equal to the conducting-sphere solution). Of course, the interior field will be wrong
+except in the conductor limit – but this trick implies that the effect of finite  
+ is felt only in the  higher
+multipole terms (which vanish if 
+). This was generalized by Redžić et al (2012) to spheroidal cases
+. Practically, it suggests using the Kelvin image as a starting approximation for large but finite 
+, adding
+corrections  for  the  residual  multipoles.  Indeed,  Kirkwood  (1957) and  Friedman  (1975) introduced
+approximate  image-charge  methods  to  replace  the  full  series  in  molecular  solvation  models
+.
+Kirkwood’s  approximation  is  essentially  truncating  at  the  dipole  term  (using  one  image);  Friedman
+proposed a single image located at the Kelvin image point but with magnitude chosen to match the exact
+dipole moment (improving accuracy for moderate contrasts)
+. These give errors on the order of a few
+percent for low or moderate permittivity ratios and are widely used in “reaction field” models of solvent
+36
+ϵ →
+2
+∞
+l = 0
+37
+38
+q′
+r = d
+=
+K
+a /d
+2
+39
+40
+ϵ /ϵ
+=
+2
+1  ∞
+41
+42
+42
+V
+D
+41
+43
+r > d
+r < a
+∣ϵ −
+2
+ϵ ∣
+1
+∝ (ϵ −
+2
+ϵ )
+1
+d → a+
+∼ (a/d)l+1
+d → a
+lmax
+l
+∼
+max
+ln(γ)
+ln(1/(1−a/d))
+γ
+ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+d/a = 1.1
+d/a = 1.01
+44
+45
+a
+ϵ2
+ϵ1
+A =
+l
+4πϵ2
+q
+ϵ (l+1)+ϵ l
+1
+2
+ϵ −ϵ
+1
+2
+( a
+r′ )
+l
+l ≥
+0
+ϵ →
+1
+∞
+l = 0
+r = a /p
+2
+p < a
+46
+47
+ϵ2
+48
+49
+ϵ2
+ϵ →
+2
+∞
+50
+ϵ2
+51
+52
+51
+52
+4
+
+
+=== Page 5 ===
+dielectrics
+. Modern extensions use multiple discrete images (e.g. 3 or 4 image charges per sphere) to
+fit higher multipole moments, yielding accuracies of 10^(-4) with far fewer terms than the full series
+.
+Such methods, combined with FMM (fast multipole method), allow efficient  
+ simulations of many-
+charge systems with dielectric spheres
+. 
+Coated (Layered) Spheres: A  dielectric-coated conducting sphere is another geometry amenable to
+analytic solution. Suppose a conducting core radius  is covered by a concentric dielectric shell (outer radius
+, permittivity 
+), embedded in medium 
+. A point charge in the outside region can be solved by matching
+boundary conditions at 
+ (dielectric interface) and 
+ (conductor). One finds an infinite series again:
+outside
+ 
+,
+ 
+;  in  the  shell
+ 
+,
+ 
+; inside the conductor  
+,  
+. The coefficients are determined by applying (i)
+ at 
+ (implying 
+), and (ii) continuity of 
+ and 
+ at 
+. The algebra
+leads to formulas for 
+ in terms of 
+. These are lengthy, but in special cases they simplify. Pyati
+(Radio Sci. 28:1105, 1993) applied Kelvin inversion to this problem
+: using the fact that inversion in a
+sphere of radius  
+ maps the coated sphere to a simpler geometry, he obtained an analytic image
+solution. Essentially, the presence of the coating means the image of a charge is no longer a single charge:
+one gets a doublet of images – an image charge and an image dipole (or higher multipole) located at the
+Kelvin image point – to satisfy the two conditions at the interface. For example, for a very  thin coating
+(
+, 
+), one can treat the coating as a perturbation: the image charge is approximately Kelvin’s
+, plus a small dipole at the same location to account for the finite 
+. The dipole moment can be
+solved from a first-order perturbation of the boundary condition: it comes out proportional to 
+,
+which for large 
+ is small. Conversely, if the shell permittivity is low, the dipole moment might reinforce the
+primary image (if 
+, the dipole term adds a repulsive component). In general, series solutions for
+coated spheres are given in treatises like Stratton’s Electromagnetic Theory (1941, §3.25) and in many
+antenna-scattering analyses (the static limit of Mie theory). The coefficients often involve the spherical
+harmonic recursion for three-layer systems. The effect of the coating is to modify the effective polarization
+of the sphere: e.g. the polarizability of a coated metal sphere is  
+,
+which reduces to the earlier 
+ for 
+, and to the perfect conductor value (polarizability 
+) as
+. This indicates that a high-  coating can nearly mimic a metal even if the core is just metal (which is
+already conductor, trivial here) – more interesting is a dielectric core with a different coating, which can
+produce resonant polarization effects if  
+ is lower than  
+. Generally, however, no  finite set of simple
+images exists for coated spheres either; one again deals with infinite series or images of increasing
+multipole order. Pyati’s work shows that Kelvin’s inversion can simplify the algebra but still yields an infinite
+series of image multipoles (just in a perhaps more organized way). 
+Multiple Spheres and Sphere–Plane Configurations: The method of images can be iterated to handle two
+conducting spheres or a sphere near a conducting plane, but the result is an infinite recursive series of
+images. For example, a conducting sphere above a conducting infinite plane: the plane induces an image
+charge (Kelvin’s method for a plane says put 
+ below the plane); but that image below the plane is like a
+point charge near the sphere (below it), which induces another image in the sphere, which then induces
+another in the plane, and so on ad infinitum. Physically, the two objects “mirror” charges back and forth. In
+fact, using the sphere’s Kelvin formula and the plane’s mirror formula alternately yields an infinite sequence
+of image charges of geometrically decreasing magnitude. In the sphere-plane case, these image charges lie
+on the perpendicular axis through the sphere center, at progressively smaller distances, and the series
+converges fast if the gap 
+ is not too small. In the limit 
+ (sphere almost touching the plane),
+the  method-of-images  series  converges  slowly;  instead  one  can  use  the  method  of  bispherical
+52
+53
+54
+55
+O(N)
+56
+a
+b
+ϵ2
+ϵ1
+r = b
+r = a
+r > b
+V =
++
+4πϵ r
+1 >
+q
+B (a/r)
+P (cos θ)
+∑l
+l
+l+1
+l
+a < r < b
+V =
+(C r +
+∑
+l l
+D r
+)P (cos θ)
+l − l−1
+l
+r < a V = 0
+V = 0
+r = a
+C a +
+l
+l
+D a
+=
+l
+−l−1
+0
+V
+ϵ∂ V
+r
+r = b
+Bl
+ϵ , ϵ , a, b, d
+1
+2
+57
+58
+ab
+b = a + δ δ ≪ a
+−qa/d
+ϵ2
+(ϵ −
+2
+∞)
+ϵ2
+ϵ <
+2
+ϵ1
+α = 4πϵ a
+1
+3
+ϵ (2ϵ +ϵ )+2(ϵ −ϵ )( ) ϵ
+2
+1
+2
+1
+2
+b
+a 3 1
+ϵ (2ϵ +ϵ )−(ϵ −ϵ )( ) (2ϵ +ϵ )
+2
+1
+2
+1
+2
+b
+a 3
+1
+2
+2ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+b = a
+= 4πϵ a
+1
+3
+ϵ →
+2
+∞
+ϵ
+ϵ2
+ϵ1
+−q
+g = d − a
+g ≪ a
+5
+
+
+=== Page 6 ===
+coordinates. Bispherical coordinates exploit the fact that equipotentials of two-sphere systems are level
+surfaces of a certain coordinate ; the Green’s function for two conducting spheres (or a sphere and a plane
+as the plane is a sphere of infinite radius) can be expanded in Legendre functions 
+ of non-integer degree
+(the so-called toroidal harmonics). This yields an exact infinite series for the potential, from which one can
+extract asymptotic behavior. For small  , the capacitance  
+ of a sphere-plane system behaves as  
+ (like a quasi-parallel plate with a logarithmic correction) – this comes from the
+dominant large-  behavior of the series. The field in the narrow gap is extremely high (formally  
+ on  small  patch  area  
+),  so  discretization  of  charge  images  can  become  ill-conditioned.
+Numerical solvers (BEM, etc.) use mesh refinement in the gap and on the sphere’s near-face to capture this
+boundary-layer field. Often a proximity parameter
+ is used: for 
+, one can derive a singular
+asymptotic expansion for the field: e.g. the maximum surface field on the sphere scales like  
+times the field of an isolated sphere. Error estimates for truncating the image series: if we truncate after 
+image pairs (sphere-plane iterations), the error in potential near the gap is on the order of the next image
+charge magnitude 
+. For large separation 
+, only the first image (plane’s 
+) is
+significant and the error decays as 
+ – very fast. 
+For  two finite spheres (both conducting), the image method likewise gives an infinite double series of
+point charges inside each sphere. This was studied by King (1934) and others; the exact series solution for
+two-sphere capacitance and force was derived by Lord Rayleigh (1897) using bispherical harmonics. There
+is no simple closed-form formula; one must sum the series or use approximation formulas valid in certain
+limits (e.g. small  or large ). For mixed dielectric spheres influencing each other, one can again set up
+dual infinite series of multipoles. For instance, two dielectric spheres in vacuum will polarize each other: one
+can expand each sphere’s response in multipoles, with coefficients that depend on the external field applied
+by the other sphere’s multipoles – this leads to a  matrix equation coupling the two sets of coefficients.
+Solving that yields a double series (the method is analogous to multiple scattering theory). Only in limiting
+cases (like one sphere much larger than the other, or extreme permittivity ratios) can one find simplified
+image approximations.  Fikioris (1977) and others have looked at two-sphere polarization; generally one
+must truncate for numerical evaluation. 
+Sphere near a Dielectric Interface: This hybrid problem (e.g. a dielectric or conducting sphere close to a
+dielectric  half-space)  is  very  challenging  analytically.  No  closed-form  Green’s  function  is  known.  One
+approach is the method of images with multipoles: the presence of the interface can be accounted by an
+infinite set of image multipoles (located as a mirror distribution of the sphere’s charges) plus possibly
+continuous distributions. For example, a conducting sphere above a dielectric plane might be approximated
+by combining the sphere-plane image series (assuming the plane is conducting) with corrections for the
+fact that the plane is actually dielectric. Another approach: use  bispherical coordinates if the sphere
+intersects the plane (for a sphere partially embedded in a dielectric, effectively two-sphere coordinates with
+one sphere of infinite radius). Some special cases have analytic results:  e.g. a conducting sphere half-
+embedded in a dielectric half-space – by symmetry, this can be treated by image charges distributed along a
+line (like the method of  odd extension across the interface, yielding an integral equation). In general,
+however,  these  mixed  problems  are  solved  with  numerical  methods  (BEM  or  multipole  expansions
+truncated at high order). 
+Failure of Finite Image Solutions: In summary, apart from the canonical geometries (plane, sphere,
+infinite cylinder,  maybe ellipsoid in certain orientations),  finite discrete image systems do not exist for
+most conductor–dielectric setups
+. The method of images “fails” in the sense that one needs either
+an infinite number of images or an image distribution (line, surface, etc.). A famous example is the dielectric
+η
+Pν
+g
+C
+C ∼
+2πϵ a/ ln(4a/g) +
+0
+O(1)
+l
+E ∼
+2πϵ A
+0
+gap
+q
+Agap
+λ = g/a
+λ ≪ 1
+E
+∼
+max
+λ
+1
+N
+∼ (a − d)
+/d
+N+1
+N+1
+d ≫ a
+−q
+(a/d)2(N+1)
+g
+g
+59
+60
+6
+
+
+=== Page 7 ===
+sphere: no finite collection of Coulomb charges can satisfy the boundary conditions
+. Another example:
+an ellipsoidal conductor requires an infinite series of images lying along a line (the so-called Pellat’s solution
+involves an integral of line charges). Similarly, a  point charge in front of a dielectric slab cannot be
+represented by a few images – one gets a continuous charge “image” smeared along the perpendicular
+through the slab. These impossibility results stem from the uniqueness theorem: the Green’s function in
+such cases has branch-cut singularities (the continuous spectra corresponding to continuum of image
+charges). A rigorous statement is that the method of images in the form of finite discrete sources works iff
+the boundary is an equipotential of a conformal inversion of a sphere or plane (so basically plane, sphere, or
+special cases like coaxal cylinders in 2D). For arbitrary shapes or layered media, one resorts to infinite series
+or integrals. 
+Parameter  Scaling  &  Numerical  Considerations: It  is  crucial  to  nondimensionalize  lengths  by  a
+characteristic scale (sphere radius, etc.) and to form contrast parameters that govern the solution. Common
+dimensionless groups include the permivitty contrast
+ (which appeared in many formulas above
+as image-charge factors), the normalized separation
+ (distance of a charge or second object in
+units of sphere radius), and the gap ratio
+. In series expansions, small  can be used as an expansion
+parameter (for instance, for a weakly polarizable sphere, 
+). In contrast, 
+(huge contrast in either direction) is a singular limit – e.g. 
+ corresponds to a perfect conductor image.
+One often expands about those extremes: for a high-  sphere, one can write 
+ where
+ is 0 for 
+ and 
+ is proportional to 
+. This yields a small parameter 
+. Likewise, for a low-
+ inclusion, one can treat it as a small perturbation (since 
+, one might set 
+ with 
+ and
+expand). As for geometry, small gap
+ expansions often use 
+ as a parameter: e.g. capacitance of
+sphere-plane has an asymptotic expansion in powers of  
+ and  
+. For  far-field expansions, one
+uses 
+: e.g. the potential of a sphere of charge 
+ at large distance looks like 
+ dipole
+term + etc., with each successive multipole 
+. Truncating at dipole yields an error 
+.
+Many numerical schemes (method of moments, multipole accelerators) leverage such truncation for distant
+interactions. 
+When  implementing  image-based  solutions  or  series  numerically,  one  must  ensure  convergence and
+stability. For example, the Legendre series for a dielectric sphere can suffer catastrophic cancellation for
+large  if summed naively; using recurrence relations or log-scaling for the coefficients is recommended. In
+boundary element collocation, placing collocation points near sharp edges or small gaps is essential: e.g.
+for a sphere near a plane, a finer mesh (or denser sampling for the method of moments) is needed in the
+region of closest approach, because induced surface charge density behaves like 
+ near the
+contact point (a square-root singularity). Mesh grading proportional to 
+ is often used
+to capture this. In iterative image constructions, one monitors the magnitude of the last-added image
+charge: stopping when it falls below some tolerance ensures the error in potential is bounded by that
+magnitude. For instance, in the two-sphere problem, if the 
+th image has charge 
+, the error in potential
+is 
+; since 
+ (for large ) or 
+ (for small gap), one can estimate how
+many images are required. 
+Known Results Summary: To conclude this technical compendium, we list some notable special-case
+solutions and references: (1) A charge above a dielectric half-space – exact potential via one image charge
+(with magnitude 
+)
+, first derived by Sommerfeld and found in many textbooks
+(e.g. Jackson, Eq. 4.19). (2) Charge outside a grounded conducting sphere – Kelvin’s image solution (1845)
+. (3) Charge outside a dielectric sphere – infinite series solution (e.g. Stratton 1941, p. 147; Kirkwood
+41
+β = ϵ +ϵ
+2
+1
+ϵ −ϵ
+2
+1
+s = d/a
+g/a
+β
+B ≈
+l
+β q/(4πϵ ) (a/d)
+1
+l+1
+β → ±1
+β → 1
+ϵ
+B =
+l
+B
++
+l
+(∞)
+ΔBl
+Bl
+(∞)
+l > 0
+ΔBl
+1/ϵ2
+1/ϵ2
+ϵ
+β ≈ −1
+ϵ =
+2
+ϵ δ
+1
+δ ≪ 1
+g ≪ a
+g/a
+ln(a/g)
+g/a
+a/d ≪ 1
+Q
+Q/(4πϵ r)+
+1
+∼ (a/d)l
+∼ O((a/d) )
+3
+l
+σ ∼ (g/ρ)1/2
+distance to contact
+N
+qN
+O(q /q)
+N
+q /q ∼
+N
+(a/d)N
+d
+∼ (1 − g/a)N
+q =
+′
+(ϵ −
+1
+ϵ )/(ϵ +
+2
+1
+ϵ )q
+2
+1
+26
+7
+
+
+=== Page 8 ===
+1934, J. Chem. Phys.), no finite image; image interpreted as point + line charge
+.  (4) Charge inside a
+dielectric sphere – similar series (see  Neumann 1883 for early treatment
+).  (5) Coated sphere with
+concentric layers – series solution (see Mie theory static limit; Pyati 1993 for inversion approach
+). (6)
+Two conducting spheres – bispherical harmonic expansion (see Jeffery 1912, Snow 1952 for capacitance
+series). (7) Dielectric sphere-plane – no closed form; see Image multipole method by Zhukauskas 1988
+(approximate) or numerical BEM. (8) General layered Green’s function – spectral integrals (Sommerfeld) as
+in Chew’s “Waves and Fields in Inhomogeneous Media” (1990). (9) Novel solution techniques – e.g. Majic
+& Le Ru (2019) “logopoles” for fast sphere series
+; Yaghjian (1980) for complex images in stratified
+media. These sources provide a wealth of formulas, convergence analysis, and guidance for tackling new
+configurations that might admit near-analytic solutions via clever combinations of known Green’s functions
+and transforms. 
+Method of image charges - Wikipedia
+https://en.wikipedia.org/wiki/Method_of_image_charges
+Dielectric Image Methods: Electrostatics & Potential
+https://studylib.net/doc/18223349/dielectric-image-methods---physics
+dia-edge.dvi
+https://web2.ph.utexas.edu/~vadim/Classes/2017f/dia-edge.pdf
+Point charge in a three‐dielectric medium with planar interfaces
+https://pubs.aip.org/aapt/ajp/article/46/11/1172/1043468/Point-charge-in-a-three-dielectric-medium-with
+[PDF] Point charge in a three-dielectric medium with planar interfaces
+https://www.famaf.unc.edu.ar/~serra/AJP15.pdf
+Calculation of Sommerfeld Integrals in Dipole Radiation Problems
+https://www.mdpi.com/2227-7390/12/2/298
+Full article: Efficient computation of Sommerfeld integral tails
+https://www.tandfonline.com/doi/full/10.1080/09205071.2015.1129915
+(PDF) Sommerfeld's Integrals and Hallén's Integral Equation in Data ...
+https://www.researchgate.net/publication/
+261477302_Sommerfeld's_Integrals_and_Hallen's_Integral_Equation_in_Data_Analysis_for_Horizontal_Dipole_Antenna_above_Real_Ground
+engineering.purdue.edu
+https://engineering.purdue.edu/wcchew/ece604f19/Lecture%20Notes/Lect32.pdf
+Image charge inclusion in the dielectric sphere revisited
+https://doras.dcu.ie/17553/1/EJP.pdf
+Image charge approximations of reaction fields in solvents with arbitrary ionic
+strength - PMC 
+https://pmc.ncbi.nlm.nih.gov/articles/PMC2719861/
+Dielectric Function for a Material Containing Hyperspherical ... - jstor
+https://www.jstor.org/stable/53305
+Princeton PHYS 215 Dielectric Image Method Analysis and Solutions
+https://www.studocu.vn/vn/document/dai-hoc-su-pham-ha-noi/physics/princeton-dielectric-image-method-anh-dien/86961259
+39
+34
+57
+44
+45
+1
+28
+29
+30
+32
+33
+59
+60
+2
+3
+6
+21
+41
+43
+4
+5
+7
+8
+9
+10
+11
+12
+13
+14
+15
+24
+25
+16
+17
+19
+18
+20
+22
+23
+26
+27
+31
+35
+36
+37
+38
+46
+47
+48
+49
+50
+34
+42
+51
+52
+53
+54
+55
+56
+39
+40
+8
+
+
+=== Page 9 ===
+Schematic of the problem considered in this work. A point charge q is... | Download Scientific
+Diagram
+https://www.researchgate.net/figure/Schematic-of-the-problem-considered-in-this-work-A-point-charge-q-is-located-at-point-
+E_fig1_321324912
+The Multiple Utility of Kelvin’s Inversion
+https://www.mdpi.com/3042-402X/2/3/11
+44
+45
+57
+58
+9

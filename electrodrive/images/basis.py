@@ -62,6 +62,8 @@ class ImageBasisElement:
             return PointChargeBasis(params)
         if t == "axis_point":
             return PointChargeBasis(params, type_name="axis_point")
+        if t == "three_layer_images":
+            return PointChargeBasis(params, type_name="three_layer_images")
         if t == "ring":
             return RingImageBasis(params, type_name="ring")
         if t == "ring_gauss":
@@ -1015,6 +1017,7 @@ def generate_candidate_basis(
     wants_inner_ribbon = "inner_rim_ribbon" in basis_types
     wants_inner_patch_ring = "inner_patch_ring" in basis_types
     wants_rich_inner = "rich_inner_rim" in basis_types
+    wants_three_layer = "three_layer_images" in basis_types
 
     # Sphere Kelvin ladder: image charges inside each spherical conductor.
     if wants_sphere_kelvin and spheres and point_charges:
@@ -1166,6 +1169,101 @@ def generate_candidate_basis(
                     motif_index=0,
                 )
                 candidates.append(elem)
+        elif getattr(spec, "dielectrics", None):
+            # Layered planar: generate mirrored axial candidates across interfaces.
+            layers = getattr(spec, "dielectrics", None) or []
+            charges = [
+                torch.tensor(ch["pos"], device=device, dtype=dtype)
+                for ch in getattr(spec, "charges", None) or []
+                if ch.get("type") == "point"
+            ]
+            if charges:
+                z_bounds: List[float] = []
+                for layer in layers:
+                    for key in ("z_min", "z_max"):
+                        val = layer.get(key, None)
+                        if val is None:
+                            continue
+                        try:
+                            z_bounds.append(float(val))
+                        except Exception:
+                            continue
+                z_bounds = sorted(set(z_bounds))
+                z_min = min(z_bounds) if z_bounds else -1.0
+                z_max = max(z_bounds) if z_bounds else 1.0
+                thickness = abs(z_max - z_min) if z_bounds else 1.0
+                remaining = max(1, n_candidates - len(candidates))
+                pos_set = []
+                for pos in charges:
+                    z0 = float(pos[2].item())
+                    # base mirrored across each interface
+                    for zb in z_bounds:
+                        pos_set.append(pos.clone())
+                        z_m = 2.0 * zb - z0
+                        pos_set.append(torch.tensor([pos[0], pos[1], z_m], device=device, dtype=dtype))
+                        # multiple reflections up/down slab
+                        for n in range(1, 3):
+                            delta = 2.0 * thickness * n
+                            pos_set.append(torch.tensor([pos[0], pos[1], z_m - delta], device=device, dtype=dtype))
+                            pos_set.append(torch.tensor([pos[0], pos[1], z_m + delta], device=device, dtype=dtype))
+                for p in pos_set:
+                    if len(candidates) >= n_candidates:
+                        break
+                    elem = PointChargeBasis({"position": p}, type_name="axis_point")
+                    annotate_group_info(
+                        elem,
+                        conductor_id=0,
+                        family_name="axis_point",
+                        motif_index=0,
+                    )
+                    candidates.append(elem)
+
+    if wants_three_layer:
+        layers = getattr(spec, "dielectrics", None) or []
+        charges = [
+            torch.tensor(ch["pos"], device=device, dtype=dtype)
+            for ch in getattr(spec, "charges", None) or []
+            if ch.get("type") == "point"
+        ]
+        z0 = float(charges[0][2].item()) if charges else 0.75
+        z_bounds: List[float] = []
+        for layer in layers:
+            for key in ("z_min", "z_max"):
+                val = layer.get(key, None)
+                if val is None:
+                    continue
+                try:
+                    z_bounds.append(float(val))
+                except Exception:
+                    continue
+        z_bounds = sorted(set(z_bounds))
+        if len(z_bounds) >= 2:
+            z_top = max(z_bounds)
+            z_low = min(z_bounds)
+            h = abs(z_top - z_low)
+        else:
+            z_top = 0.0
+            h = 0.5
+        depths: List[float] = []
+        depths.append(-0.25 * h)
+        depths.append(-h - 0.5 * h)
+        depths.append(-h - 1.5 * h)
+        depths.append(-h - 2.5 * h)
+        depths.append(0.1 * h)
+        for idx, z_img in enumerate(depths):
+            if abs(z_img - z0) < 1e-3:
+                continue
+            pos = torch.tensor([0.0, 0.0, z_img], device=device, dtype=dtype)
+            elem = PointChargeBasis({"position": pos}, type_name="three_layer_images")
+            annotate_group_info(
+                elem,
+                conductor_id=0,
+                family_name="three_layer_images",
+                motif_index=idx,
+            )
+            candidates.append(elem)
+            if len(candidates) >= n_candidates:
+                break
 
     # Mirror-stack candidates for parallel planes (experimental).
     planes = [c for c in conductors if c.get("type") == "plane"]

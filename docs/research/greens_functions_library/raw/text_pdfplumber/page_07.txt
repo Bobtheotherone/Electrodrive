@@ -1,0 +1,45 @@
+sphere: no finite collection of Coulomb charges can satisfy the boundary conditions 41 . Another example:
+an ellipsoidal conductor requires an infinite series of images lying along a line (the so-called Pellat’s solution
+involves an integral of line charges). Similarly, a point charge in front of a dielectric slab cannot be
+represented by a few images – one gets a continuous charge “image” smeared along the perpendicular
+through the slab. These impossibility results stem from the uniqueness theorem: the Green’s function in
+such cases has branch-cut singularities (the continuous spectra corresponding to continuum of image
+charges). A rigorous statement is that the method of images in the form of finite discrete sources works iff
+the boundary is an equipotential of a conformal inversion of a sphere or plane (so basically plane, sphere, or
+special cases like coaxal cylinders in 2D). For arbitrary shapes or layered media, one resorts to infinite series
+or integrals. 
+Parameter Scaling & Numerical Considerations:  It is crucial to nondimensionalize lengths by a
+characteristic scale (sphere radius, etc.) and to form contrast parameters that govern the solution. Common
+dimensionless groups include the permivitty contrastβ = ϵ2−ϵ1 (which appeared in many formulas above
+ϵ2+ϵ1
+as image-charge factors), the normalized separation s = d/a (distance of a charge or second object in
+units of sphere radius), and the gap ratiog/a. In series expansions, small β can be used as an expansion
+parameter (for instance, for a weakly polarizable sphere, Bl ≈ βq/(4πϵ1)(a/d)l+1). In contrast, β → ±1
+(huge contrast in either direction) is a singular limit – e.g. β → 1 corresponds to a perfect conductor image.
+One often expands about those extremes: for a high-ϵ sphere, one can write Bl = Bl(∞)+ΔBl where
+Bl(∞) is 0 for l > 0 and ΔBl is proportional to 1/ϵ2. This yields a small parameter 1/ϵ2. Likewise, for a low-
+ϵ inclusion, one can treat it as a small perturbation (since β ≈ −1, one might set ϵ2 = ϵ1δ with δ ≪ 1 and
+expand). As for geometry, small gapg ≪ a expansions often use g/a as a parameter: e.g. capacitance of
+sphere-plane has an asymptotic expansion in powers of ln(a/g) and g/a. For far-field expansions, one
+uses a/d ≪ 1: e.g. the potential of a sphere of charge Q at large distance looks like Q/(4πϵ1r)+ dipole
+term + etc., with each successive multipole ∼ (a/d)l. Truncating at dipole yields an error ∼ O((a/d)3).
+Many numerical schemes (method of moments, multipole accelerators) leverage such truncation for distant
+interactions. 
+When implementing image-based solutions or series numerically, one must ensure  convergence  and
+stability. For example, the Legendre series for a dielectric sphere can suffer catastrophic cancellation for
+large l if summed naively; using recurrence relations or log-scaling for the coefficients is recommended. In
+boundary element collocation, placing collocation points near sharp edges or small gaps is essential: e.g.
+for a sphere near a plane, a finer mesh (or denser sampling for the method of moments) is needed in the
+region of closest approach, because induced surface charge density behaves like σ ∼ (g/ρ)1/2 near the
+contact point (a square-root singularity). Mesh grading proportional to  distance to contact is often used
+to capture this. In iterative image constructions, one monitors the magnitude of the last-added image
+charge: stopping when it falls below some tolerance ensures the error in potential is bounded by that
+magnitude. For instance, in the two-sphere problem, if the Nth image has charge qN, the error in potential
+is O(qN/q); since qN/q ∼ (a/d)N (for large d) or ∼ (1−g/a)N (for small gap), one can estimate how
+many images are required. 
+Known Results Summary: To conclude this technical compendium, we list some notable special-case
+solutions and references: (1) A charge above a dielectric half-space – exact potential via one image charge
+(with magnitude q′ = (ϵ1−ϵ2)/(ϵ1+ϵ2)q) 1 , first derived by Sommerfeld and found in many textbooks
+(e.g. Jackson, Eq. 4.19). (2) Charge outside a grounded conducting sphere – Kelvin’s image solution (1845)
+26 . (3) Charge outside a dielectric sphere – infinite series solution (e.g. Stratton 1941, p. 147; Kirkwood
+7

@@ -1,0 +1,40 @@
+1934, J. Chem. Phys.), no finite image; image interpreted as point + line charge 39 . (4) Charge inside a
+dielectric sphere – similar series (see Neumann 1883 for early treatment 34 ). (5) Coated sphere with
+concentric layers – series solution (see Mie theory static limit; Pyati 1993 for inversion approach 57 ). (6)
+Two conducting spheres – bispherical harmonic expansion (see Jeffery 1912, Snow 1952 for capacitance
+series). (7) Dielectric sphere-plane – no closed form; see Image multipole method by Zhukauskas 1988
+(approximate) or numerical BEM. (8) General layered Green’s function – spectral integrals (Sommerfeld) as
+in Chew’s “Waves and Fields in Inhomogeneous Media” (1990). (9) Novel solution techniques – e.g. Majic
+& Le Ru (2019) “logopoles” for fast sphere series 44 45 ; Yaghjian (1980) for complex images in stratified
+media. These sources provide a wealth of formulas, convergence analysis, and guidance for tackling new
+configurations that might admit near-analytic solutions via clever combinations of known Green’s functions
+and transforms. 
+1 28 29 30 32 33 59 60 Method of image charges - Wikipedia
+https://en.wikipedia.org/wiki/Method_of_image_charges
+2 3 6 21 41 43 Dielectric Image Methods: Electrostatics & Potential
+https://studylib.net/doc/18223349/dielectric-image-methods---physics
+4 5 7 8 9 10 11 12 dia-edge.dvi
+https://web2.ph.utexas.edu/~vadim/Classes/2017f/dia-edge.pdf
+13 Point charge in a three‐dielectric medium with planar interfaces
+https://pubs.aip.org/aapt/ajp/article/46/11/1172/1043468/Point-charge-in-a-three-dielectric-medium-with
+14 15 24 25 [PDF] Point charge in a three-dielectric medium with planar interfaces
+https://www.famaf.unc.edu.ar/~serra/AJP15.pdf
+16 Calculation of Sommerfeld Integrals in Dipole Radiation Problems
+https://www.mdpi.com/2227-7390/12/2/298
+17 19 Full article: Efficient computation of Sommerfeld integral tails
+https://www.tandfonline.com/doi/full/10.1080/09205071.2015.1129915
+18 20 (PDF) Sommerfeld's Integrals and Hallén's Integral Equation in Data ...
+https://www.researchgate.net/publication/
+261477302_Sommerfeld's_Integrals_and_Hallen's_Integral_Equation_in_Data_Analysis_for_Horizontal_Dipole_Antenna_above_Real_Ground
+22 23 engineering.purdue.edu
+https://engineering.purdue.edu/wcchew/ece604f19/Lecture%20Notes/Lect32.pdf
+26 27 31 35 36 37 38 46 47 48 49 50 Image charge inclusion in the dielectric sphere revisited
+https://doras.dcu.ie/17553/1/EJP.pdf
+34 42 51 52 53 54 55 56 Image charge approximations of reaction fields in solvents with arbitrary ionic
+strength - PMC 
+https://pmc.ncbi.nlm.nih.gov/articles/PMC2719861/
+39 Dielectric Function for a Material Containing Hyperspherical ... - jstor
+https://www.jstor.org/stable/53305
+40 Princeton PHYS 215 Dielectric Image Method Analysis and Solutions
+https://www.studocu.vn/vn/document/dai-hoc-su-pham-ha-noi/physics/princeton-dielectric-image-method-anh-dien/86961259
+8

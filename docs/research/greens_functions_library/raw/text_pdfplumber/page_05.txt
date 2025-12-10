@@ -1,0 +1,45 @@
+dielectrics 52 53 . Modern extensions use multiple discrete images (e.g. 3 or 4 image charges per sphere) to
+fit higher multipole moments, yielding accuracies of 10^(-4) with far fewer terms than the full series 54 55 .
+Such methods, combined with FMM (fast multipole method), allow efficient O(N) simulations of many-
+charge systems with dielectric spheres 56 . 
+Coated (Layered) Spheres: A dielectric-coated conducting sphere is another geometry amenable to
+analytic solution. Suppose a conducting core radius a is covered by a concentric dielectric shell (outer radius
+b, permittivity ϵ2), embedded in medium ϵ1. A point charge in the outside region can be solved by matching
+boundary conditions at r = b (dielectric interface) and r = a (conductor). One finds an infinite series again:
+outside  r > b,  V = 4πϵq1r> +∑lBl(a/r)l+1Pl(cosθ);   in   the   shell  a < r < b,  V = ∑(Clrl +
+Dlr−l−1)Pl(cosθ); inside the conductor r < a, V = 0. The coefficients are determined by applying (i)
+V = 0 at r = a (implying Clal +Dla−l−1 = 0), and (ii) continuity of V and ϵ∂rV at r = b. The algebra
+leads to formulas for Bl in terms of ϵ1,ϵ2,a,b,d. These are lengthy, but in special cases they simplify. Pyati
+(Radio Sci. 28:1105, 1993) applied Kelvin inversion to this problem 57 58 : using the fact that inversion in a
+sphere of radius  ab maps the coated sphere to a simpler geometry, he obtained an analytic image
+solution. Essentially, the presence of the coating means the image of a charge is no longer a single charge:
+one gets a doublet of images – an image charge and an image dipole (or higher multipole) located at the
+Kelvin image point – to satisfy the two conditions at the interface. For example, for a very thin coating
+(b = a+δ, δ ≪ a), one can treat the coating as a perturbation: the image charge is approximately Kelvin’s
+−qa/d, plus a small dipole at the same location to account for the finite ϵ2. The dipole moment can be
+solved from a first-order perturbation of the boundary condition: it comes out proportional to (ϵ2−∞),
+which for large ϵ2 is small. Conversely, if the shell permittivity is low, the dipole moment might reinforce the
+primary image (if ϵ2 < ϵ1, the dipole term adds a repulsive component). In general, series solutions for
+coated spheres are given in treatises like Stratton’s Electromagnetic Theory (1941, §3.25) and in many
+antenna-scattering analyses (the static limit of Mie theory). The coefficients often involve the spherical
+harmonic recursion for three-layer systems. The effect of the coating is to modify the effective polarization
+of the sphere: e.g. the polarizability of a coated metal sphere is α = 4πϵ1a3ϵ2(ϵ22ϵ(12+ϵ1ϵ2+)ϵ−2()ϵ+12−(ϵϵ21)−(ϵab2))3((ab2)ϵ31ϵ+1ϵ2),
+which reduces to the earlier 2ϵϵ22−+ϵϵ11 for b = a, and to the perfect conductor value (polarizability = 4πϵ1a3) as
+ϵ2 → ∞. This indicates that a high-ϵ coating can nearly mimic a metal even if the core is just metal (which is
+already conductor, trivial here) – more interesting is a dielectric core with a different coating, which can
+produce resonant polarization effects if ϵ2 is lower than ϵ1. Generally, however, no finite set of simple
+images exists for coated spheres either; one again deals with infinite series or images of increasing
+multipole order. Pyati’s work shows that Kelvin’s inversion can simplify the algebra but still yields an infinite
+series of image multipoles (just in a perhaps more organized way). 
+Multiple Spheres and Sphere–Plane Configurations: The method of images can be iterated to handle two
+conducting spheres or a sphere near a conducting plane, but the result is an infinite recursive series of
+images. For example, a conducting sphere above a conducting infinite plane: the plane induces an image
+charge (Kelvin’s method for a plane says put −q below the plane); but that image below the plane is like a
+point charge near the sphere (below it), which induces another image in the sphere, which then induces
+another in the plane, and so on ad infinitum. Physically, the two objects “mirror” charges back and forth. In
+fact, using the sphere’s Kelvin formula and the plane’s mirror formula alternately yields an infinite sequence
+of image charges of geometrically decreasing magnitude. In the sphere-plane case, these image charges lie
+on the perpendicular axis through the sphere center, at progressively smaller distances, and the series
+converges fast if the gap g = d−a is not too small. In the limit g ≪ a (sphere almost touching the plane),
+the method-of-images series converges slowly; instead one can use the method of  bispherical
+5

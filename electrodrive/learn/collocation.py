@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from electrodrive.utils.config import EPS_0, K_E
+from electrodrive.core.planar_stratified_reference import (
+    ThreeLayerConfig,
+    make_three_layer_solution,
+    potential_three_layer_region1,
+)
 
 from electrodrive.orchestration.parser import CanonicalSpec
 from electrodrive.core.images import (
@@ -88,6 +93,7 @@ def _solve_analytic(spec: CanonicalSpec) -> Optional[AnalyticSolution]:
         if spec.conductors
         else []
     )
+    dielectrics = getattr(spec, "dielectrics", None) or []
 
     # --- 1) Single grounded plane + single point charge ---
     if (
@@ -125,6 +131,69 @@ def _solve_analytic(spec: CanonicalSpec) -> Optional[AnalyticSolution]:
                 center,
                 float(radius),
             )
+
+    # --- 2c) Planar stratified three-layer (dielectric) with point charge in region 1 ---
+    if (
+        not ctypes
+        and dielectrics
+        and len(spec.charges) == 1
+        and spec.charges[0]["type"] == "point"
+    ):
+        layers = dielectrics
+        charge_z = float(spec.charges[0]["pos"][2])
+
+        def _eps_for_z(z_val: float) -> Optional[float]:
+            for layer in layers:
+                eps = layer.get("epsilon") or layer.get("eps") or layer.get("permittivity")
+                if eps is None:
+                    continue
+                z_min = layer.get("z_min", None)
+                z_max = layer.get("z_max", None)
+                try:
+                    if z_min is not None and z_val < float(z_min) - 1e-9:
+                        continue
+                    if z_max is not None and z_val > float(z_max) + 1e-9:
+                        continue
+                    return float(eps)
+                except Exception:
+                    continue
+            return None
+
+        boundary_counts: Dict[float, int] = {}
+        for layer in layers:
+            for key in ("z_min", "z_max"):
+                val = layer.get(key, None)
+                if val is None:
+                    continue
+                try:
+                    z_val = float(val)
+                except Exception:
+                    continue
+                boundary_counts[z_val] = boundary_counts.get(z_val, 0) + 1
+        shared_boundaries = [z for z, cnt in boundary_counts.items() if cnt >= 2]
+        boundaries_sorted = sorted(shared_boundaries, reverse=True)
+        if len(boundaries_sorted) < 2:
+            # Fallback: drop extremal bounds and use interior ones.
+            all_bounds = sorted(boundary_counts.keys(), reverse=True)
+            if len(all_bounds) >= 3:
+                boundaries_sorted = all_bounds[1:-1]
+        if len(boundaries_sorted) >= 2:
+            z_top = boundaries_sorted[0]
+            z_bottom = boundaries_sorted[1]
+            h = abs(z_top - z_bottom)
+            eps1 = _eps_for_z(max(charge_z, z_top + 1e-6))
+            eps2 = _eps_for_z(0.5 * (z_top + z_bottom))
+            eps3 = _eps_for_z(z_bottom - 1e-3) or _eps_for_z(z_bottom + 1e-3)
+            if eps1 and eps2 and eps3 and charge_z >= z_top:
+                cfg = ThreeLayerConfig(
+                    eps1=eps1,
+                    eps2=eps2,
+                    eps3=eps3,
+                    h=h,
+                    q=float(spec.charges[0]["q"]),
+                    r0=tuple(spec.charges[0]["pos"]),
+                )
+                return make_three_layer_solution(cfg)
 
     # --- 3) Cylinder / line-charge 2D image construction ---
     if (
@@ -723,6 +792,9 @@ def _infer_geom_type_from_spec(spec: CanonicalSpec) -> str:
         if spec.conductors
         else []
     )
+    dielectrics = getattr(spec, "dielectrics", None) or []
+    if dielectrics:
+        return "layered_planar"
     if ctypes == ["plane"]:
         if len(spec.conductors) == 1:
             return "plane"
@@ -750,6 +822,37 @@ def _infer_bbox_for_spec(spec: CanonicalSpec) -> float:
 
     conductors = getattr(spec, "conductors", None) or []
     charges = getattr(spec, "charges", None) or []
+    dielectrics = getattr(spec, "dielectrics", None) or []
+
+    if dielectrics:
+        # Use layer extents when available.
+        z_vals = []
+        for d in dielectrics:
+            z_min = d.get("z_min", None)
+            z_max = d.get("z_max", None)
+            try:
+                if z_min is not None:
+                    z_vals.append(float(z_min))
+            except Exception:
+                pass
+            try:
+                if z_max is not None:
+                    z_vals.append(float(z_max))
+            except Exception:
+                pass
+        if z_vals:
+            z_span = max(z_vals) - min(z_vals)
+            bbox = max(4.0, 4.0 * z_span)
+        # Ensure charges stay inside the bbox span.
+        for ch in charges:
+            if ch.get("type") != "point":
+                continue
+            try:
+                zq = float(ch["pos"][2])
+            except Exception:
+                continue
+            bbox = max(bbox, 4.0 * abs(zq) + 2.0)
+        return bbox
 
     if not conductors:
         return bbox
@@ -810,7 +913,7 @@ def _infer_bbox_center_for_spec(spec: CanonicalSpec) -> np.ndarray:
     except Exception:
         geom = "unknown"
 
-    if geom in ("plane", "parallel_planes"):
+    if geom in ("plane", "parallel_planes", "layered_planar"):
         return np.zeros(3, dtype=float)
 
     conductors = getattr(spec, "conductors", None) or []
@@ -887,6 +990,8 @@ def _sample_points_for_spec(
             sphere_shell_frac = _SPHERE_SHELL_FRAC
     bbox_center_np = np.array(bbox_center, dtype=float).reshape(3)
 
+    dielectrics = getattr(spec, "dielectrics", None) or []
+
     # Interior: uniform box sampling
     points_int = rng.uniform(-bbox / 2.0, bbox / 2.0, (N_interior, 3))
 
@@ -954,6 +1059,36 @@ def _sample_points_for_spec(
                 z_lo = -0.25 * bbox
                 z_hi = 0.25 * bbox
             points_int[:, 2] = rng.uniform(z_lo, z_hi, size=N_interior)
+    elif geom == "layered_planar":
+        # Keep x/y moderate; focus z sampling around layer extents and charge heights.
+        alpha = 0.25
+        points_int[:, 0] *= alpha
+        points_int[:, 1] *= alpha
+        z_vals: List[float] = []
+        for d in dielectrics:
+            for key in ("z_min", "z_max"):
+                val = d.get(key, None)
+                if val is None:
+                    continue
+                try:
+                    z_vals.append(float(val))
+                except Exception:
+                    continue
+        for ch in getattr(spec, "charges", None) or []:
+            if ch.get("type") == "point":
+                try:
+                    pos = ch.get("pos") or ch.get("position")
+                    if pos is not None:
+                        z_vals.append(float(pos[2]))
+                except Exception:
+                    continue
+        if z_vals and N_interior > 0:
+            z_min = max(0.0, min(z_vals))
+            z_max = max(z_vals)
+            pad = 0.25 * (z_max - z_min + 1e-6)
+            z_lo = max(0.0, z_min - pad)
+            z_hi = z_max + pad
+            points_int[:, 2] = rng.uniform(z_lo, z_hi, size=N_interior)
 
     if N_interior > 0:
         points_int += bbox_center_np
@@ -961,10 +1096,11 @@ def _sample_points_for_spec(
     # Boundary: per-conductor sampling, reusing the same shape heuristics
     points_bnd_list: List[np.ndarray] = []
     conductors = getattr(spec, "conductors", None) or []
-    if N_boundary > 0 and conductors:
-        N_per = max(1, N_boundary // len(conductors))
-        for c in conductors:
-            ctype = c.get("type")
+    if N_boundary > 0 and (conductors or dielectrics):
+        targets = conductors if conductors else dielectrics
+        N_per = max(1, N_boundary // len(targets))
+        for c in targets:
+            ctype = c.get("type") if conductors else "dielectric_interface"
             if ctype == "plane":
                 z = float(c.get("z", 0.0))
                 # For plane/parallel_planes, restrict boundary sampling in x/y
@@ -1039,6 +1175,27 @@ def _sample_points_for_spec(
                 nz = sinv
                 pts += np.stack([nx, ny, nz], axis=1) * eps
                 points_bnd_list.append(pts)
+            elif ctype == "dielectric_interface":
+                z_candidates: List[float] = []
+                for key in ("z_min", "z_max"):
+                    val = c.get(key, None)
+                    if val is None:
+                        continue
+                    try:
+                        zv = float(val)
+                        if zv >= -1e-6:  # only upper interfaces for region-1 oracle
+                            z_candidates.append(zv)
+                    except Exception:
+                        continue
+                for z in z_candidates:
+                    span = bbox / 4.0
+                    xy = rng.uniform(-span, span, (max(1, N_per // 2), 2))
+                    points_bnd_list.append(
+                        np.c_[
+                            xy,
+                            np.full(max(1, N_per // 2), z, dtype=float),
+                        ]
+                    )
 
     if points_bnd_list:
         points_bnd = np.vstack(points_bnd_list)
@@ -1285,6 +1442,26 @@ def _evaluate_oracle_on_points(
                         fast_done = True
                 except Exception:
                     fast_done = False
+
+            if (
+                not fast_done
+                and geom_type == "layered_planar"
+                and isinstance(solution.meta, dict)
+                and solution.meta.get("kind") == "planar_three_layer"
+            ):
+                cfg = ThreeLayerConfig(
+                    eps1=float(solution.meta.get("eps1", 1.0)),
+                    eps2=float(solution.meta.get("eps2", 1.0)),
+                    eps3=float(solution.meta.get("eps3", 1.0)),
+                    h=float(solution.meta.get("h", 1.0)),
+                    q=float(solution.meta.get("q", 1.0)),
+                    r0=tuple(solution.meta.get("r0", (0.0, 0.0, 1.0))),
+                    n_k=int(solution.meta.get("n_k", 256) or 256),
+                    k_max=solution.meta.get("k_max", None),
+                )
+                pts = torch.from_numpy(points_np).to(device=device, dtype=dtype)
+                V_gt = potential_three_layer_region1(pts, cfg, device=device, dtype=dtype)
+                fast_done = True
 
             # 3) Grounded cylinder (infinite) with 2D line charge
             #    V_SI ∝ K_E * λ * ln(ρ / ρ'), scaled consistently with other paths.

@@ -1,0 +1,89 @@
+coordinates. Bispherical coordinates exploit the fact that equipotentials of two-sphere systems are level
+surfaces of a certain coordinate ; the Green’s function for two conducting spheres (or a sphere and a plane
+as the plane is a sphere of infinite radius) can be expanded in Legendre functions 
+ of non-integer degree
+(the so-called toroidal harmonics). This yields an exact infinite series for the potential, from which one can
+extract asymptotic behavior. For small  , the capacitance  
+ of a sphere-plane system behaves as  
+ (like a quasi-parallel plate with a logarithmic correction) – this comes from the
+dominant large-  behavior of the series. The field in the narrow gap is extremely high (formally  
+ on  small  patch  area  
+),  so  discretization  of  charge  images  can  become  ill-conditioned.
+Numerical solvers (BEM, etc.) use mesh refinement in the gap and on the sphere’s near-face to capture this
+boundary-layer field. Often a proximity parameter
+ is used: for 
+, one can derive a singular
+asymptotic expansion for the field: e.g. the maximum surface field on the sphere scales like  
+times the field of an isolated sphere. Error estimates for truncating the image series: if we truncate after 
+image pairs (sphere-plane iterations), the error in potential near the gap is on the order of the next image
+charge magnitude 
+. For large separation 
+, only the first image (plane’s 
+) is
+significant and the error decays as 
+ – very fast. 
+For  two finite spheres (both conducting), the image method likewise gives an infinite double series of
+point charges inside each sphere. This was studied by King (1934) and others; the exact series solution for
+two-sphere capacitance and force was derived by Lord Rayleigh (1897) using bispherical harmonics. There
+is no simple closed-form formula; one must sum the series or use approximation formulas valid in certain
+limits (e.g. small  or large ). For mixed dielectric spheres influencing each other, one can again set up
+dual infinite series of multipoles. For instance, two dielectric spheres in vacuum will polarize each other: one
+can expand each sphere’s response in multipoles, with coefficients that depend on the external field applied
+by the other sphere’s multipoles – this leads to a  matrix equation coupling the two sets of coefficients.
+Solving that yields a double series (the method is analogous to multiple scattering theory). Only in limiting
+cases (like one sphere much larger than the other, or extreme permittivity ratios) can one find simplified
+image approximations.  Fikioris (1977) and others have looked at two-sphere polarization; generally one
+must truncate for numerical evaluation. 
+Sphere near a Dielectric Interface: This hybrid problem (e.g. a dielectric or conducting sphere close to a
+dielectric  half-space)  is  very  challenging  analytically.  No  closed-form  Green’s  function  is  known.  One
+approach is the method of images with multipoles: the presence of the interface can be accounted by an
+infinite set of image multipoles (located as a mirror distribution of the sphere’s charges) plus possibly
+continuous distributions. For example, a conducting sphere above a dielectric plane might be approximated
+by combining the sphere-plane image series (assuming the plane is conducting) with corrections for the
+fact that the plane is actually dielectric. Another approach: use  bispherical coordinates if the sphere
+intersects the plane (for a sphere partially embedded in a dielectric, effectively two-sphere coordinates with
+one sphere of infinite radius). Some special cases have analytic results:  e.g. a conducting sphere half-
+embedded in a dielectric half-space – by symmetry, this can be treated by image charges distributed along a
+line (like the method of  odd extension across the interface, yielding an integral equation). In general,
+however,  these  mixed  problems  are  solved  with  numerical  methods  (BEM  or  multipole  expansions
+truncated at high order). 
+Failure of Finite Image Solutions: In summary, apart from the canonical geometries (plane, sphere,
+infinite cylinder,  maybe ellipsoid in certain orientations),  finite discrete image systems do not exist for
+most conductor–dielectric setups
+. The method of images “fails” in the sense that one needs either
+an infinite number of images or an image distribution (line, surface, etc.). A famous example is the dielectric
+η
+Pν
+g
+C
+C ∼
+2πϵ a/ ln(4a/g) +
+0
+O(1)
+l
+E ∼
+2πϵ A
+0
+gap
+q
+Agap
+λ = g/a
+λ ≪ 1
+E
+∼
+max
+λ
+1
+N
+∼ (a − d)
+/d
+N+1
+N+1
+d ≫ a
+−q
+(a/d)2(N+1)
+g
+g
+59
+60
+6

@@ -29,6 +29,7 @@ from electrodrive.images.operator import BasisOperator
 from electrodrive.learn.collocation import make_collocation_batch_for_spec
 from electrodrive.orchestration.parser import CanonicalSpec
 from electrodrive.utils.logging import JsonlLogger
+from electrodrive.utils.config import K_E
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,12 @@ def _solve_normal_eq_psd(
         L = torch.linalg.cholesky(ATA)
         w = torch.cholesky_solve(ATg.unsqueeze(-1), L).squeeze(-1)
     except Exception:
-        w = torch.linalg.solve(ATA, ATg)
+        try:
+            w = torch.linalg.solve(ATA, ATg)
+        except Exception:
+            eps = 1e-6 * torch.max(torch.abs(torch.diag(ATA))).clamp_min(1.0)
+            ATA = ATA + eps * torch.eye(ATA.shape[0], device=ATA.device, dtype=ATA.dtype)
+            w = torch.linalg.solve(ATA, ATg)
     return w
 
 
@@ -712,6 +718,7 @@ def get_collocation_data(
     rng: np.random.Generator | None = None,
     n_points_override: Optional[int] = None,
     ratio_override: Optional[float] = None,
+    subtract_physical_potential: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build collocation points + targets for a given spec.
 
@@ -771,6 +778,29 @@ def get_collocation_data(
         return_is_boundary=return_is_boundary,
         pass_label="initial",
     )
+
+    if subtract_physical_potential and X_f.numel() > 0:
+        try:
+            charges = getattr(spec, "charges", []) or []
+            q_list = []
+            pos_list = []
+            for c in charges:
+                if c.get("type") != "point":
+                    continue
+                q_list.append(float(c.get("q", 0.0)))
+                pos_list.append([float(v) for v in c.get("pos", [0.0, 0.0, 0.0])])
+            if q_list:
+                Q = torch.tensor(q_list, device=device, dtype=dtype).view(1, -1)
+                P = torch.tensor(pos_list, device=device, dtype=dtype).view(len(q_list), 3)
+                diff = X_f[:, None, :] - P[None, :, :]
+                R = torch.linalg.norm(diff, dim=2).clamp_min(1e-9)
+                V_phys = (K_E * Q / R).sum(dim=1)
+                V_f = V_f - V_phys
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Failed to subtract physical potential; leaving targets unchanged.",
+                error=str(exc),
+            )
 
     logger.info(
         "Collocation data prepared.",
@@ -1769,6 +1799,7 @@ def cheap_discover_images_for_collocation(
     logger: JsonlLogger,
     n_max: int = 8,
     reg_l1: float = 1e-4,
+    subtract_physical_potential: bool = False,
 ) -> ImageSystem:
     """Lightweight ISTA-based solve to seed adaptive collocation."""
     device = _get_default_device()
@@ -1806,6 +1837,28 @@ def cheap_discover_images_for_collocation(
         return_is_boundary=False,
         pass_label="cheap_collocation",
     )
+    if subtract_physical_potential and colloc_pts.numel() > 0:
+        try:
+            charges = getattr(spec, "charges", []) or []
+            q_list = []
+            pos_list = []
+            for c in charges:
+                if c.get("type") != "point":
+                    continue
+                q_list.append(float(c.get("q", 0.0)))
+                pos_list.append([float(v) for v in c.get("pos", [0.0, 0.0, 0.0])])
+            if q_list:
+                Q = torch.tensor(q_list, device=device, dtype=dtype).view(1, -1)
+                P = torch.tensor(pos_list, device=device, dtype=dtype).view(len(q_list), 3)
+                diff = colloc_pts[:, None, :] - P[None, :, :]
+                R = torch.linalg.norm(diff, dim=2).clamp_min(1e-9)
+                V_phys = (K_E * Q / R).sum(dim=1)
+                target_vec = target_vec - V_phys
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Cheap collocation: failed to subtract physical potential; leaving targets unchanged.",
+                error=str(exc),
+            )
     if colloc_pts.numel() == 0 or target_vec.numel() == 0:
         logger.warning("Cheap solve skipped: empty collocation batch.")
         return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
@@ -1836,6 +1889,7 @@ def build_adaptive_collocation(
     ratio_boundary: float,
     n_rounds: int,
     initial_system: Optional[ImageSystem],
+    subtract_physical_potential: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Residual-driven collocation builder for adaptive discovery runs.
@@ -1884,6 +1938,30 @@ def build_adaptive_collocation(
             )
             break
 
+        if subtract_physical_potential:
+            try:
+                charges = getattr(spec, "charges", []) or []
+                q_list = []
+                pos_list = []
+                for c in charges:
+                    if c.get("type") != "point":
+                        continue
+                    q_list.append(float(c.get("q", 0.0)))
+                    pos_list.append([float(v) for v in c.get("pos", [0.0, 0.0, 0.0])])
+                if q_list:
+                    Q = torch.tensor(q_list, device=device, dtype=dtype).view(1, -1)
+                    P = torch.tensor(pos_list, device=device, dtype=dtype).view(len(q_list), 3)
+                    diff = X_r[:, None, :] - P[None, :, :]
+                    R = torch.linalg.norm(diff, dim=2).clamp_min(1e-9)
+                    V_phys = (K_E * Q / R).sum(dim=1)
+                    V_r = V_r - V_phys
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Adaptive collocation: failed to subtract physical potential; leaving targets unchanged.",
+                    error=str(exc),
+                    pass_label=pass_label,
+                )
+
         if is_b_r is None:
             is_b_r = torch.zeros(X_r.shape[0], device=device, dtype=torch.bool)
 
@@ -1906,6 +1984,7 @@ def build_adaptive_collocation(
                         spec,
                         ["axis_point"],
                         logger,
+                        subtract_physical_potential=subtract_physical_potential,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1988,6 +2067,7 @@ def discover_images(
     lambda_weight_prior: float | torch.Tensor = 0.0,
     weight_prior_label: Optional[str] = None,
     model_checkpoint: Optional[str] = None,
+    subtract_physical_potential: bool = False,
 ) -> ImageSystem:
     """Top-level entry point for sparse image discovery."""
 
@@ -2207,6 +2287,7 @@ def discover_images(
             rng=rng,
             n_points_override=colloc_n_points,
             ratio_override=colloc_ratio,
+            subtract_physical_potential=subtract_physical_potential,
         )
         if isinstance(colloc_out, tuple) and len(colloc_out) == 3:
             colloc_pts, target, is_boundary = colloc_out  # type: ignore[misc]
@@ -2223,6 +2304,7 @@ def discover_images(
             ratio_boundary=colloc_ratio,
             n_rounds=adaptive_rounds,
             initial_system=None,
+            subtract_physical_potential=subtract_physical_potential,
         )
         if not need_boundary_mask:
             is_boundary = None

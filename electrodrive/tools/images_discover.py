@@ -49,6 +49,8 @@ def run_discover(args: argparse.Namespace) -> int:
     operator_mode_flag = args.operator_mode  # None means defer to discover/env
     operator_mode_log = True if operator_mode_flag is None else bool(operator_mode_flag)
 
+    subtract_physical = bool(getattr(args, "subtract_physical", False))
+
     logger.info(
         "Images discovery run started.",
         spec=str(args.spec),
@@ -67,6 +69,7 @@ def run_discover(args: argparse.Namespace) -> int:
         n_points=args.n_points if args.n_points is not None else None,
         ratio_boundary=args.ratio_boundary if args.ratio_boundary is not None else None,
         aug_boundary=bool(args.aug_boundary),
+        subtract_physical=subtract_physical,
     )
     try:
         spec = _load_spec(Path(args.spec))
@@ -124,6 +127,7 @@ def run_discover(args: argparse.Namespace) -> int:
             basis_generator_mode=args.basis_generator_mode,
             geo_encoder=geo_encoder,
             model_checkpoint=args.model_checkpoint,
+            subtract_physical_potential=subtract_physical,
         )
         save_path = out_dir / "discovered_system.json"
         metadata = {
@@ -239,6 +243,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--aug-boundary",
         action="store_true",
         help="Enable augmented Lagrangian boundary enforcement.",
+    )
+    p_disc.add_argument(
+        "--subtract-physical",
+        action="store_true",
+        help="Subtract free-space potential from targets (induced solve).",
     )
     p_disc.add_argument(
         "--lambda-group",

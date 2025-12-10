@@ -1,0 +1,42 @@
+the spectral parameter and no closed-form point-image exists (necessitating the so-called “Sommerfeld
+integrals”). 
+Green’s Functions for Spherical Boundaries (Method of Images for
+Spheres)
+Conducting Sphere (Kelvin’s Image Charge): A point charge q in an infinite homogeneous medium at
+distance d from the center of a grounded conducting sphere (radius a < d) induces an image charge qK =
+−qa/d located along the line from the center through the real charge, at radius dK = a2/d from the
+center 26 27 . This Kelvin image produces a potential that exactly cancels V on the conductor surface. The
+resulting Green’s function (Dirichlet, ϕ = 0 on sphere) is:
+1 1 a/d
+G (r,r′) = − ,
+sphere 4πϵ0(∣r−r′∣ ∣r−(dK2 /d′)d^∣)
+for a source at r′ outside the sphere (with ∣r′∣ > a). The induced surface charge density is found by the
+image method as well: σ(θ) = −ϵ0∂nϕ∣r=a = −4πa(a2+qd(2a−2−2add2)cosθ)3/2 for a point charge on the polar axis
+28 29 , and the total induced charge is −q (the conductor shields the external field) 30 . Kelvin (1845)
+discovered this solution 31 , which was a cornerstone in the development of the method of images. The 
+reciprocal problem (charge inside a grounded sphere) also yields a single image: if q is at radius p < a
+inside, then an image q′ = −qa/p at radius a2/p outside produces zero potential on the sphere 32 33 .
+K
+These classic results are given in Maxwell’s treatise and many textbooks (e.g. Smythe, Static & Dynamic
+Electricity, 1968, provides derivations). Neumann (1883) already discussed the sphere image problem and
+its relation to inversion symmetry 34 . The method can be generalized to other conductor shapes that are 
+spherical inversions of a plane or sphere: e.g. a conducting spherical shell with inner/outer radii yields
+image charges for interior/exterior problems via Kelvin inversion (a charge outside a grounded spherical
+shell induces one image outside and one inside the shell). Another example: a conducting circular cylinder
+can be solved by images in 2D (line charges); Kelvin inversion maps it to a line and sphere configuration.
+These are all special cases where a finite set of image multipoles yields an exact solution. 
+Dielectric Sphere in Homogeneous Medium: For a point charge near a dielectric (non-conducting) sphere,
+no finite set of simple images exists – instead the solution can be expanded in an infinite series of
+multipoles (or interpreted as an image distribution inside the sphere). Consider a sphere of radius a,
+permittivity ϵ2, in an infinite medium ϵ1. Place a charge q at distance d from the center (outside the sphere).
+The potential outside (r > d) can be expanded in spherical harmonics about the sphere: Vext(r,θ) =
+4πqϵ1 r1> +∑l∞=0Blral+l1Pl(cosθ)  (with  r> = max(r,d)).   Inside   the   sphere   (r < a),  Vint(r,θ) =
+∑l∞=0AlrlPl(cosθ). Applying the boundary conditions at r = a (continuity of V and ϵ∂rV) leads to the
+coefficients (for l ≥ 0):
+q ϵ −ϵ a l+1 q ϵ −ϵ l+1
+B = 2 1 , A = − 2 1 a−2l−1dl.
+l 4πϵ ϵ l+ϵ (l+1) (d) l 4πϵ ϵ l+ϵ (l+1) ϵ
+1 2 1 1 2 1 2
+For example, the dipole terml = 1 gives B1 = 4πqϵ1 2ϵϵ22−+ϵϵ11(a2/d2), corresponding to an induced dipole
+moment p = 4πϵ1B1a3 = q 2ϵϵ22−+ϵϵ11a3/d (which matches the known polarizability of a dielectric sphere) 35
+3

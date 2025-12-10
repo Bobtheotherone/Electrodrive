@@ -1,0 +1,6 @@
+PDF reflection coefficient structure: R_eff(k)=R12 + (T12*T21*R23*e^{-2kh})/(1 - R21*R23*e^{-2kh}); static TM so Rp(k) real.
+Sommerfeld integral becomes sum of exponentials in k-space; finite-complex-image/rational fits approximate e^{-2kh} terms with a few images.
+For three-layer static: expect dominant reflected image near interface z~0- and secondary near z~-(h) or deeper depending on contrast (eps2=4, eps3=2, eps1=1).
+Approx image depths: mirror of source across z=0 (but scaled by reflection), additional effective images at z=-2h, -3h mimicking multiple reflections; can keep 3-4 depths total.
+Keep depths real for static case; complex images optional but avoid for now.
+Exclude source-depth candidate (avoid degeneracy). Axis symmetry only.

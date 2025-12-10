@@ -42,3 +42,4 @@ __pycache__/
 temp_AI_upgrade/
 AGENTS.md
 keops_gpu_test.py
+.keops_cache/

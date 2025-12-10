@@ -1,0 +1,47 @@
+36 . The infinite series can be summed in closed form only in limiting cases (e.g. ϵ2 → ∞ reduces to the
+Kelvin image solution where only l = 0 term survives 37 38 ). In general, the image representation is an
+infinite sequence: one can show that the same solution is obtained by replacing the sphere with an infinite
+set of point charges located on the line through the sphere center and the original charge (a convergent
+sequence approaching the center). In fact, the classic analysis by Kirkwood (1934) interprets the series as
+an infinite image charge expansion for reaction field calculations. Norris (1995)】 explicitly constructed
+the image system: a point charge q′ at the Kelvin image point r = dK = a2/dplus a continuous line
+distribution of charge along the radius from the center to that image point 39 40 . This line-charge
+density can be chosen so that each term of its multipole expansion reproduces the series coefficients
+above. (For ϵ2/ϵ1  ∞, a c=ontinuous distribution is needed – a single point image is insufficient 41 .)
+The image line charge formulation is discussed by Norris and by Lindell (Radio Sci., 27:1–8, 1992) 42
+42 , who termed it an “electrostatic image theory” for the dielectric sphere. In summary, unlike the
+conducting sphere, no finite combination of discrete images can satisfy both V and D continuity for a
+dielectric sphere 41 43 . The infinite-series solution (or equivalent image distribution) is the accepted
+Green’s function. The series converges for field points outside the sphere if r > d, and for field points
+inside if r < a. It converges faster when the contrast ∣ϵ2−ϵ1∣ is small (since higher-order multipoles
+have coefficients ∝ (ϵ2−ϵ1)) and when the charge is not too close to the sphere. If the charge
+approaches the sphere (d → a+), the series develops a slow convergence (the terms ∼ (a/d)l+1
+approach 1) and many multipoles are needed – this corresponds to the known strong field
+enhancement in narrow gaps. In fact, as d → a, the needed truncation order lmax to achieve a given
+accuracy grows roughly like lmax ∼ ln(1/l(n1(−γ)a/d)), where γ is a factor related to ϵϵ22+−ϵϵ11. Practically, for 
+d/a = 1.1 (10% gap), perhaps tens of terms suffice; for d/a = 1.01 (1% gap), hundreds of terms may
+be required to capture the near-contact singular field. Techniques like the use of spherical harmonics
+of the second kind (logarithmic potentials) aka “logopoles”** have been developed by Majic & Le Ru
+(2019) to accelerate convergence in this regime 44 45 . These functions effectively capture the line-charge
+singularity inside the sphere, yielding a more rapidly convergent expansion than standard Legendre series. 
+If the point charge is inside a dielectric sphere (radius a, permittivity ϵ2) embedded in medium ϵ1, one
+similarly expands in harmonics. The roles of interior/exterior solutions swap: inside we have a Coulomb plus
+l
+reflected series, outside purely multipole series. The coefficients become Al = 4πqϵ2 ϵ1(lϵ+1−1)ϵ+2ϵ2l (ra′) for l ≥
+0, etc. When ϵ1 → ∞ (sphere in a conducting medium), only the l = 0 term survives inside (uniform field),
+consistent with the image-charge result that a dielectric sphere in a conducting host induces a single image
+outside at r = a2/p (for a charge at radius p < a) 46 47 . A curious fact noted by van Siclen (AJP 56, 1142
+(1988)) is that if one places the Kelvin image charge inside a dielectric sphere (instead of the proper infinite
+series), the external field it produces together with the real external charge is independent of ϵ2 48 49 . In
+other words, the combination “external charge + Kelvin image” yields the correct outside potential for any
+sphere permittivity (equal to the conducting-sphere solution). Of course, the interior field will be wrong
+except in the conductor limit – but this trick implies that the effect of finite ϵ2 is felt only in the higher
+multipole terms (which vanish if ϵ2 → ∞). This was generalized by Redžić et al (2012) to spheroidal cases
+50 . Practically, it suggests using the Kelvin image as a starting approximation for large but finite ϵ2, adding
+corrections for the residual multipoles. Indeed,  Kirkwood (1957)  and  Friedman (1975)  introduced
+approximate image-charge methods to replace the full series in molecular solvation models 51 52 .
+Kirkwood’s approximation is essentially truncating at the dipole term (using one image); Friedman
+proposed a single image located at the Kelvin image point but with magnitude chosen to match the exact
+dipole moment (improving accuracy for moderate contrasts) 51 52 . These give errors on the order of a few
+percent for low or moderate permittivity ratios and are widely used in “reaction field” models of solvent
+4

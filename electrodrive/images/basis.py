@@ -103,8 +103,6 @@ class ImageBasisElement:
                 elem = RingLadderBasis(params)
             elif t == "toroidal_mode_cluster":
                 elem = ToroidalModeClusterBasis(params)
-            elif t == "toroidal_eigen_mode":
-                elem = ToroidalEigenModeBasis(params)
             elif t == "inner_rim_arc":
                 elem = InnerRimArcBasis(params)
             elif t == "inner_rim_ribbon":

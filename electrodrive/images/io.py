@@ -27,6 +27,7 @@ def save_image_system(
 
     data = {
         "metadata": metadata or {},
+        "system_metadata": getattr(system, "metadata", {}),
         "images": images,
     }
     with path.open("w", encoding="utf-8") as f:
@@ -53,4 +54,5 @@ def load_image_system(
         weights.append(w)
 
     w_tensor = torch.tensor(weights, device=device, dtype=dtype)
-    return ImageSystem(elements, w_tensor)
+    sys_meta = data.get("system_metadata", {}) if isinstance(data, dict) else {}
+    return ImageSystem(elements, w_tensor, metadata=sys_meta)

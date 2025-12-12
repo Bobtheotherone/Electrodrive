@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import List
@@ -15,6 +16,7 @@ from electrodrive.images.io import save_image_system
 from electrodrive.images.geo_encoder import GeoEncoder, load_geo_components_from_checkpoint
 from electrodrive.images.learned_solver import load_lista_from_checkpoint
 from electrodrive.images.learned_generator import SimpleGeoEncoder, MLPBasisGenerator
+from electrodrive.images.diffusion_generator import DiffusionBasisGenerator, DiffusionGeneratorConfig
 
 
 def _load_spec(path: Path) -> CanonicalSpec:
@@ -51,6 +53,26 @@ def run_discover(args: argparse.Namespace) -> int:
 
     subtract_physical = bool(getattr(args, "subtract_physical", False))
 
+    intensive = bool(getattr(args, "intensive", False))
+    if intensive:
+        if args.n_points is None:
+            args.n_points = 8192
+        if args.ratio_boundary is None:
+            args.ratio_boundary = 0.7
+        if args.adaptive_collocation_rounds is None:
+            args.adaptive_collocation_rounds = 2
+        if args.restarts is None:
+            args.restarts = 3
+        os.environ["EDE_IMAGES_INTENSIVE"] = "1"
+    if args.adaptive_collocation_rounds is None:
+        args.adaptive_collocation_rounds = 1
+    if args.restarts is None:
+        args.restarts = 1
+
+    lambda_group = args.lambda_group
+    if solver_choice == "lista" and (lambda_group is None or lambda_group == 0.0):
+        lambda_group = 1e-3
+
     logger.info(
         "Images discovery run started.",
         spec=str(args.spec),
@@ -65,11 +87,12 @@ def run_discover(args: argparse.Namespace) -> int:
         solver_explicit=bool(solver_explicit),
         operator_mode=operator_mode_log,
         adaptive_collocation_rounds=int(args.adaptive_collocation_rounds),
-        lambda_group=float(args.lambda_group),
+        lambda_group=float(lambda_group),
         n_points=args.n_points if args.n_points is not None else None,
         ratio_boundary=args.ratio_boundary if args.ratio_boundary is not None else None,
         aug_boundary=bool(args.aug_boundary),
         subtract_physical=subtract_physical,
+        intensive=bool(intensive),
     )
     try:
         spec = _load_spec(Path(args.spec))
@@ -77,11 +100,10 @@ def run_discover(args: argparse.Namespace) -> int:
         lista_model = None
         basis_generator = None
         geo_encoder = None
+
         if args.model_checkpoint:
             lista_model = load_lista_from_checkpoint(args.model_checkpoint)
-            geo_encoder, basis_generator = load_geo_components_from_checkpoint(
-                args.model_checkpoint
-            )
+            geo_encoder, basis_generator = load_geo_components_from_checkpoint(args.model_checkpoint)
             if any([lista_model, geo_encoder, basis_generator]):
                 logger.info(
                     "Model checkpoint hydrated.",
@@ -95,6 +117,17 @@ def run_discover(args: argparse.Namespace) -> int:
                     "Model checkpoint provided but no components could be loaded.",
                     checkpoint=str(args.model_checkpoint),
                 )
+            if args.basis_generator in {"diffusion", "hybrid_diffusion"} and not isinstance(
+                basis_generator, DiffusionBasisGenerator
+            ):
+                logger.error(
+                    "Diffusion basis generator requested via --basis-generator, but checkpoint does not contain diffusion weights.",
+                    checkpoint=str(args.model_checkpoint),
+                )
+                return 1
+
+        if args.basis_generator == "none":
+            basis_generator = None
         if basis_generator is None and args.basis_generator == "mlp":
             choice = args.geo_encoder.lower() if hasattr(args, "geo_encoder") else "egnn"
             if choice == "simple":
@@ -105,8 +138,26 @@ def run_discover(args: argparse.Namespace) -> int:
                 except Exception:
                     geo_encoder = SimpleGeoEncoder()
             basis_generator = MLPBasisGenerator()
+        if args.basis_generator in {"diffusion", "hybrid_diffusion"} and basis_generator is None:
+            intensive_flag = bool(getattr(args, "intensive", False) or os.getenv("EDE_IMAGES_INTENSIVE", "0") == "1")
+            cfg = DiffusionGeneratorConfig(
+                k_max=64 if intensive_flag else 32,
+                n_steps=64 if intensive_flag else 32,
+                hidden_dim=256 if intensive_flag else 128,
+                n_layers=6 if intensive_flag else 4,
+                n_heads=8 if intensive_flag else 4,
+            )
+            basis_generator = DiffusionBasisGenerator(cfg)
+            logger.warning(
+                "Using a freshly-initialized diffusion generator (no checkpoint). Weights are random; treat outputs as exploratory."
+            )
+
         aug_cfg = AugLagrangeConfig() if args.aug_boundary else None
         operator_mode = args.operator_mode
+        gen_mode = args.basis_generator_mode
+        if args.basis_generator in {"diffusion", "hybrid_diffusion"}:
+            gen_mode = args.basis_generator
+
         system = discover_images(
             spec=spec,
             basis_types=basis_types,
@@ -122,12 +173,13 @@ def run_discover(args: argparse.Namespace) -> int:
             adaptive_collocation_rounds=args.adaptive_collocation_rounds,
             n_points_override=args.n_points,
             ratio_boundary_override=args.ratio_boundary,
-            lambda_group=args.lambda_group,
+            lambda_group=lambda_group,
             basis_generator=basis_generator,
-            basis_generator_mode=args.basis_generator_mode,
+            basis_generator_mode=gen_mode,
             geo_encoder=geo_encoder,
             model_checkpoint=args.model_checkpoint,
             subtract_physical_potential=subtract_physical,
+            intensive=intensive,
         )
         save_path = out_dir / "discovered_system.json"
         metadata = {
@@ -139,8 +191,19 @@ def run_discover(args: argparse.Namespace) -> int:
             "basis_generator": args.basis_generator,
             "basis_generator_mode": args.basis_generator_mode,
             "subtract_physical": subtract_physical,
+            "solver": solver_choice,
+            "lambda_group": float(lambda_group),
         }
         save_image_system(system, save_path, metadata=metadata)
+        manifest = metadata.copy()
+        manifest_path = out_dir / "discovery_manifest.json"
+        manifest["numeric_status"] = system.metadata.get("numeric_status", "ok")
+        manifest["rel_resid"] = system.metadata.get("rel_resid")
+        manifest["max_abs_weight"] = system.metadata.get("max_abs_weight")
+        manifest["min_nonzero_weight"] = system.metadata.get("min_nonzero_weight")
+        manifest.setdefault("condition_status", None)
+        manifest.setdefault("gate1_status", None)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         logger.info(
             "Images discovery completed.",
             out=str(save_path),
@@ -237,7 +300,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_disc.add_argument(
         "--adaptive-collocation-rounds",
         type=int,
-        default=1,
+        default=None,
         help="Number of residual-driven collocation rounds (1 = no adaptation).",
     )
     p_disc.add_argument(
@@ -259,15 +322,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_disc.add_argument(
         "--restarts",
         type=int,
-        default=1,
+        default=None,
         help="If >0, enable LBFGS refinement of weights/positions.",
+    )
+    p_disc.add_argument(
+        "--intensive",
+        action="store_true",
+        help="Use aggressive GPU-heavy settings (more points, candidates, and refinement).",
     )
     p_disc.add_argument(
         "--basis-generator",
         type=str,
         default="none",
-        choices=["none", "mlp"],
-        help="Optional learned candidate generator (default: none).",
+        choices=["none", "mlp", "diffusion", "hybrid_diffusion"],
+        help="Optional learned candidate generator. 'diffusion' and 'hybrid_diffusion' require a trained checkpoint.",
     )
     p_disc.add_argument(
         "--geo-encoder",
@@ -280,7 +348,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basis-generator-mode",
         type=str,
         default="static_only",
-        choices=["static_only", "static_plus_learned", "learned_only"],
+        choices=["static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion"],
         help="How to combine learned candidates with static heuristics.",
     )
     p_disc.add_argument(

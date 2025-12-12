@@ -38,6 +38,22 @@ from electrodrive.utils.logging import JsonlLogger
 from tools.stage1_sphere_dimer_discover import _parse_basis_arg  # type: ignore
 
 
+def _manifest_all_gates_pass(manifest_path: Path) -> bool:
+    if not manifest_path.exists():
+        return True
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        data.get("gate1_status") == "pass"
+        and data.get("numeric_status") == "ok"
+        and data.get("condition_status") != "ill_conditioned"
+        and data.get("gate2_status") == "pass"
+        and data.get("gate3_status") == "pass"
+    )
+
+
 DEFAULT_SPEC = stage1_sphere_dimer_inside_path()
 DEFAULT_ZS = [0.3, 0.7, 1.0, 1.3, 1.6, 1.9, 2.1]
 
@@ -200,6 +216,10 @@ def main(argv: List[str] | None = None) -> int:
     print("SVD summary:", summary)
 
     if args.vault or args.vault_slug:
+        manifest_path = args.out / "discovery_manifest.json"
+        if not _manifest_all_gates_pass(manifest_path):
+            print("Vault skip: manifest fails gate criteria.")
+            return 0
         ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         slug = args.vault_slug or f"stage1_axis_weight_modes_{ts}"
         vault_dir = Path("the_vault") / slug

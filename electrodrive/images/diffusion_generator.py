@@ -44,12 +44,12 @@ class DiffusionGeneratorConfig:
     """Lightweight hyperparameters for the diffusion-based BasisGenerator."""
 
     k_max: int = 32
-    type_names: Tuple[str, ...] = field(default_factory=_default_type_names)
+    n_steps: int = 32
     hidden_dim: int = 128
-    time_emb_dim: int = 64
     n_layers: int = 4
     n_heads: int = 4
-    n_steps: int = 32
+    type_names: Tuple[str, ...] = field(default_factory=_default_type_names)
+    time_emb_dim: int = 64
     beta_min: float = 1e-4
     beta_max: float = 2e-2
     sigma_min: float = 0.0
@@ -156,6 +156,7 @@ class DiffusionBasisGenerator(BasisGenerator):
         super().__init__()
         self.cfg = cfg or DiffusionGeneratorConfig()
         self.type_names = list(self.cfg.type_names)
+        self.slab_bounds: Optional[Tuple[float, float]] = None  # (z_bottom, z_top)
         self.denoiser = _DiffusionSetDenoiser(
             cfg=self.cfg,
             n_types=len(self.type_names),
@@ -238,6 +239,18 @@ class DiffusionBasisGenerator(BasisGenerator):
         mask_tensor = mask if mask is not None else torch.ones(n_samples, K, device=device, dtype=torch.bool)
         return x_t, logits_t, mask_tensor
 
+    def set_slab_bounds(self, bounds: Tuple[float, float]) -> None:
+        """Configure planar slab bounds for rejection sampling (z_bottom, z_top)."""
+        try:
+            z_bottom, z_top = float(bounds[0]), float(bounds[1])
+        except Exception:
+            return
+        if not math.isfinite(z_bottom) or not math.isfinite(z_top):
+            return
+        if z_top <= z_bottom:
+            return
+        self.slab_bounds = (z_bottom, z_top)
+
     # ------------------------------------------------------------------ #
     # BasisGenerator API
     # ------------------------------------------------------------------ #
@@ -263,38 +276,58 @@ class DiffusionBasisGenerator(BasisGenerator):
         cond_vec = torch.cat([z_global, charge_mean], dim=-1).unsqueeze(0)
         mask = torch.ones(1, self.cfg.k_max, device=device, dtype=torch.bool)
 
-        with torch.no_grad():
-            x_samples, logits_samples, mask_tensor = self.sample(
-                cond_vec=cond_vec,
-                mask=mask,
-                device=device,
-                dtype=dtype,
-                n_samples=1,
-            )
-
-        x_final = x_samples[0]
-        logits_final = logits_samples[0]
-        mask_final = mask_tensor[0]
-
         elems: List[ImageBasisElement] = []
-        for j in range(min(self.cfg.k_max, n_candidates)):
-            if not bool(mask_final[j].item()):
-                continue
-            pos_local = x_final[j]
-            if not torch.isfinite(pos_local).all():
-                continue
-            type_idx = int(torch.argmax(logits_final[j]).item())
-            type_name = self.type_names[type_idx % len(self.type_names)]
-            elem = self._make_element(type_name, pos_local, conductor_nodes)
-            if elem is None:
-                continue
-            annotate_group_info(
-                elem,
-                conductor_id=0,
-                family_name=elem.type,
-                motif_index=j + 1,
-            )
-            elems.append(elem)
+        max_attempts = 4
+        attempt = 0
+        while len(elems) < min(self.cfg.k_max, n_candidates) and attempt < max_attempts:
+            attempt += 1
+            with torch.no_grad():
+                x_samples, logits_samples, mask_tensor = self.sample(
+                    cond_vec=cond_vec,
+                    mask=mask,
+                    device=device,
+                    dtype=dtype,
+                    n_samples=1,
+                )
+
+            x_final = x_samples[0]
+            logits_final = logits_samples[0]
+            mask_final = mask_tensor[0]
+
+            for j in range(self.cfg.k_max):
+                if len(elems) >= n_candidates:
+                    break
+                if not bool(mask_final[j].item()):
+                    continue
+                pos_local = x_final[j]
+                if not torch.isfinite(pos_local).all():
+                    continue
+                type_idx = int(torch.argmax(logits_final[j]).item())
+                type_name = self.type_names[type_idx % len(self.type_names)]
+                elem = self._make_element(type_name, pos_local, conductor_nodes)
+                if elem is None:
+                    continue
+                conductor_id = 0
+                if self.slab_bounds is not None:
+                    z_bottom, z_top = self.slab_bounds
+                    z_val = float(elem.params.get("position", torch.tensor([0.0, 0.0, 0.0]))[2])
+                    if z_val > z_top:
+                        conductor_id = 0  # region1
+                    elif z_val < z_bottom:
+                        conductor_id = 2  # region3
+                    elif z_bottom <= z_val <= z_top:
+                        conductor_id = 1  # slab interior
+                    else:
+                        continue
+                annotate_group_info(
+                    elem,
+                    conductor_id=conductor_id,
+                    family_name="three_layer_diffusion",
+                    motif_index=len(elems),
+                )
+                elems.append(elem)
+            if len(elems) >= n_candidates:
+                break
         return elems[:n_candidates]
 
     def _make_element(

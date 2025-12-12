@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from electrodrive.images.basis import generate_candidate_basis
+from electrodrive.images.basis import BASIS_FAMILY_ENUM, compute_group_ids, generate_candidate_basis
 from electrodrive.orchestration.parser import CanonicalSpec
 
 
@@ -32,6 +32,17 @@ def test_three_layer_basis_depths_and_groups():
     assert families[2:4] == ["three_layer_slab", "three_layer_slab"]
     assert families[4:] == ["three_layer_tail", "three_layer_tail"]
     assert all(elem.type == "three_layer_images" for elem in cands)
+
+    group_ids = compute_group_ids(cands, device=torch.device("cpu"), dtype=torch.long)
+    assert len(group_ids) == len(cands)
+    family_codes = {fam: BASIS_FAMILY_ENUM[fam] for fam in ("three_layer_mirror", "three_layer_slab", "three_layer_tail")}
+    conductor_ids = [1, 2, 1, 1, 2, 2]
+    motifs = [0, 1, 0, 1, 0, 1]
+    expected_ids = []
+    for cid, fam, motif in zip(conductor_ids, families, motifs):
+        fam_code = family_codes[fam]
+        expected_ids.append(cid * 1000 + fam_code * 10 + motif)
+    assert group_ids.tolist() == expected_ids
 
 
 def test_three_layer_basis_inactive_for_non_layered():

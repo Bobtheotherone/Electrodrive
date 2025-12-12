@@ -43,6 +43,7 @@ class DummyArgs:
         self.n_points = None
         self.ratio_boundary = None
         self.aug_boundary = False
+        self.intensive = False
 
 
 def test_images_discover_empty_collocation(tmp_path: Path):

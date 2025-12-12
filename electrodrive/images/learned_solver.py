@@ -272,6 +272,26 @@ class LISTALayer(nn.Module):
         w_phys = w * inv_norms
         return w_phys
 
+    def solve(
+        self,
+        A_operator: torch.Tensor | BasisOperator,
+        b: torch.Tensor,
+        *,
+        X: Optional[torch.Tensor] = None,
+        group_ids: Optional[torch.Tensor] = None,
+        lambda_group: float | torch.Tensor = 0.0,
+        reg_l1: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Wrapper matching ECO contract for LISTA solves."""
+        # reg_l1 included for API compatibility; thresholds already learned.
+        return self.forward(
+            A_operator,
+            X,
+            b,
+            group_ids=group_ids,
+            lambda_group=lambda_group,
+        )
+
 
 def _infer_lista_dim(state_dict: dict[str, torch.Tensor], cfg: Optional[dict[str, Any]]) -> Optional[int]:
     """Infer LISTA layer width from a checkpoint payload."""

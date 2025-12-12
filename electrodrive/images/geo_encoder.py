@@ -401,14 +401,26 @@ def _materialize_geo_encoder(obj: Any) -> Optional[nn.Module]:
 def _materialize_basis_generator(obj: Any) -> Optional[nn.Module]:
     try:
         from electrodrive.images.learned_generator import MLPBasisGenerator  # local import to avoid cycles
+        from electrodrive.images.diffusion_generator import DiffusionBasisGenerator, DiffusionGeneratorConfig
     except Exception:
         MLPBasisGenerator = None  # type: ignore[assignment]
+        DiffusionBasisGenerator = None  # type: ignore[assignment]
+        DiffusionGeneratorConfig = None  # type: ignore[assignment]
 
     if isinstance(obj, nn.Module):
         return obj
     if isinstance(obj, Mapping) and MLPBasisGenerator is not None:
         gen = MLPBasisGenerator()
         try:
+            gen.load_state_dict(obj, strict=False)
+            return gen
+        except Exception:
+            return None
+    if isinstance(obj, Mapping) and DiffusionBasisGenerator is not None and DiffusionGeneratorConfig is not None:
+        # Best-effort diffusion generator reconstruction.
+        try:
+            cfg = DiffusionGeneratorConfig()
+            gen = DiffusionBasisGenerator(cfg)
             gen.load_state_dict(obj, strict=False)
             return gen
         except Exception:

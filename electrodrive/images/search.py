@@ -104,6 +104,14 @@ def _get_default_dtype() -> torch.dtype:
     return torch.float32
 
 
+def _intensive_enabled(override: Optional[bool] = None) -> bool:
+    """Return True if intensive mode is requested via override or env."""
+    if override is not None:
+        return bool(override)
+    val = os.getenv("EDE_IMAGES_INTENSIVE", "0").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
 def _estimate_lipschitz(
     A: torch.Tensor,
     logger: JsonlLogger,
@@ -277,9 +285,10 @@ def _group_prox(
 class ImageSystem:
     """A concrete image system: basis elements + weights."""
 
-    def __init__(self, elements: List[ImageBasisElement], weights: torch.Tensor):
+    def __init__(self, elements: List[ImageBasisElement], weights: torch.Tensor, metadata: Optional[Dict[str, Any]] = None):
         self.elements = elements
         self.weights = weights
+        self.metadata: Dict[str, Any] = metadata or {}
         if weights.numel() > 0:
             self.device = weights.device
             self.dtype = weights.dtype
@@ -463,6 +472,107 @@ def _normalize_generator_mode(mode: Optional[str]) -> str:
     return m
 
 
+def _extract_slab_bounds(spec: CanonicalSpec) -> Optional[Tuple[float, float]]:
+    if getattr(spec, "BCs", "") != "dielectric_interfaces":
+        return None
+    layers = getattr(spec, "dielectrics", None) or []
+    if len(layers) != 3:
+        return None
+    try:
+        triples: List[Tuple[float, float, float, Dict[str, Any]]] = []
+        for layer in layers:
+            z_min = float(layer["z_min"])
+            z_max = float(layer["z_max"])
+            thickness = z_max - z_min
+            triples.append((z_min, z_max, thickness, layer))
+    except Exception:
+        return None
+    if len(triples) != 3:
+        return None
+    triples.sort(key=lambda t: (t[0] + t[1]) * 0.5)
+    bottom, middle, top = triples
+    if middle[2] <= 0:
+        return None
+    z_bottom_slab = middle[0]
+    z_top_slab = middle[1]
+    return z_bottom_slab, z_top_slab
+
+
+def _dedup_candidates_by_position(candidates: List[ImageBasisElement], tol: float = 1e-6) -> List[ImageBasisElement]:
+    seen: List[Tuple[float, float, float]] = []
+    deduped: List[ImageBasisElement] = []
+    for elem in candidates:
+        pos = getattr(elem, "params", {}).get("position", None)
+        if isinstance(pos, torch.Tensor):
+            coords = pos.detach().cpu().view(-1)
+            key = (float(coords[0]), float(coords[1]), float(coords[2]))
+        else:
+            deduped.append(elem)
+            continue
+        keep = True
+        for px, py, pz in seen:
+            if abs(px - key[0]) < tol and abs(py - key[1]) < tol and abs(pz - key[2]) < tol:
+                keep = False
+                break
+        if keep:
+            seen.append(key)
+            deduped.append(elem)
+    return deduped
+
+
+def _domain_extent_from_spec(spec: CanonicalSpec) -> float:
+    z_vals: List[float] = []
+    for ch in getattr(spec, "charges", []) or []:
+        try:
+            z_vals.append(abs(float(ch.get("pos", [0.0, 0.0, 0.0])[2])))
+        except Exception:
+            continue
+    for layer in getattr(spec, "dielectrics", []) or []:
+        for key in ("z_min", "z_max"):
+            try:
+                z_vals.append(abs(float(layer.get(key, 0.0))))
+            except Exception:
+                continue
+    domain = getattr(spec, "domain", {})
+    if isinstance(domain, dict):
+        bbox = domain.get("bbox", None)
+        if bbox and len(bbox) == 2 and len(bbox[0]) >= 3 and len(bbox[1]) >= 3:
+            try:
+                z_vals.append(abs(float(bbox[0][2])))
+                z_vals.append(abs(float(bbox[1][2])))
+            except Exception:
+                pass
+    max_z = max(z_vals) if z_vals else 1.0
+    return max(1.0, max_z)
+
+
+def _numeric_diagnostics(system: ImageSystem, colloc_pts: torch.Tensor, target: torch.Tensor) -> Dict[str, Any]:
+    """Compute residual and weight diagnostics for a solved system."""
+    if colloc_pts.numel() == 0 or target.numel() == 0:
+        return {"numeric_status": "ok", "rel_resid": float("nan"), "max_abs_weight": float("nan"), "min_nonzero_weight": float("nan")}
+    with torch.no_grad():
+        preds = system.potential(colloc_pts)
+        diff = preds - target
+        denom = torch.linalg.norm(target).clamp_min(1e-12)
+        rel_resid = float((torch.linalg.norm(diff) / denom).item())
+
+        weights = system.weights.detach().cpu()
+        max_abs_weight = float(weights.abs().max().item()) if weights.numel() > 0 else 0.0
+        nonzero = weights[weights != 0]
+        min_nonzero_weight = float(nonzero.abs().min().item()) if nonzero.numel() > 0 else float("nan")
+        status = "ok"
+        if not torch.isfinite(weights).all():
+            status = "nonfinite"
+        elif rel_resid > 100.0:
+            status = "catastrophic"
+        return {
+            "numeric_status": status,
+            "rel_resid": rel_resid,
+            "max_abs_weight": max_abs_weight,
+            "min_nonzero_weight": min_nonzero_weight,
+        }
+
+
 def _family_name(elem: ImageBasisElement) -> str:
     info = getattr(elem, "_group_info", None)
     if isinstance(info, dict) and "family_name" in info:
@@ -556,6 +666,12 @@ def _build_learned_candidates(
                 device=device,
                 dtype=dtype,
             )
+            slab_bounds = _extract_slab_bounds(spec)
+            if slab_bounds and hasattr(basis_generator, "set_slab_bounds"):
+                try:
+                    basis_generator.set_slab_bounds(slab_bounds)  # type: ignore[call-arg]
+                except Exception:
+                    pass
             learned = basis_generator(
                 z_global=z_global,
                 charge_nodes=charge_nodes,
@@ -961,6 +1077,8 @@ def solve_l1_ista(
             max_iter = max_iter_env
     except Exception:
         pass
+    if _intensive_enabled():
+        max_iter = max(max_iter, 200)
 
     try:
         tol_env = float(os.getenv("EDE_IMAGES_ISTA_TOL", "nan"))
@@ -1616,23 +1734,33 @@ def solve_sparse(
             pass
         try:
             # Prefer LISTA checkpoints that accept reg_l1; fall back gracefully if not.
-            try:
-                w_lista = lista_model(
+            if hasattr(lista_model, "solve"):
+                w_lista = lista_model.solve(
                     A,
-                    X,
                     V_gt,
+                    X=X,
+                    group_ids=group_ids,
+                    lambda_group=lambda_group,
                     reg_l1=reg_l1,
-                    group_ids=group_ids,
-                    lambda_group=lambda_group,
                 )
-            except TypeError:
-                w_lista = lista_model(
-                    A,
-                    X,
-                    V_gt,
-                    group_ids=group_ids,
-                    lambda_group=lambda_group,
-                )
+            else:
+                try:
+                    w_lista = lista_model(
+                        A,
+                        X,
+                        V_gt,
+                        reg_l1=reg_l1,
+                        group_ids=group_ids,
+                        lambda_group=lambda_group,
+                    )
+                except TypeError:
+                    w_lista = lista_model(
+                        A,
+                        X,
+                        V_gt,
+                        group_ids=group_ids,
+                        lambda_group=lambda_group,
+                    )
             # Regardless of LISTA quality, finish with a full ISTA solve to ensure parity.
             stats["solver"] = "lista+ista_full"
             w_out, support_out = _ista_call(max_iter_inner=max_iter, tol_inner=tol, do_refit=ls_refit)
@@ -1696,6 +1824,9 @@ def optimize_parameters_lbfgs(
     points: torch.Tensor,
     g: torch.Tensor,
     logger: JsonlLogger,
+    *,
+    domain_extent: Optional[float] = None,
+    max_iter_override: Optional[int] = None,
 ) -> ImageSystem:
     """
     Optional second-stage refinement using L-BFGS.
@@ -1768,6 +1899,18 @@ def optimize_parameters_lbfgs(
             )
             return system
 
+    # Snapshot pre-refinement state for potential rollback.
+    pre_serialized = [elem.serialize() for elem in system.elements]
+    pre_weights = system.weights.detach().clone()
+
+    def _rel_resid(sys: ImageSystem) -> float:
+        preds = sys.potential(points)
+        diff = preds - g
+        denom = torch.linalg.norm(g).clamp_min(1e-12)
+        return float((torch.linalg.norm(diff) / denom).item())
+
+    rel_resid_before = _rel_resid(system)
+
     # L-BFGS over weights + element parameters.
     try:
         max_iter_env = os.getenv("EDE_IMAGES_LBFGS_MAX_ITER", "")
@@ -1775,6 +1918,11 @@ def optimize_parameters_lbfgs(
             max_iter = int(max_iter_env) if max_iter_env else 50
         except Exception:
             max_iter = 50
+        if max_iter_override is not None:
+            try:
+                max_iter = int(max_iter_override)
+            except Exception:
+                pass
 
         optimizer = torch.optim.LBFGS(
             params,
@@ -1813,7 +1961,38 @@ def optimize_parameters_lbfgs(
 
     with torch.no_grad():
         new_weights = w.detach()
-    return ImageSystem(system.elements, new_weights)
+        refined = ImageSystem(system.elements, new_weights)
+
+    # Guardrails: revert on divergence or unphysical positions.
+    try:
+        rel_resid_after = _rel_resid(refined)
+    except Exception:
+        rel_resid_after = float("inf")
+
+    out_of_bounds = False
+    if domain_extent is not None and math.isfinite(domain_extent):
+        thresh = float(domain_extent) * 3.0
+        for elem in refined.elements:
+            pos = getattr(elem, "params", {}).get("position", None)
+            if isinstance(pos, torch.Tensor):
+                z_val = float(pos.view(-1)[2].item())
+                if abs(z_val) > thresh:
+                    out_of_bounds = True
+                    break
+
+    if (rel_resid_after > rel_resid_before * 10.0) or out_of_bounds:
+        logger.warning(
+            "LBFGS refinement diverged; reverting to pre-LBFGS.",
+            rel_resid_before=rel_resid_before,
+            rel_resid_after=rel_resid_after,
+            out_of_bounds=bool(out_of_bounds),
+        )
+        restored_elems = [
+            ImageBasisElement.deserialize(e, device=device, dtype=dtype) for e in pre_serialized
+        ]
+        return ImageSystem(restored_elems, pre_weights.to(device=device, dtype=dtype))
+
+    return refined
 
 
 def cheap_discover_images_for_collocation(
@@ -2091,11 +2270,15 @@ def discover_images(
     weight_prior_label: Optional[str] = None,
     model_checkpoint: Optional[str] = None,
     subtract_physical_potential: bool = False,
+    intensive: Optional[bool] = None,
 ) -> ImageSystem:
     """Top-level entry point for sparse image discovery."""
 
     device = _get_default_device()
     dtype = _get_default_dtype()
+    if intensive is True:
+        os.environ["EDE_IMAGES_INTENSIVE"] = "1"
+    intensive_mode = _intensive_enabled(intensive)
 
     solver_mode_raw = (solver or "ista").strip().lower()
     solver_mode = solver_mode_raw if solver_mode_raw else "ista"
@@ -2155,11 +2338,14 @@ def discover_images(
         operator_mode=bool(use_operator),
         aug_lagrange=bool(aug_cfg is not None),
         model_checkpoint=model_checkpoint,
+        intensive=bool(intensive_mode),
     )
 
     mode_env = os.getenv("EDE_IMAGES_BASIS_GENERATOR_MODE", "")
     mode_raw = mode_env if mode_env else basis_generator_mode
     mode = _normalize_generator_mode(mode_raw)
+    cand_multiplier = 16 if intensive_mode else 4
+    learned_multiplier = max(2, cand_multiplier // 2)
     cand_rng = _make_torch_rng(device)
 
     if mode in {"diffusion", "hybrid_diffusion"} and basis_generator is None:
@@ -2167,7 +2353,13 @@ def discover_images(
             from electrodrive.images.diffusion_generator import DiffusionBasisGenerator, DiffusionGeneratorConfig
 
             basis_generator = DiffusionBasisGenerator(
-                DiffusionGeneratorConfig(k_max=max(4, n_max * 2))
+                DiffusionGeneratorConfig(
+                    k_max=max(4, n_max * learned_multiplier),
+                    n_steps=64 if intensive_mode else 32,
+                    hidden_dim=256 if intensive_mode else 128,
+                    n_layers=6 if intensive_mode else 4,
+                    n_heads=8 if intensive_mode else 4,
+                )
             )
             logger.info("Using diffusion BasisGenerator.", mode=mode)
         except Exception as exc:
@@ -2182,7 +2374,7 @@ def discover_images(
         static_candidates = generate_candidate_basis(
             spec,
             basis_types=basis_types,
-            n_candidates=max(1, n_max * 4),
+            n_candidates=max(1, n_max * cand_multiplier),
             device=device,
             dtype=dtype,
             rng=cand_rng,
@@ -2194,7 +2386,7 @@ def discover_images(
             spec=spec,
             basis_generator=basis_generator,
             geo_encoder=geo_encoder,
-            n_candidates=max(1, n_max * 2),
+            n_candidates=max(1, n_max * learned_multiplier),
             device=device,
             dtype=dtype,
             logger=logger,
@@ -2203,7 +2395,8 @@ def discover_images(
     if mode in {"learned_only", "diffusion"}:
         candidates = learned_candidates
     elif mode in {"static_plus_learned", "hybrid_diffusion"}:
-        candidates = static_candidates + learned_candidates
+        combined = static_candidates + learned_candidates
+        candidates = _dedup_candidates_by_position(combined, tol=1e-6) if mode == "hybrid_diffusion" else combined
     else:
         candidates = static_candidates
 
@@ -2215,69 +2408,11 @@ def discover_images(
         logger.warning("No candidate basis elements generated for this configuration.")
         return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
 
-    weight_prior_vec: Optional[torch.Tensor] = None
-    lambda_weight_prior_vec: Optional[torch.Tensor | float] = None
-    if weight_prior is not None:
-        w_prior = torch.as_tensor(weight_prior, device=device, dtype=dtype).view(-1)
-        if w_prior.numel() == 1:
-            w_prior = w_prior.expand(len(candidates))
-        if w_prior.numel() < len(candidates):
-            w_prior = torch.cat(
-                [w_prior, torch.zeros(len(candidates) - w_prior.numel(), device=device, dtype=dtype)],
-                dim=0,
-            )
-        elif w_prior.numel() > len(candidates):
-            w_prior = w_prior[: len(candidates)]
-        weight_prior_vec = w_prior
-
-        if torch.is_tensor(lambda_weight_prior):
-            lam_prior = torch.as_tensor(lambda_weight_prior, device=device, dtype=dtype).view(-1)
-            if lam_prior.numel() == 1:
-                lam_prior = lam_prior.expand(len(candidates))
-            if lam_prior.numel() < len(candidates):
-                lam_prior = torch.cat(
-                    [lam_prior, torch.zeros(len(candidates) - lam_prior.numel(), device=device, dtype=dtype)],
-                    dim=0,
-                )
-            elif lam_prior.numel() > len(candidates):
-                lam_prior = lam_prior[: len(candidates)]
-            if float(lam_prior.max().item()) > 0.0:
-                lambda_weight_prior_vec = lam_prior
-        else:
-            lam_scalar = float(lambda_weight_prior)
-            if lam_scalar > 0.0:
-                lambda_weight_prior_vec = lam_scalar
-        lam_log = 0.0
-        if torch.is_tensor(lambda_weight_prior_vec):
-            lam_log = float(lambda_weight_prior_vec.max().item())
-        elif lambda_weight_prior_vec is not None:
-            lam_log = float(lambda_weight_prior_vec)
-        logger.info(
-            "Weight-mode prior enabled.",
-            lambda_weight_prior=lam_log,
-            prior_label=weight_prior_label,
-        )
-
-    try:
-        group_ids_full = compute_group_ids(candidates, device=device, dtype=torch.long)
-    except Exception:
-        group_ids_full = None
-
-    per_elem_reg_vec: Optional[torch.Tensor] = None
-    if per_type_reg:
-        reg_list = [float(per_type_reg.get(elem.type, reg_l1)) for elem in candidates]
-        per_elem_reg_vec = torch.tensor(reg_list, device=device, dtype=dtype)
-
-    lambda_group_vec = _build_lambda_group_vector(
-        candidates,
-        device=device,
-        dtype=dtype,
-        lambda_default=lambda_group,
-    )
-
-    colloc_n_points, colloc_ratio = _resolve_collocation_params(
+    colloc_n_points_base, colloc_ratio_base = _resolve_collocation_params(
         n_points_override, ratio_boundary_override
     )
+    colloc_n_points_eff = colloc_n_points_base
+    candidates_work: List[ImageBasisElement] = candidates
     try:
         adaptive_rounds_env = int(os.getenv("EDE_IMAGES_ADAPTIVE_ROUNDS", "0"))
     except Exception:
@@ -2299,196 +2434,289 @@ def discover_images(
         or aug_cfg is not None
     )
 
-    rng = _make_collocation_rng()
-    if adaptive_rounds <= 1:
-        colloc_out = get_collocation_data(
-            spec,
-            logger,
-            device=device,
-            dtype=dtype,
-            return_is_boundary=need_boundary_mask,
-            rng=rng,
-            n_points_override=colloc_n_points,
-            ratio_override=colloc_ratio,
-            subtract_physical_potential=subtract_physical_potential,
-        )
-        if isinstance(colloc_out, tuple) and len(colloc_out) == 3:
-            colloc_pts, target, is_boundary = colloc_out  # type: ignore[misc]
-        else:
-            colloc_pts, target = colloc_out  # type: ignore[misc]
-            is_boundary = None
-    else:
-        colloc_pts, target, is_boundary = build_adaptive_collocation(
-            spec=spec,
-            logger=logger,
-            device=device,
-            dtype=dtype,
-            n_points=colloc_n_points,
-            ratio_boundary=colloc_ratio,
-            n_rounds=adaptive_rounds,
-            initial_system=None,
-            subtract_physical_potential=subtract_physical_potential,
-        )
-        if not need_boundary_mask:
-            is_boundary = None
-
-    if colloc_pts.shape[0] == 0:
-        return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
-    try:
-        frac_boundary = float(is_boundary.float().mean().item()) if is_boundary is not None and bool(is_boundary.numel()) else 0.0
-    except Exception:
-        frac_boundary = 0.0
-    try:
-        logger.info(
-            "collocation_stats",
-            n_points=int(colloc_pts.shape[0]),
-            frac_boundary=float(frac_boundary),
-            adaptive_rounds=int(adaptive_rounds),
-        )
-    except Exception:
-        pass
-
-    if lista_model is not None and hasattr(lista_model, "K"):
+    attempt = 0
+    while True:
         try:
-            lista_K = int(getattr(lista_model, "K"))
-            if lista_K != len(candidates):
-                logger.error(
-                    "LISTA checkpoint dimension mismatch.",
-                    lista_K=int(lista_K),
-                    n_candidates=len(candidates),
+            weight_prior_vec: Optional[torch.Tensor] = None
+            lambda_weight_prior_vec: Optional[torch.Tensor | float] = None
+            if weight_prior is not None:
+                w_prior = torch.as_tensor(weight_prior, device=device, dtype=dtype).view(-1)
+                if w_prior.numel() == 1:
+                    w_prior = w_prior.expand(len(candidates_work))
+                if w_prior.numel() < len(candidates_work):
+                    w_prior = torch.cat(
+                        [w_prior, torch.zeros(len(candidates_work) - w_prior.numel(), device=device, dtype=dtype)],
+                        dim=0,
+                    )
+                elif w_prior.numel() > len(candidates_work):
+                    w_prior = w_prior[: len(candidates_work)]
+                weight_prior_vec = w_prior
+
+                if torch.is_tensor(lambda_weight_prior):
+                    lam_prior = torch.as_tensor(lambda_weight_prior, device=device, dtype=dtype).view(-1)
+                    if lam_prior.numel() == 1:
+                        lam_prior = lam_prior.expand(len(candidates_work))
+                    if lam_prior.numel() < len(candidates_work):
+                        lam_prior = torch.cat(
+                            [lam_prior, torch.zeros(len(candidates_work) - lam_prior.numel(), device=device, dtype=dtype)],
+                            dim=0,
+                        )
+                    elif lam_prior.numel() > len(candidates_work):
+                        lam_prior = lam_prior[: len(candidates_work)]
+                    if float(lam_prior.max().item()) > 0.0:
+                        lambda_weight_prior_vec = lam_prior
+                else:
+                    lam_scalar = float(lambda_weight_prior)
+                    if lam_scalar > 0.0:
+                        lambda_weight_prior_vec = lam_scalar
+                lam_log = 0.0
+                if torch.is_tensor(lambda_weight_prior_vec):
+                    lam_log = float(lambda_weight_prior_vec.max().item())
+                elif lambda_weight_prior_vec is not None:
+                    lam_log = float(lambda_weight_prior_vec)
+                logger.info(
+                    "Weight-mode prior enabled.",
+                    lambda_weight_prior=lam_log,
+                    prior_label=weight_prior_label,
                 )
-                return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
-        except Exception:
-            pass
 
-    A_dict = assemble_basis(candidates, colloc_pts, use_operator, device, dtype)
-    try:
-        col_min = float("nan")
-        col_max = float("nan")
-        if isinstance(A_dict, BasisOperator):
-            col_norms = getattr(A_dict, "col_norms", None)
-            if col_norms is None:
-                col_norms = A_dict.estimate_col_norms(colloc_pts)  # type: ignore[arg-type]
-                A_dict.col_norms = col_norms
-            col_min = float(col_norms.min().item()) if col_norms.numel() else float("nan")
-            col_max = float(col_norms.max().item()) if col_norms.numel() else float("nan")
-        else:
-            col_norms = torch.linalg.norm(A_dict, dim=0)
-            col_min = float(col_norms.min().item()) if col_norms.numel() else float("nan")
-            col_max = float(col_norms.max().item()) if col_norms.numel() else float("nan")
-        logger.info(
-            "basis_operator_stats",
-            K=len(candidates),
-            N=int(colloc_pts.shape[0]),
-            operator_mode=bool(use_operator),
-            col_norm_min=col_min,
-            col_norm_max=col_max,
-        )
-    except Exception:
-        pass
-
-    def _build_system_from_weights(w_vec: torch.Tensor, support: List[int]) -> ImageSystem:
-        if w_vec.numel() == 0 or not support:
-            return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
-        support_lim = support[: max(0, int(n_max))]
-        elems = [candidates[i] for i in support_lim]
-        weights_sel = w_vec[support_lim]
-        system_out = ImageSystem(elems, weights_sel)
-        if restarts > 0:
-            system_out = optimize_parameters_lbfgs(system_out, colloc_pts, target, logger)
-        return system_out
-
-    def _run_sparse_once(
-        A_in: torch.Tensor | BasisOperator,
-        target_in: torch.Tensor,
-        support_cap: Optional[int],
-        with_stats: bool = False,
-    ) -> Tuple[torch.Tensor, List[int]] | Tuple[torch.Tensor, List[int], Dict[str, Any]]:
-        return solve_sparse(
-            A_in,
-            colloc_pts,
-            target_in,
-            is_boundary if need_boundary_mask else None,
-            logger,
-            reg_l1=reg_l1,
-            solver=solver_mode,
-            lista_model=lista_model if solver_mode == "lista" else None,
-            aug_lagrange_cfg=aug_cfg,
-            boundary_weight=boundary_weight if aug_cfg is None else None,
-            boundary_mode=boundary_mode,
-            boundary_penalty_default=boundary_penalty_default,
-            per_elem_reg=per_elem_reg_vec,
-            group_ids=group_ids_full,
-            lambda_group=lambda_group_vec if lambda_group_vec is not None else lambda_group,
-            weight_prior=weight_prior_vec,
-            lambda_weight_prior=lambda_weight_prior_vec if lambda_weight_prior_vec is not None else 0.0,
-            normalize_columns=True,
-            ls_refit=True,
-            support_k=support_cap,
-            max_iter=1000,
-            tol=1e-6,
-            lista_refine=True,
-            return_stats=with_stats,
-        )
-
-    if two_stage:
-        nonlocal_types = [
-            "ring",
-            "ring_gauss",
-            "poloidal_ring",
-            "ring_ladder_inner",
-            "ring_ladder_outer",
-            "toroidal_mode_cluster",
-        ]
-        non_idx = [i for i, c in enumerate(candidates) if c.type in nonlocal_types]
-        point_idx = [i for i, c in enumerate(candidates) if c.type == "point"]
-
-        weights_full = torch.zeros(len(candidates), device=device, dtype=dtype)
-        target_res = target
-
-        if non_idx:
-            A_non = assemble_basis([candidates[i] for i in non_idx], colloc_pts, use_operator, device, dtype)
-            w_non, _ = _run_sparse_once(A_non, target_res, min(len(non_idx), n_max))
-            for idx_val, w_val in zip(non_idx, w_non):
-                weights_full[idx_val] = w_val
             try:
-                target_res = target - _matvec(A_non, w_non, colloc_pts if isinstance(A_non, BasisOperator) else None)
-            except Exception as exc:
-                logger.warning("Two-stage residual update failed; using original targets.", error=str(exc))
+                group_ids_full = compute_group_ids(candidates_work, device=device, dtype=torch.long)
+            except Exception:
+                group_ids_full = None
 
-        if point_idx:
-            A_point = assemble_basis([candidates[i] for i in point_idx], colloc_pts, use_operator, device, dtype)
-            w_point, _ = _run_sparse_once(A_point, target_res, min(len(point_idx), n_max))
-            for idx_val, w_val in zip(point_idx, w_point):
-                weights_full[idx_val] = w_val
+            per_elem_reg_vec: Optional[torch.Tensor] = None
+            if per_type_reg:
+                reg_list = [float(per_type_reg.get(elem.type, reg_l1)) for elem in candidates_work]
+                per_elem_reg_vec = torch.tensor(reg_list, device=device, dtype=dtype)
 
-        w_out = weights_full
-        support_full = [
-            int(i) for i in torch.argsort(torch.abs(w_out), descending=True).tolist()
-            if float(torch.abs(w_out[int(i)]).item()) > 0.0
-        ]
-        system = _build_system_from_weights(w_out, support_full)
-        return system
-
-    w_out = _run_sparse_once(A_dict, target, n_max if n_max > 0 else None, with_stats=True)
-    if isinstance(w_out, tuple) and len(w_out) == 3:
-        w_final, support_final, solver_stats = w_out  # type: ignore[misc]
-    else:
-        w_final, support_final = w_out  # type: ignore[misc]
-        solver_stats = {}
-    system = _build_system_from_weights(w_final, support_final)
-    if solver_stats:
-        try:
-            logger.info(
-                "solver_stats",
-                solver=str(solver_stats.get("solver")),
-                iters=int(solver_stats.get("iters", -1)),
-                converged=bool(solver_stats.get("converged", False)),
-                bc_norm=float(solver_stats.get("bc_norm", float("nan"))),
-                int_norm=float(solver_stats.get("int_norm", float("nan"))),
-                lambda_group=float(solver_stats.get("lambda_group", float("nan"))),
-                aug_rho_final=float(solver_stats.get("aug_rho_final", float("nan"))),
+            lambda_group_vec = _build_lambda_group_vector(
+                candidates_work,
+                device=device,
+                dtype=dtype,
+                lambda_default=lambda_group,
             )
-        except Exception:
-            pass
-    return system
+
+            colloc_n_points = colloc_n_points_eff
+            colloc_ratio = colloc_ratio_base
+            rng = _make_collocation_rng()
+            if adaptive_rounds <= 1:
+                colloc_out = get_collocation_data(
+                    spec,
+                    logger,
+                    device=device,
+                    dtype=dtype,
+                    return_is_boundary=need_boundary_mask,
+                    rng=rng,
+                    n_points_override=colloc_n_points,
+                    ratio_override=colloc_ratio,
+                    subtract_physical_potential=subtract_physical_potential,
+                )
+                if isinstance(colloc_out, tuple) and len(colloc_out) == 3:
+                    colloc_pts, target, is_boundary = colloc_out  # type: ignore[misc]
+                else:
+                    colloc_pts, target = colloc_out  # type: ignore[misc]
+                    is_boundary = None
+            else:
+                colloc_pts, target, is_boundary = build_adaptive_collocation(
+                    spec=spec,
+                    logger=logger,
+                    device=device,
+                    dtype=dtype,
+                    n_points=colloc_n_points,
+                    ratio_boundary=colloc_ratio,
+                    n_rounds=adaptive_rounds,
+                    initial_system=None,
+                    subtract_physical_potential=subtract_physical_potential,
+                )
+                if not need_boundary_mask:
+                    is_boundary = None
+
+            if colloc_pts.shape[0] == 0:
+                return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
+            try:
+                frac_boundary = float(is_boundary.float().mean().item()) if is_boundary is not None and bool(is_boundary.numel()) else 0.0
+            except Exception:
+                frac_boundary = 0.0
+            try:
+                logger.info(
+                    "collocation_stats",
+                    n_points=int(colloc_pts.shape[0]),
+                    frac_boundary=float(frac_boundary),
+                    adaptive_rounds=int(adaptive_rounds),
+                )
+            except Exception:
+                pass
+
+            if lista_model is not None and hasattr(lista_model, "K"):
+                try:
+                    lista_K = int(getattr(lista_model, "K"))
+                    if lista_K != len(candidates_work):
+                        logger.error(
+                            "LISTA checkpoint dimension mismatch.",
+                            lista_K=int(lista_K),
+                            n_candidates=len(candidates_work),
+                        )
+                        return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
+                except Exception:
+                    pass
+
+            A_dict = assemble_basis(candidates_work, colloc_pts, use_operator, device, dtype)
+            try:
+                col_min = float("nan")
+                col_max = float("nan")
+                if isinstance(A_dict, BasisOperator):
+                    col_norms = getattr(A_dict, "col_norms", None)
+                    if col_norms is None:
+                        col_norms = A_dict.estimate_col_norms(colloc_pts)  # type: ignore[arg-type]
+                        A_dict.col_norms = col_norms
+                    col_min = float(col_norms.min().item()) if col_norms.numel() else float("nan")
+                    col_max = float(col_norms.max().item()) if col_norms.numel() else float("nan")
+                else:
+                    col_norms = torch.linalg.norm(A_dict, dim=0)
+                    col_min = float(col_norms.min().item()) if col_norms.numel() else float("nan")
+                    col_max = float(col_norms.max().item()) if col_norms.numel() else float("nan")
+                logger.info(
+                    "basis_operator_stats",
+                    K=len(candidates_work),
+                    N=int(colloc_pts.shape[0]),
+                    operator_mode=bool(use_operator),
+                    col_norm_min=col_min,
+                    col_norm_max=col_max,
+                )
+            except Exception:
+                pass
+
+            def _build_system_from_weights(w_vec: torch.Tensor, support: List[int]) -> ImageSystem:
+                if w_vec.numel() == 0 or not support:
+                    return ImageSystem([], torch.zeros(0, device=device, dtype=dtype))
+                support_lim = support[: max(0, int(n_max))]
+                elems = [candidates_work[i] for i in support_lim]
+                weights_sel = w_vec[support_lim]
+                system_out = ImageSystem(elems, weights_sel)
+                if restarts > 0:
+                    max_iter_lbfgs = 200 if intensive_mode else None
+                    extent = _domain_extent_from_spec(spec) if intensive_mode else None
+                    system_out = optimize_parameters_lbfgs(
+                        system_out,
+                        colloc_pts,
+                        target,
+                        logger,
+                        domain_extent=extent,
+                        max_iter_override=max_iter_lbfgs,
+                    )
+                return system_out
+
+            def _run_sparse_once(
+                A_in: torch.Tensor | BasisOperator,
+                target_in: torch.Tensor,
+                support_cap: Optional[int],
+                with_stats: bool = False,
+            ) -> Tuple[torch.Tensor, List[int]] | Tuple[torch.Tensor, List[int], Dict[str, Any]]:
+                return solve_sparse(
+                    A_in,
+                    colloc_pts,
+                    target_in,
+                    is_boundary if need_boundary_mask else None,
+                    logger,
+                    reg_l1=reg_l1,
+                    solver=solver_mode,
+                    lista_model=lista_model if solver_mode == "lista" else None,
+                    aug_lagrange_cfg=aug_cfg,
+                    boundary_weight=boundary_weight if aug_cfg is None else None,
+                    boundary_mode=boundary_mode,
+                    boundary_penalty_default=boundary_penalty_default,
+                    per_elem_reg=per_elem_reg_vec,
+                    group_ids=group_ids_full,
+                    lambda_group=lambda_group_vec if lambda_group_vec is not None else lambda_group,
+                    weight_prior=weight_prior_vec,
+                    lambda_weight_prior=lambda_weight_prior_vec if lambda_weight_prior_vec is not None else 0.0,
+                    normalize_columns=True,
+                    ls_refit=True,
+                    support_k=support_cap,
+                    max_iter=1000,
+                    tol=1e-6,
+                    lista_refine=True,
+                    return_stats=with_stats,
+                )
+
+            if two_stage:
+                nonlocal_types = [
+                    "ring",
+                    "ring_gauss",
+                    "poloidal_ring",
+                    "ring_ladder_inner",
+                    "ring_ladder_outer",
+                    "toroidal_mode_cluster",
+                ]
+                non_idx = [i for i, c in enumerate(candidates_work) if c.type in nonlocal_types]
+                point_idx = [i for i, c in enumerate(candidates_work) if c.type == "point"]
+
+                weights_full = torch.zeros(len(candidates_work), device=device, dtype=dtype)
+                target_res = target
+
+                if non_idx:
+                    A_non = assemble_basis([candidates_work[i] for i in non_idx], colloc_pts, use_operator, device, dtype)
+                    w_non, _ = _run_sparse_once(A_non, target_res, min(len(non_idx), n_max))
+                    for idx_val, w_val in zip(non_idx, w_non):
+                        weights_full[idx_val] = w_val
+                    try:
+                        target_res = target - _matvec(A_non, w_non, colloc_pts if isinstance(A_non, BasisOperator) else None)
+                    except Exception as exc:
+                        logger.warning("Two-stage residual update failed; using original targets.", error=str(exc))
+
+                if point_idx:
+                    A_point = assemble_basis([candidates_work[i] for i in point_idx], colloc_pts, use_operator, device, dtype)
+                    w_point, _ = _run_sparse_once(A_point, target_res, min(len(point_idx), n_max))
+                    for idx_val, w_val in zip(point_idx, w_point):
+                        weights_full[idx_val] = w_val
+
+                w_out = weights_full
+                support_full = [
+                    int(i) for i in torch.argsort(torch.abs(w_out), descending=True).tolist()
+                    if float(torch.abs(w_out[int(i)]).item()) > 0.0
+                ]
+                system = _build_system_from_weights(w_out, support_full)
+                return system
+
+            w_out = _run_sparse_once(A_dict, target, n_max if n_max > 0 else None, with_stats=True)
+            if isinstance(w_out, tuple) and len(w_out) == 3:
+                w_final, support_final, solver_stats = w_out  # type: ignore[misc]
+            else:
+                w_final, support_final = w_out  # type: ignore[misc]
+                solver_stats = {}
+            system = _build_system_from_weights(w_final, support_final)
+            if solver_stats:
+                try:
+                    logger.info(
+                        "solver_stats",
+                        solver=str(solver_stats.get("solver")),
+                        iters=int(solver_stats.get("iters", -1)),
+                        converged=bool(solver_stats.get("converged", False)),
+                        bc_norm=float(solver_stats.get("bc_norm", float("nan"))),
+                        int_norm=float(solver_stats.get("int_norm", float("nan"))),
+                        lambda_group=float(solver_stats.get("lambda_group", float("nan"))),
+                        aug_rho_final=float(solver_stats.get("aug_rho_final", float("nan"))),
+                    )
+                except Exception:
+                    pass
+            # Numeric diagnostics for manifest / Gate 2/3 linkage.
+            diagnostics = _numeric_diagnostics(system, colloc_pts, target)
+            system.metadata.update(diagnostics)
+            return system
+        except RuntimeError as exc:
+            is_oom = "out of memory" in str(exc).lower()
+            if not (intensive_mode and is_oom and attempt == 0):
+                raise
+            logger.warning(
+                "Intensive mode scaled back due to VRAM limits.",
+                attempt=int(attempt + 1),
+                n_points=int(colloc_n_points_eff),
+                n_candidates=len(candidates_work),
+                error=str(exc),
+            )
+            colloc_n_points_eff = max(256, int(colloc_n_points_eff // 2))
+            new_k = max(1, len(candidates_work) // 2)
+            candidates_work = candidates_work[:new_k]
+            attempt += 1
+            continue

@@ -46,6 +46,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OUT_ROOT = REPO_ROOT / "runs/stage0_sphere_axis_moi"
 
 
+def _manifest_all_gates_pass(manifest_path: Path) -> bool:
+    if not manifest_path.exists():
+        return True
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return (
+        data.get("gate1_status") == "pass"
+        and data.get("numeric_status") == "ok"
+        and data.get("condition_status") != "ill_conditioned"
+        and data.get("gate2_status") == "pass"
+        and data.get("gate3_status") == "pass"
+    )
+
+
 def _parse_basis_arg(raw_basis: Sequence[str] | str) -> List[str]:
     if isinstance(raw_basis, str):
         parts = [p.strip() for p in raw_basis.split(",") if p.strip()]
@@ -478,6 +494,7 @@ def run_sweep(
 
     ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     symbolic_outputs: List[Dict[str, Any]] = []
+    vault_dir: Optional[Path] = None
     for n_val, pairs in weights_by_nmax.items():
         pairs_sorted = sorted(pairs, key=lambda kv: kv[0])
         z_grid = [p[0] for p in pairs_sorted]
@@ -515,6 +532,10 @@ def run_sweep(
         symbolic_outputs.append({"n_max": int(n_val), "dir": str(sym_dir)})
 
         if vault or vault_slug:
+            manifest_path = Path(out_root) / "discovery_manifest.json"
+            if not _manifest_all_gates_pass(manifest_path):
+                logger.warning("Vault skip: manifest fails gate criteria.", manifest=str(manifest_path))
+                continue
             slug = vault_slug or f"stage0_axis_weight_modes_n{n_val}_{ts}"
             vault_dir = Path("the_vault") / slug
             vault_dir.mkdir(parents=True, exist_ok=True)
@@ -522,10 +543,11 @@ def run_sweep(
                 src = sym_dir / fname
                 if src.exists():
                     shutil.copy(src, vault_dir / fname)
-        try:
-            shutil.copy(stage0_sphere_external_path(), vault_dir / "spec_stage0.json")
-        except Exception:
-            pass
+        if vault_dir is not None:
+            try:
+                shutil.copy(stage0_sphere_external_path(), vault_dir / "spec_stage0.json")
+            except Exception:
+                pass
 
     if symbolic_outputs:
         summary["symbolic_outputs"] = symbolic_outputs

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from collections import defaultdict
+import math
 
 import numpy as np
 import torch
@@ -23,6 +25,30 @@ class _StubLogger(JsonlLogger):
 
     def warning(self, *args, **kwargs):
         pass
+
+
+def _find_repo_root(start: Path) -> Path:
+    """Walk upward to locate repo root (identified by .git)."""
+    for p in [start, *start.parents]:
+        if (p / ".git").exists():
+            return p
+    return start
+
+
+def _resolve_spec_path(spec_arg: str | None) -> Path:
+    """Resolve spec path robustly (absolute or repo-relative)."""
+    if spec_arg is None:
+        raise FileNotFoundError("No spec path provided.")
+    cand = Path(spec_arg)
+    if cand.is_absolute() and cand.exists():
+        return cand
+    if cand.exists():
+        return cand
+    repo_root = _find_repo_root(Path(__file__).resolve())
+    alt = repo_root / cand
+    if alt.exists():
+        return alt
+    raise FileNotFoundError(f"Could not resolve spec path: {spec_arg}")
 
 
 def build_spec(eps2: float, h: float) -> CanonicalSpec:
@@ -131,13 +157,19 @@ def main() -> int:
     ap.add_argument("--ratio-boundary", type=float, default=0.6)
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--family-scale", action="store_true", help="Apply per-family column scaling.")
+    ap.add_argument("--manifest", type=Path, default=None, help="Optional manifest path to write condition_status.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32
+    dtype_env = str(os.getenv("EDE_IMAGES_DTYPE", "float32")).lower()
+    if dtype_env in {"float64", "double"}:
+        dtype = torch.float64
+    else:
+        dtype = torch.float32
 
     if args.spec:
-        spec = CanonicalSpec.from_json(json.loads(Path(args.spec).read_text()))
+        spec_path = _resolve_spec_path(args.spec)
+        spec = CanonicalSpec.from_json(json.loads(Path(spec_path).read_text()))
     else:
         spec = build_spec(args.eps2, args.h)
 
@@ -160,6 +192,10 @@ def main() -> int:
 
     stats_base = lstsq_metrics(A, V_gt, is_b)
     output = {"base": stats_base}
+    condition_status = "ok"
+    cond_est = stats_base.get("cond_est", float("nan"))
+    if cond_est and math.isfinite(cond_est) and cond_est > 1e7:
+        condition_status = "ill_conditioned"
 
     if args.family_scale:
         dense_raw = op.to_dense(max_entries=None, targets=X)
@@ -170,6 +206,18 @@ def main() -> int:
         stats_scaled = lstsq_metrics(A_scaled, V_gt, is_b)
         output["scaled"] = stats_scaled
         output["scales"] = scales
+        cond_est = stats_scaled.get("cond_est", cond_est)
+        if cond_est and math.isfinite(cond_est) and cond_est > 1e7:
+            condition_status = "ill_conditioned"
+
+    if args.manifest:
+        try:
+            manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest.exists() else {}
+        except Exception:
+            manifest = {}
+        manifest["condition_status"] = condition_status
+        manifest["cond_est"] = cond_est
+        args.manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print(json.dumps(output, indent=2))
     return 0

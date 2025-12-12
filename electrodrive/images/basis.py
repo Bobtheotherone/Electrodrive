@@ -37,10 +37,35 @@ class ImageBasisElement:
 
     def serialize(self) -> Dict[str, Any]:
         """Serialize to a JSON-friendly dict."""
-        return {
+        def _json_safe(val: Any) -> Any:
+            if isinstance(val, (str, int, float, bool)) or val is None:
+                return val
+            if isinstance(val, torch.Tensor):
+                if val.numel() == 1:
+                    return val.detach().cpu().item()
+                return val.detach().cpu().tolist()
+            if isinstance(val, (list, tuple)):
+                return [_json_safe(v) for v in val]
+            if isinstance(val, dict):
+                return {str(k): _json_safe(v) for k, v in val.items()}
+            try:
+                json.dumps(val)
+                return val
+            except Exception:
+                return str(val)
+
+        data: Dict[str, Any] = {
             "type": self.type,
             "params": {k: v.detach().cpu().tolist() for k, v in self.params.items()},
         }
+
+        info = getattr(self, "_group_info", None)
+        if isinstance(info, dict) and len(info) > 0:
+            group_info = {str(k): _json_safe(v) for k, v in info.items()}
+            if len(group_info) > 0:
+                data["group_info"] = group_info
+
+        return data
 
     @staticmethod
     def deserialize(
@@ -50,45 +75,63 @@ class ImageBasisElement:
     ) -> "ImageBasisElement":
         """Inverse of :meth:`serialize`."""
         t = data["type"]
+        elem: ImageBasisElement
         if t == "toroidal_eigen_mode":
-            return ToroidalEigenModeBasis(
+            elem = ToroidalEigenModeBasis(
                 {"components": data.get("params", {}).get("components", [])}
             )
-        params = {
-            k: torch.tensor(v, device=device, dtype=dtype)
-            for k, v in data["params"].items()
-        }
-        if t == "point":
-            return PointChargeBasis(params)
-        if t == "axis_point":
-            return PointChargeBasis(params, type_name="axis_point")
-        if t == "three_layer_images":
-            return PointChargeBasis(params, type_name="three_layer_images")
-        if t == "ring":
-            return RingImageBasis(params, type_name="ring")
-        if t == "ring_gauss":
-            return RingImageBasis(params, type_name="ring_gauss")
-        if t == "mirror_stack":
-            return MirrorStackBasis(params)
-        if t == "poloidal_ring":
-            return PoloidalRingBasis(params)
-        if t in ("ring_ladder", "ring_ladder_inner", "ring_ladder_outer"):
-            return RingLadderBasis(params)
-        if t == "toroidal_mode_cluster":
-            return ToroidalModeClusterBasis(params)
-        if t == "toroidal_eigen_mode":
-            return ToroidalEigenModeBasis(params)
-        if t == "inner_rim_arc":
-            return InnerRimArcBasis(params)
-        if t == "inner_rim_ribbon":
-            return InnerRimRibbonBasis(params)
-        if t == "inner_patch_ring":
-            return InnerPatchRingBasis(params)
-        if t == "sphere_kelvin_image":
-            return SphereKelvinImageBasis(params)
-        if t == "sphere_equatorial_ring":
-            return SphereEquatorialRingBasis(params)
-        raise ValueError(f"Unknown basis element type: {t}")
+        else:
+            params = {
+                k: torch.tensor(v, device=device, dtype=dtype)
+                for k, v in data["params"].items()
+            }
+            if t == "point":
+                elem = PointChargeBasis(params)
+            elif t == "axis_point":
+                elem = PointChargeBasis(params, type_name="axis_point")
+            elif t == "three_layer_images":
+                elem = PointChargeBasis(params, type_name="three_layer_images")
+            elif t == "ring":
+                elem = RingImageBasis(params, type_name="ring")
+            elif t == "ring_gauss":
+                elem = RingImageBasis(params, type_name="ring_gauss")
+            elif t == "mirror_stack":
+                elem = MirrorStackBasis(params)
+            elif t == "poloidal_ring":
+                elem = PoloidalRingBasis(params)
+            elif t in ("ring_ladder", "ring_ladder_inner", "ring_ladder_outer"):
+                elem = RingLadderBasis(params)
+            elif t == "toroidal_mode_cluster":
+                elem = ToroidalModeClusterBasis(params)
+            elif t == "toroidal_eigen_mode":
+                elem = ToroidalEigenModeBasis(params)
+            elif t == "inner_rim_arc":
+                elem = InnerRimArcBasis(params)
+            elif t == "inner_rim_ribbon":
+                elem = InnerRimRibbonBasis(params)
+            elif t == "inner_patch_ring":
+                elem = InnerPatchRingBasis(params)
+            elif t == "sphere_kelvin_image":
+                elem = SphereKelvinImageBasis(params)
+            elif t == "sphere_equatorial_ring":
+                elem = SphereEquatorialRingBasis(params)
+            else:
+                raise ValueError(f"Unknown basis element type: {t}")
+
+        group_info = data.get("group_info", None)
+        if isinstance(group_info, dict):
+            info = dict(group_info)
+            for key in ("conductor_id", "motif_index", "family"):
+                if key in info:
+                    try:
+                        info[key] = int(info[key])
+                    except Exception:
+                        pass
+            if "family_name" in info:
+                info["family_name"] = str(info["family_name"])
+            setattr(elem, "_group_info", info)
+
+        return elem
 
 
 class PointChargeBasis(ImageBasisElement):
@@ -1247,8 +1290,16 @@ def generate_candidate_basis(
                 point_charges = [
                     c for c in getattr(spec, "charges", None) or [] if c.get("type") == "point"
                 ]
+
+                def _layer_id(z_val: float, *, tol: float = 1e-9) -> int:
+                    if z_val > top_z + tol:
+                        return 0  # region1 / top half-space
+                    if z_val < bottom_z - tol:
+                        return 2  # region3 / bottom half-space
+                    return 1      # slab interior
+
                 if h > 0.0 and point_charges:
-                    for cid, charge in enumerate(point_charges):
+                    for charge in point_charges:
                         try:
                             z0 = float(charge["pos"][2])
                             x0 = float(charge["pos"][0])
@@ -1294,7 +1345,7 @@ def generate_candidate_basis(
                                 motif = idx_img - 4
                             annotate_group_info(
                                 elem,
-                                conductor_id=cid,
+                                conductor_id=_layer_id(float(z_img)),
                                 family_name=family,
                                 motif_index=motif,
                             )
@@ -1804,6 +1855,10 @@ BASIS_FAMILY_NAMES: List[str] = [
     "learned_point",
     "learned_ring",
     "diffusion_point",
+    "three_layer_mirror",
+    "three_layer_slab",
+    "three_layer_tail",
+    "three_layer_diffusion",
 ]
 
 # Map name -> small integer code (1..)
@@ -1869,20 +1924,36 @@ def compute_group_ids(
         if not isinstance(info, dict):
             info = {}
 
-        conductor_id = int(info.get("conductor_id", 0))
-        motif_index = int(info.get("motif_index", 0))
+        has_group_info = len(info) > 0
+        try:
+            conductor_id = int(info.get("conductor_id", 0))
+        except Exception:
+            conductor_id = 0
+        try:
+            motif_index = int(info.get("motif_index", 0))
+        except Exception:
+            motif_index = 0
 
-        family_name = info.get("family_name", getattr(elem, "type", "unknown"))
-        family = info.get("family", None)
-        if family is None:
+        family_name = info.get("family_name", None) if has_group_info else None
+        family: int
+        if family_name is not None and family_name in BASIS_FAMILY_ENUM:
+            family = BASIS_FAMILY_ENUM[family_name]
+        elif info.get("family", None) is not None:
+            try:
+                family = int(info["family"])
+            except Exception:
+                family = _family_code(str(info.get("family_name", getattr(elem, "type", "unknown"))))
+        elif family_name is not None:
             family = _family_code(str(family_name))
-        family = int(family)
+        else:
+            family_name = getattr(elem, "type", "unknown")
+            family = _family_code(str(family_name))
 
         # Backfill + persist
         info.setdefault("conductor_id", conductor_id)
         info.setdefault("motif_index", motif_index)
         info.setdefault("family_name", str(family_name))
-        info.setdefault("family", family)
+        info["family"] = int(family)
         setattr(elem, "_group_info", info)
 
         ids.append(conductor_id * 1000 + family * 10 + motif_index)

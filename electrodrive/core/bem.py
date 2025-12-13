@@ -1589,6 +1589,10 @@ def bem_solve(
     current_h = float(getattr(cfg, "initial_h", 0.3))
     refine_factor = float(getattr(cfg, "refine_factor", 0.5))
     target_bc = float(getattr(cfg, "target_bc_inf_norm", 1e-7))
+    # Treat BC residuals within this band as effectively equal; helps avoid
+    # selecting a coarser pass purely due to numerical noise once residuals
+    # are well below the target threshold.
+    tiny_bc_band = max(target_bc * 1e-3, 1e-12)
 
     # Hoist config scalars out of the refinement loop to avoid repeated getattr
     max_refine_passes = int(getattr(cfg, "max_refine_passes", 3))
@@ -2452,6 +2456,17 @@ def bem_solve(
                     )
                     else plateau + 1
                 )
+            elif (
+                best is not None
+                and abs(bc_resid_linf - best_bc) <= tiny_bc_band
+                and N > int(best.get("dof", 0))
+            ):
+                # Prefer the finer mesh when residuals are indistinguishable
+                # (well below target_bc), to avoid regressing accuracy on
+                # refined passes due to numerical noise.
+                best = pass_payload
+                best_bc = bc_resid_linf
+                plateau = 0
             else:
                 plateau += 1
 

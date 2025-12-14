@@ -12,6 +12,9 @@ Dependency policy: FastAPI is optional extra; this module avoids importing it at
 import time. Use get_ws_router() to construct the router.
 """
 
+RESEARCHED_EVENTS_JSONL = "researched_events.jsonl"
+
+
 import asyncio
 import base64
 import json
@@ -491,6 +494,7 @@ def _resolve_run_dir(runs_root: Path, run_id: str) -> Optional[Path]:
             "metrics.json",
             "events.jsonl",
             "evidence_log.jsonl",
+            RESEARCHED_EVENTS_JSONL,
             "train_log.jsonl",
             "metrics.jsonl",
         )
@@ -564,6 +568,7 @@ def get_ws_router():
         Design Doc FR-4 + §1.4: merge/tail multiple JSONL files:
           - events.jsonl
           - evidence_log.jsonl
+          - researched_events.jsonl
           - train_log.jsonl
           - metrics.jsonl
         """
@@ -579,6 +584,7 @@ def get_ws_router():
         followers = [
             _JsonlFollowState(path=run_dir / "events.jsonl", name="events.jsonl"),
             _JsonlFollowState(path=run_dir / "evidence_log.jsonl", name="evidence_log.jsonl"),
+            _JsonlFollowState(path=run_dir / RESEARCHED_EVENTS_JSONL, name=RESEARCHED_EVENTS_JSONL),
             _JsonlFollowState(path=run_dir / "train_log.jsonl", name="train_log.jsonl"),
             _JsonlFollowState(path=run_dir / "metrics.jsonl", name="metrics.jsonl"),
         ]
@@ -812,3 +818,4 @@ def get_ws_router():
             return
 
     return router
+

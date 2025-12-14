@@ -60,6 +60,7 @@ class OutputsInfo(TypedDict, total=False):
     metrics_json: Optional[str]
     events_jsonl: Optional[str]
     evidence_log_jsonl: Optional[str]
+    researched_events_jsonl: Optional[str]
     command_txt: Optional[str]
     report_html: Optional[str]
     artifacts_dir: Optional[str]
@@ -383,6 +384,7 @@ def infer_outputs(run_dir: Path) -> OutputsInfo:
         "metrics_json": "metrics.json" if (rd / "metrics.json").is_file() else None,
         "events_jsonl": "events.jsonl" if (rd / "events.jsonl").exists() else None,
         "evidence_log_jsonl": "evidence_log.jsonl" if (rd / "evidence_log.jsonl").exists() else None,
+        "researched_events_jsonl": "researched_events.jsonl" if (rd / "researched_events.jsonl").exists() else None,
         "viz_dir": "viz" if (rd / "viz").is_dir() else None,
         "artifacts_dir": "artifacts" if (rd / "artifacts").is_dir() else None,
         "plots_dir": "plots" if (rd / "plots").is_dir() else None,
@@ -431,3 +433,4 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
 
     if "started_at" not in manifest:
         raise ValueError("manifest missing required key: 'started_at'")
+

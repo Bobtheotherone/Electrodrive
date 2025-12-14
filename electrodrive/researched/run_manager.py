@@ -20,6 +20,7 @@ Hard constraints (prompt):
 import dataclasses
 import enum
 import getpass
+import inspect
 import json
 import os
 import platform
@@ -82,6 +83,10 @@ _TORCH_VERSION_CACHE: str | None = None
 
 # ResearchED-owned manifest (never overwritten by subprocess workflows).
 _RESEARCHED_MANIFEST_NAME = "manifest.researched.json"
+
+# GUI-generated events are written to a separate stream to avoid concurrent writes
+# with subprocess-owned logs (see top-level constraint re: events.jsonl).
+_RESEARCHED_EVENTS_JSONL = "researched_events.jsonl"
 
 
 def _find_repo_root(start: Path) -> Path | None:
@@ -367,6 +372,69 @@ def _touch(path: Path) -> None:
     except Exception:
         return
 
+def _write_controls_compat(run_dir: Path, updates: Dict[str, Any] | None = None, *, merge: bool = True) -> Any:
+    """
+    Call electrodrive.live.controls.write_controls across Electrodrive versions.
+
+    The upstream helper has evolved (some versions accept seq_increment, some do not).
+    This wrapper prefers a signature-aware call and falls back through a few common
+    call patterns so ResearchED stays compatible.
+    """
+    from electrodrive.live.controls import write_controls  # type: ignore
+
+    u: Dict[str, Any] = dict(updates or {})
+
+    # First try a signature-aware call.
+    try:
+        sig = inspect.signature(write_controls)
+        params = sig.parameters
+        args: list[Any] = [run_dir]
+        kwargs: Dict[str, Any] = {}
+
+        if "updates" in params:
+            kwargs["updates"] = u
+        else:
+            args.append(u)
+
+        if "merge" in params:
+            kwargs["merge"] = merge
+
+        # Only pass seq_increment if supported.
+        if "seq_increment" in params:
+            kwargs["seq_increment"] = True
+
+        return write_controls(*args, **kwargs)
+    except TypeError:
+        # Likely a signature mismatch; fall through to brute-force attempts below.
+        pass
+    except Exception:
+        # If inspection fails, also fall through.
+        pass
+
+    # Brute-force compatibility attempts (ordered from most to least specific).
+    attempts: list[tuple[tuple[Any, ...], Dict[str, Any]]] = [
+        ((run_dir,), {"updates": u, "merge": merge, "seq_increment": True}),
+        ((run_dir,), {"updates": u, "merge": merge}),
+        ((run_dir,), {"updates": u}),
+        ((run_dir, u), {"merge": merge, "seq_increment": True}),
+        ((run_dir, u), {"merge": merge}),
+        ((run_dir, u), {}),
+        ((run_dir,), {}),
+    ]
+    last: Exception | None = None
+    for args, kwargs in attempts:
+        try:
+            return write_controls(*args, **kwargs)
+        except TypeError as exc:
+            last = exc
+            continue
+        except Exception as exc:
+            last = exc
+            break
+    if last is not None:
+        raise last
+    # Should be unreachable.
+    return write_controls(run_dir, u)
 
 def _try_symlink(dst: Path, target_name: str) -> bool:
     """
@@ -630,6 +698,7 @@ def _write_manifest_minimal(
             "metrics_json": "metrics.json",
             "events_jsonl": "events.jsonl",
             "evidence_log_jsonl": "evidence_log.jsonl",
+            "researched_events_jsonl": _RESEARCHED_EVENTS_JSONL,
             "command_txt": "command.txt",
             "stdout_log": "stdout.log",
             "stderr_log": "stderr.log",
@@ -999,7 +1068,11 @@ def _ensure_metrics_json(out_dir: Path, workflow: str, *, run_status: str, retur
 
 
 def _append_event(out_dir: Path, *, level: str = "info", msg: str, **fields: Any) -> None:
-    """Append a single JSONL record to events.jsonl (best-effort)."""
+    """Append a single JSONL record to ResearchED's own JSONL stream (best-effort).
+
+    IMPORTANT: We intentionally do NOT append to events.jsonl, because the subprocess
+    workflows may also write there. Concurrent writers can corrupt JSONL lines.
+    """
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -1021,7 +1094,7 @@ def _append_event(out_dir: Path, *, level: str = "info", msg: str, **fields: Any
         else:
             rec[str(k)] = v
 
-    _append_jsonl_record(out_dir / "events.jsonl", rec)
+    _append_jsonl_record(out_dir / _RESEARCHED_EVENTS_JSONL, rec)
 
 
 def _ensure_report_html(out_dir: Path) -> None:
@@ -1243,13 +1316,12 @@ class RunManager:
         _touch(out_dir / "stdout.log")
         _touch(out_dir / "stderr.log")
         _touch(out_dir / "command.txt")
+        _touch(out_dir / _RESEARCHED_EVENTS_JSONL)
 
         # Ensure control.json exists early for control-aware workflows (FR-6).
         if wf.supports_controls:
             try:
-                from electrodrive.live.controls import write_controls  # type: ignore
-
-                write_controls(out_dir, {})
+                _write_controls_compat(out_dir, {})
             except Exception:
                 pass
 
@@ -1371,8 +1443,7 @@ class RunManager:
         # Primary path for control-aware workflows: cooperative terminate via control.json.
         if wf.supports_controls:
             try:
-                from electrodrive.live.controls import write_controls  # type: ignore
-                write_controls(rec.out_dir, updates={"terminate": True}, merge=True, seq_increment=True)
+                _write_controls_compat(rec.out_dir, {"terminate": True}, merge=True)
             except Exception:
                 pass
 
@@ -1462,9 +1533,7 @@ class RunManager:
                 safe_updates["snapshot"] = s if s else None
 
         try:
-            from electrodrive.live.controls import write_controls  # type: ignore
-
-            st = write_controls(rec.out_dir, updates=safe_updates, merge=True, seq_increment=True)
+            st = _write_controls_compat(rec.out_dir, safe_updates, merge=True)
             # FR-6: Control actions must be visible in the run's event stream.
             try:
                 _append_event(
@@ -1641,9 +1710,7 @@ class RunManager:
         # Ensure control.json exists for control-aware workflows (FR-6).
         if wf.supports_controls:
             try:
-                from electrodrive.live.controls import write_controls  # type: ignore
-
-                write_controls(out_dir, {})
+                _write_controls_compat(out_dir, {})
             except Exception:
                 pass
 
@@ -1996,3 +2063,4 @@ class RunManager:
             self._bridge_stops.pop(run_id, None)
             self._requests.pop(run_id, None)
             self._cancel_requested.discard(run_id)
+

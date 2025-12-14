@@ -16,6 +16,7 @@ at import time. Use get_api_router() to construct the router.
 import asyncio
 import difflib
 import json
+import inspect
 import os
 import platform
 import re
@@ -41,6 +42,9 @@ _PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # - We keep a ResearchED-owned copy so UI-required fields (started_at/status/inputs/outputs) are never lost.
 _RESEARCHED_MANIFEST_NAME = "manifest.researched.json"
 
+# GUI-generated events (kept separate to avoid concurrent writes with subprocess logs).
+_RESEARCHED_EVENTS_JSONL = "researched_events.jsonl"
+
 
 
 def _utc_iso_now() -> str:
@@ -55,6 +59,64 @@ def _utc_iso_from_epoch(ts: float) -> str:
         return _utc_iso_now()
 
 
+def _write_controls_compat(run_dir: Path, updates: Dict[str, Any] | None = None, *, merge: bool = True) -> Any:
+    """
+    Call electrodrive.live.controls.write_controls across Electrodrive versions.
+
+    Some repo versions accept `seq_increment`, others don't. This wrapper tries a
+    signature-aware call first, then falls back through common call patterns.
+    """
+    from electrodrive.live.controls import write_controls  # type: ignore
+
+    u: Dict[str, Any] = dict(updates or {})
+
+    # Signature-aware best effort.
+    try:
+        sig = inspect.signature(write_controls)
+        params = sig.parameters
+        args: list[Any] = [run_dir]
+        kwargs: Dict[str, Any] = {}
+
+        if "updates" in params:
+            kwargs["updates"] = u
+        else:
+            args.append(u)
+
+        if "merge" in params:
+            kwargs["merge"] = merge
+
+        if "seq_increment" in params:
+            kwargs["seq_increment"] = True
+
+        return write_controls(*args, **kwargs)
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+    # Brute-force fallbacks.
+    attempts: list[tuple[tuple[Any, ...], Dict[str, Any]]] = [
+        ((run_dir,), {"updates": u, "merge": merge, "seq_increment": True}),
+        ((run_dir,), {"updates": u, "merge": merge}),
+        ((run_dir,), {"updates": u}),
+        ((run_dir, u), {"merge": merge, "seq_increment": True}),
+        ((run_dir, u), {"merge": merge}),
+        ((run_dir, u), {}),
+        ((run_dir,), {}),
+    ]
+    last: Exception | None = None
+    for args, kwargs in attempts:
+        try:
+            return write_controls(*args, **kwargs)
+        except TypeError as exc:
+            last = exc
+            continue
+        except Exception as exc:
+            last = exc
+            break
+    if last is not None:
+        raise last
+    return write_controls(run_dir, u)
 def _presets_dir() -> Path:
     # FR-2: presets saved to disk.
     env = os.getenv("RESEARCHED_PRESETS_DIR", "").strip()
@@ -682,7 +744,10 @@ def _log_gui_event(run_dir: Path, action: str, payload: Mapping[str, Any]) -> No
     Design Doc FR-6 acceptance: "Control actions are logged into the run’s events stream".
 
     We avoid importing heavy logging utilities here; instead we append a JSONL record
-    directly to events.jsonl with best-effort cross-platform locking.
+    directly to researched_events.jsonl.
+
+    IMPORTANT: we do not write to events.jsonl, because the subprocess workflow
+    may also write there, which risks corrupting JSONL lines with concurrent appends.
     """
     try:
         # Ensure both filenames exist for downstream tailers.
@@ -695,7 +760,7 @@ def _log_gui_event(run_dir: Path, action: str, payload: Mapping[str, Any]) -> No
             "action": str(action),
             "payload": dict(payload),
         }
-        _append_jsonl_record(run_dir / "events.jsonl", rec)
+        _append_jsonl_record(run_dir / _RESEARCHED_EVENTS_JSONL, rec)
     except Exception:
         # Never propagate logging failures.
         return
@@ -1402,7 +1467,7 @@ def _maybe_parse_message_json(msg: Any) -> Optional[Dict[str, Any]]:
 
 
 def _compute_log_coverage(run_dir: Path, *, limit_per_file: int = 5000) -> Dict[str, Any]:
-    files = ["events.jsonl", "evidence_log.jsonl", "train_log.jsonl", "metrics.jsonl"]
+    files = ["events.jsonl", "evidence_log.jsonl", _RESEARCHED_EVENTS_JSONL, "train_log.jsonl", "metrics.jsonl"]
     present = [f for f in files if (run_dir / f).is_file()]
 
     total_parsed = 0
@@ -1970,9 +2035,7 @@ def get_api_router():
 
         # 1) Control-aware graceful terminate.
         try:
-            from electrodrive.live.controls import write_controls  # type: ignore
-
-            write_controls(run_dir, updates={"terminate": True}, merge=True, seq_increment=True)
+            _write_controls_compat(run_dir, {"terminate": True}, merge=True)
             _log_gui_event(run_dir, "terminate_requested", {"terminate": True})
         except Exception:
             pass
@@ -2212,9 +2275,7 @@ def get_api_router():
 
         # Protocol-correct write (atomic + seq/ts + merge) via repo helper.
         try:
-            from electrodrive.live.controls import write_controls  # type: ignore
-
-            st = write_controls(run_dir, updates=updates, merge=True, seq_increment=True)
+            st = _write_controls_compat(run_dir, updates, merge=True)
             control_dict = st.to_dict()
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"control_write_failed: {exc}")
@@ -2357,3 +2418,4 @@ def get_api_router():
         return {"ok": True, "run_id": run_id, "coverage": cov}
 
     return router
+

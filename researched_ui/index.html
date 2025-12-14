@@ -1,0 +1,18 @@
+<!-- FILE: researched_ui/index.html -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ResearchED</title>
+
+    <!--
+      Design Doc: §3.1–§3.2 (local web UI + Python backend over HTTP+WebSocket), FR-5 (live monitor plots/streams), FR-6 (run controls).
+      Repo: Bobtheotherone/Electrodrive (UI remains optional/non-invasive; backend serves built UI as static assets; APIs via /api and /ws).
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

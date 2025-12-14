@@ -827,7 +827,7 @@ class PlotService:
         dedup = _DedupCache(max_items=75_000)
 
         paths: List[Path] = []
-        for name in ("events.jsonl", "evidence_log.jsonl"):
+        for name in ("events.jsonl", "evidence_log.jsonl", "researched_events.jsonl"):
             p = run_dir / name
             if p.is_file():
                 paths.append(p)
@@ -1547,3 +1547,4 @@ class PlotService:
                         except Exception:
                             continue
         return None
+

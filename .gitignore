@@ -17,6 +17,10 @@ outdir/
 *.json
 *.tsv
 
+# --- ResearchED UI exceptions (must come AFTER *.json ignore) ---
+!researched_ui/package.json
+!researched_ui/tsconfig.json
+
 # Temporary / analysis artifacts
 repo_flatten.txt
 repo_flattened.txt
@@ -48,4 +52,3 @@ keops_gpu_test.py
 electrodrive/researched/**/__pycache__/
 electrodrive/researched/**/*.pyc
 electrodrive/researched/flattened_repo_with_contents.txt
-

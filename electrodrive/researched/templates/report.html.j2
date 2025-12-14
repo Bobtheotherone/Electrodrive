@@ -1,0 +1,164 @@
+{# electrodrive/researched/templates/report.html.j2 #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{{ title }} - {{ manifest.run_id or manifest.id or run_dir_name }}</title>
+  <style>{{ css }}</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div>
+        <h1 class="title">{{ title }}</h1>
+        <div class="subtitle">
+          Run: <span class="mono">{{ manifest.run_id or manifest.id or run_dir_name }}</span>
+          · Workflow: <span class="pill">{{ manifest.workflow or manifest.inputs.workflow or "unknown" }}</span>
+          · Status: <span class="pill status-{{ (manifest.status or "unknown")|lower }}">{{ manifest.status or "unknown" }}</span>
+        </div>
+      </div>
+      <div class="meta">
+        Generated: <span class="mono">{{ generated_at }}</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Run summary</h2>
+      <div class="grid2">
+        <div><b>run_id</b>: <span class="mono">{{ manifest.run_id or manifest.id or "" }}</span></div>
+        <div><b>workflow</b>: <span class="mono">{{ manifest.workflow or "unknown" }}</span></div>
+        <div><b>status</b>: <span class="mono">{{ manifest.status or "" }}</span></div>
+        <div><b>started_at</b>: <span class="mono">{{ manifest.started_at or "" }}</span></div>
+        <div><b>ended_at</b>: <span class="mono">{{ manifest.ended_at or "" }}</span></div>
+        <div><b>manifest</b>: <span class="mono">{{ manifest_file or "" }}</span></div>
+      </div>
+
+      {% if manifest.git %}
+      <h3>Git</h3>
+      <div class="grid2">
+        <div><b>sha</b>: <span class="mono">{{ manifest.git.sha }}</span></div>
+        <div><b>branch</b>: <span class="mono">{{ manifest.git.branch }}</span></div>
+        <div><b>dirty</b>: <span class="mono">{{ manifest.git.dirty }}</span></div>
+        <div><b>diff_summary</b>: <span class="mono">{{ manifest.git.diff_summary }}</span></div>
+      </div>
+      {% endif %}
+
+      {% if manifest.env %}
+      <h3>Environment</h3>
+      <div class="grid2">
+        <div><b>host</b>: <span class="mono">{{ manifest.env.host }}</span></div>
+        <div><b>device</b>: <span class="mono">{{ manifest.env.device }}</span></div>
+        <div><b>dtype</b>: <span class="mono">{{ manifest.env.dtype }}</span></div>
+        <div><b>torch</b>: <span class="mono">{{ manifest.env.torch_version }}</span></div>
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Links</h2>
+      <ul class="links">
+        <li><a href="command.txt">command.txt</a></li>
+        <li><a href="manifest.researched.json">manifest.researched.json</a></li>
+        <li><a href="manifest.json">manifest.json</a></li>
+        <li><a href="metrics.json">metrics.json</a></li>
+        <li><a href="events.jsonl">events.jsonl</a></li>
+        <li><a href="evidence_log.jsonl">evidence_log.jsonl</a></li>
+        <li><a href="stdout.log">stdout.log</a></li>
+      </ul>
+    </section>
+
+    {% if warnings and warnings|length > 0 %}
+    <section class="card warn">
+      <h2>Warnings</h2>
+      <ul class="warnings">
+        {% for w in warnings %}
+        <li>{{ w }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>Key plots</h2>
+      <div class="plotgrid">
+        {% for p in plots %}
+          {% if p.path and p.path.lower().endswith(".png") %}
+          <figure class="plot">
+            <img src="plots/{{ p.path }}" alt="{{ p.path }}"/>
+            <figcaption class="mono">{{ p.path }}</figcaption>
+          </figure>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </section>
+
+    {% if viz_frames and viz_frames|length > 0 %}
+    <section class="card">
+      <h2>Visualization frames</h2>
+      <p class="hint">Showing up to 60 frames (sorted). Frames are referenced as relative paths under <span class="mono">viz/</span> for portability.</p>
+      <div class="vizgrid">
+        {% for fn in viz_frames[:60] %}
+          <img class="vizframe" src="viz/{{ fn }}" alt="{{ fn }}"/>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>Gate dashboard</h2>
+      <div class="grid2">
+        <div><b>Gate2</b>: <span class="pill">{{ gate_dashboard.gate2_status or "n/a" }}</span></div>
+        <div><b>structure_score</b>: <span class="mono">{{ gate_dashboard.structure_score }}</span></div>
+        <div><b>Gate3</b>: <span class="pill">{{ gate_dashboard.gate3_status or "n/a" }}</span></div>
+        <div><b>novelty_score</b>: <span class="mono">{{ gate_dashboard.novelty_score }}</span></div>
+      </div>
+      <div class="plotgrid">
+        <figure class="plot">
+          <img src="plots/gate_dashboard.png" alt="gate_dashboard.png"/>
+          <figcaption class="mono">gate_dashboard.png</figcaption>
+        </figure>
+        <figure class="plot">
+          <img src="plots/log_coverage.png" alt="log_coverage.png"/>
+          <figcaption class="mono">log_coverage.png (FR-9.6)</figcaption>
+        </figure>
+      </div>
+      <p class="hint">The structured dashboard JSON is stored at <a href="plots/gate_dashboard.json" class="mono">plots/gate_dashboard.json</a>.</p>
+    </section>
+
+    <section class="card">
+      <h2>Log coverage (FR-9.6)</h2>
+      <p class="hint">This section summarizes how logs were ingested/normalized (event field source, residual variants, and which log files were ingested).</p>
+      <pre class="code">{{ coverage | tojson(indent=2, sort_keys=True) }}</pre>
+    </section>
+
+    <section class="card">
+      <h2>Artifacts</h2>
+      <div class="grid2">
+        <div>
+          <h3>artifacts/</h3>
+          <ul class="files">
+            {% for a in artifacts %}
+              <li><a href="artifacts/{{ a.path }}">{{ a.path }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+        <div>
+          <h3>plots/</h3>
+          <ul class="files">
+            {% for p in plots %}
+              <li><a href="plots/{{ p.path }}">{{ p.path }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>ResearchED report · portable relative paths · generated {{ generated_at }}</div>
+  </footer>
+</body>
+</html>

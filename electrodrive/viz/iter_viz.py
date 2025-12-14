@@ -76,6 +76,19 @@ def _scientific(v: Optional[float]) -> str:
         return "nan"
 
 
+def _first_present(rec: Dict[str, Any], keys) -> Any:
+    for k in keys:
+        if k in rec:
+            v = rec.get(k)
+            if v is not None:
+                return v
+    return None
+
+
+def _event_name(rec: Dict[str, Any]) -> str:
+    return str(rec.get("event") or rec.get("msg") or rec.get("message") or "")
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """
     Atomic write helper (best-effort).
@@ -134,22 +147,18 @@ def _parse_iter_event(rec: Dict[str, Any]) -> Optional[IterSample]:
     """
     Extract IterSample from a single JSONL record, if it looks like a GMRES iteration.
     """
-    msg = str(rec.get("event", "")).lower()
-
-    # Two event styles we care about:
-    # - "GMRES iter." from bem_solve callback (iter/resid + context)
-    # - "GMRES progress." from gmres_restart
-    if "gmres iter." in msg:
-        i = rec.get("iter", rec.get("iters"))
-        r = rec.get("resid")
-    elif "gmres progress." in msg:
-        i = rec.get("iters", rec.get("iter"))
-        r = rec.get("resid")
-    else:
+    msg = _event_name(rec).lower()
+    if msg and "gmres" not in msg:
         return None
 
-    i_f = _safe_float(i)
-    r_f = _safe_float(r)
+    i_raw = _first_present(rec, ("iter", "iters", "step", "k"))
+    r_raw = _first_present(
+        rec,
+        ("resid", "resid_true", "resid_precond", "resid_true_l2", "resid_precond_l2"),
+    )
+
+    i_f = _safe_float(i_raw)
+    r_f = _safe_float(r_raw)
     if i_f is None or r_f is None:
         return None
 
@@ -356,11 +365,13 @@ def overlay_metrics_on_frames(out_dir: Path, logger: JsonlLogger) -> None:
         if not viz_dir.is_dir():
             return
 
+        events_path = out_dir / "events.jsonl"
         evidence_path = out_dir / "evidence_log.jsonl"
+        log_path = events_path if events_path.is_file() else evidence_path
         metrics_path = out_dir / "metrics.json"
 
         offset_path = viz_dir / ".overlay_offset"
-        samples, new_offset = _read_evidence_incremental(evidence_path, offset_path)
+        samples, new_offset = _read_evidence_incremental(log_path, offset_path)
         if new_offset and new_offset != 0:
             try:
                 offset_path.write_text(str(new_offset), encoding="utf-8")
@@ -369,10 +380,10 @@ def overlay_metrics_on_frames(out_dir: Path, logger: JsonlLogger) -> None:
 
         # Even if no new samples from incremental read, we want last-known values
         # so we may parse whole file once if needed.
-        if not samples and evidence_path.is_file():
+        if not samples and log_path.is_file():
             # Best-effort full scan in fallback mode
             try:
-                with evidence_path.open("r", encoding="utf-8") as f:
+                with log_path.open("r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if not line:

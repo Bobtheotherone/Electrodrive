@@ -630,6 +630,7 @@ def _write_manifest_minimal(
             "metrics_json": "metrics.json",
             "events_jsonl": "events.jsonl",
             "evidence_log_jsonl": "evidence_log.jsonl",
+            "command_txt": "command.txt",
             "stdout_log": "stdout.log",
             "stderr_log": "stderr.log",
             # Optional; will exist for solve when viz is enabled.

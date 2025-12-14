@@ -378,6 +378,30 @@ def _detect_rotation_or_truncation(state: TailState) -> None:
         state.offset = 0
 
 
+def _first_present(obj: Dict[str, object], keys) -> object:
+    for k in keys:
+        if k in obj:
+            v = obj.get(k)
+            if v is not None:
+                return v
+    return None
+
+
+def _event_name(obj: Dict[str, object]) -> str:
+    return str(obj.get("event") or obj.get("msg") or obj.get("message") or "")
+
+
+def _safe_float(v: object) -> Optional[float]:
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str) and v.strip():
+            return float(v.strip())
+    except Exception:
+        return None
+    return None
+
+
 def _parse_progress_line(obj: Dict[str, object]) -> Optional[Tuple[int, float]]:
     """
     Extract (iter, resid) from a JSON object if it looks like GMRES progress.
@@ -385,18 +409,24 @@ def _parse_progress_line(obj: Dict[str, object]) -> Optional[Tuple[int, float]]:
     if not isinstance(obj, dict):
         return None
 
-    # Prefer explicit keys from bem_solver GMRES logs.
-    it = obj.get("iter")
-    if isinstance(it, (int, float)):
-        resid = obj.get("resid")
-        if isinstance(resid, (int, float)):
-            return int(it), float(resid)
+    msg = _event_name(obj).lower()
+    if msg and "gmres" not in msg:
+        return None
 
-    # Fallback: "GMRES progress." schema (iters / resid).
-    it2 = obj.get("iters")
-    resid2 = obj.get("resid")
-    if isinstance(it2, (int, float)) and isinstance(resid2, (int, float)):
-        return int(it2), float(resid2)
+    it_raw = _first_present(obj, ("iter", "iters", "step", "k"))
+    resid_raw = _first_present(
+        obj,
+        ("resid", "resid_true", "resid_precond", "resid_true_l2", "resid_precond_l2"),
+    )
+    it_val = _safe_float(it_raw)
+    resid_val = _safe_float(resid_raw)
+    if it_val is None or resid_val is None:
+        return None
+
+    try:
+        return int(it_val), float(resid_val)
+    except Exception:
+        return None
 
     return None
 
@@ -667,7 +697,9 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
         print(f"[live] Invalid run dir: {run_path}", file=sys.stderr)
         return 1
 
-    log_path = run_path / "evidence_log.jsonl"
+    events_log = run_path / "events.jsonl"
+    evidence_log = run_path / "evidence_log.jsonl"
+    log_path = events_log if events_log.exists() else evidence_log
     tail = TailState(path=log_path)
     win = ResidualWindow.create(maxlen=max(10, int(window) if window > 0 else 200))
     ctrl = ControlWriter(run_path, min_interval=0.1)
@@ -701,6 +733,14 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
 
             # GPU sync (best-effort)
             _maybe_cuda_sync()
+
+            preferred_log = events_log if events_log.exists() else evidence_log
+            if preferred_log != tail.path:
+                tail.close()
+                tail.path = preferred_log
+                tail.inode = None
+                tail.offset = 0
+            log_path = tail.path
 
             # Tail log for new residuals
             _tail_jsonl(tail, win)

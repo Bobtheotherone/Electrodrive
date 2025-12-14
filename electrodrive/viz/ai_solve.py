@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from PIL import Image, ImageDraw, ImageFont  # type: ignore
@@ -25,6 +25,52 @@ try:
     _HAVE_PIL = True
 except Exception:  # pragma: no cover
     _HAVE_PIL = False
+
+
+def _first_present(rec: Dict[str, Any], keys) -> Any:
+    for k in keys:
+        if k in rec:
+            v = rec.get(k)
+            if v is not None:
+                return v
+    return None
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str) and v.strip():
+            return float(v.strip())
+    except Exception:
+        return None
+    return None
+
+
+def _event_name(rec: Dict[str, Any]) -> str:
+    return str(rec.get("event") or rec.get("msg") or rec.get("message") or "")
+
+
+def _iter_value(rec: Dict[str, Any]) -> Optional[int]:
+    raw = _first_present(rec, ("iter", "iters", "step", "k"))
+    val = _safe_float(raw)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except Exception:
+        return None
+
+
+def _resid_value(rec: Dict[str, Any]) -> Optional[float]:
+    raw = _first_present(
+        rec,
+        ("resid", "resid_true", "resid_precond", "resid_true_l2", "resid_precond_l2"),
+    )
+    val = _safe_float(raw)
+    if val is None:
+        return None
+    return float(val)
 
 
 def _load_metrics(out_dir: Path) -> Dict[str, Any]:
@@ -75,25 +121,17 @@ def _extract_solver_trace(
     res: List[float] = []
     tile_info: Dict[str, Any] = {}
     for ev in events:
-        msg = str(ev.get("event", "")).lower()
-        # GMRES iteration events from bem_solve callback.
-        if "gmres iter." in msg:
-            i = ev.get("iter")
-            r = ev.get("resid")
-            if isinstance(i, (int, float)) and isinstance(r, (int, float)):
-                iters.append(int(i))
-                res.append(float(r))
-            # Capture tiling context (last seen wins).
-            for key in ("tile_size", "pass_index", "cycle", "restart"):
-                if key in ev:
-                    tile_info[key] = ev[key]
-        # Fallback: older progress events.
-        elif "gmres progress." in msg:
-            i = ev.get("iters")
-            r = ev.get("resid")
-            if isinstance(i, (int, float)) and isinstance(r, (int, float)):
-                iters.append(int(i))
-                res.append(float(r))
+        msg = _event_name(ev).lower()
+        if "gmres" in msg and ("iter" in msg or "progress" in msg):
+            i = _iter_value(ev)
+            r = _resid_value(ev)
+            if i is not None and r is not None:
+                iters.append(i)
+                res.append(r)
+                # Capture tiling context (last seen wins).
+                for key in ("tile_size", "pass_index", "cycle", "restart"):
+                    if key in ev:
+                        tile_info[key] = ev[key]
     return iters, res, tile_info
 
 

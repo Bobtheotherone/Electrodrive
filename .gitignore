@@ -43,3 +43,9 @@ temp_AI_upgrade/
 AGENTS.md
 keops_gpu_test.py
 .keops_cache/
+
+# ResearchED generated artifacts
+electrodrive/researched/**/__pycache__/
+electrodrive/researched/**/*.pyc
+electrodrive/researched/flattened_repo_with_contents.txt
+

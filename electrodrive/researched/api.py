@@ -2041,25 +2041,7 @@ def get_api_router():
 
         return {"ok": True, "run_id": run_id, "tracked": True, "force": bool(force)}
 
-    @router.get("/runs/{run_id}/artifacts")
-    def list_artifacts(
-        run_id: str,
-        request: Request,
-        recursive: bool = Query(False, description="Recurse into subdirectories."),
-    ) -> List[Dict[str, Any]]:
-        runs_root = Path(getattr(request.app.state, "runs_root", "runs"))
-        run_dir = _resolve_run_dir(runs_root, run_id)
-        if run_dir is None:
-            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
-        return _list_artifacts(run_dir, recursive=bool(recursive))
-
-    @router.get("/runs/{run_id}/artifacts/{relpath:path}")
-    def get_artifact(run_id: str, relpath: str, request: Request):
-        runs_root = Path(getattr(request.app.state, "runs_root", "runs"))
-        run_dir = _resolve_run_dir(runs_root, run_id)
-        if run_dir is None:
-            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
-
+    def _serve_artifact(run_dir: Path, relpath: str):
         if not _safe_relpath(relpath):
             raise HTTPException(status_code=400, detail="invalid relpath")
 
@@ -2076,8 +2058,39 @@ def get_api_router():
         if not target.is_file():
             raise HTTPException(status_code=404, detail="file not found")
 
-        # Let FileResponse handle range requests efficiently.
         return FileResponse(str(target), filename=target.name)
+
+    @router.get("/runs/{run_id}/artifacts")
+    def list_artifacts(
+        run_id: str,
+        request: Request,
+        recursive: bool = Query(False, description="Recurse into subdirectories."),
+    ) -> List[Dict[str, Any]]:
+        runs_root = Path(getattr(request.app.state, "runs_root", "runs"))
+        run_dir = _resolve_run_dir(runs_root, run_id)
+        if run_dir is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        return _list_artifacts(run_dir, recursive=bool(recursive))
+
+    @router.get("/runs/{run_id}/artifact")
+    def get_artifact_query(
+        run_id: str,
+        request: Request,
+        relpath: str = Query(..., alias="path", description="Relative path within the run directory."),
+    ):
+        runs_root = Path(getattr(request.app.state, "runs_root", "runs"))
+        run_dir = _resolve_run_dir(runs_root, run_id)
+        if run_dir is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        return _serve_artifact(run_dir, relpath)
+
+    @router.get("/runs/{run_id}/artifacts/{relpath:path}")
+    def get_artifact(run_id: str, relpath: str, request: Request):
+        runs_root = Path(getattr(request.app.state, "runs_root", "runs"))
+        run_dir = _resolve_run_dir(runs_root, run_id)
+        if run_dir is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        return _serve_artifact(run_dir, relpath)
 
     # ------------------------------------------------------------------
     # Controls (FR-6)

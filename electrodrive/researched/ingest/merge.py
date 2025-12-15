@@ -225,3 +225,72 @@ def merge_streams(
     except Exception:
         pass
     return out
+
+
+def _safe_jsonl_iter(path: Path) -> List[Dict[str, Any]]:
+    """Robust JSONL reader used by merge_event_files; never raises."""
+    rows: List[Dict[str, Any]] = []
+    try:
+        if not path or not path.is_file():
+            return rows
+    except Exception:
+        return rows
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = (line or "").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+    except Exception:
+        return rows
+    return rows
+
+
+def merge_event_files(
+    *,
+    events_path: Path | str | None,
+    evidence_path: Path | str | None = None,
+    normalizer: Optional[Callable[..., NormalizedEvent]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Merge + deduplicate events across events.jsonl and evidence_log.jsonl.
+
+    Returns normalized dicts sorted by timestamp (ascending). Designed for
+    deterministic QC tests and ingestion tooling.
+    """
+    paths: List[Path] = []
+    for p in (events_path, evidence_path):
+        if p is None:
+            continue
+        try:
+            pp = Path(p)
+            if pp not in paths:
+                paths.append(pp)
+        except Exception:
+            continue
+
+    batch: List[Tuple[Path, Dict[str, Any]]] = []
+    for p in paths:
+        for rec in _safe_jsonl_iter(p):
+            batch.append((p, rec))
+
+    merged = merge_streams(batch, normalizer=normalizer)
+    out: List[Dict[str, Any]] = []
+    for ev in merged:
+        try:
+            if hasattr(ev, "as_dict"):
+                out.append(ev.as_dict())  # type: ignore[call-arg]
+            else:
+                out.append(dict(ev))  # type: ignore[arg-type]
+        except Exception:
+            try:
+                out.append({"event": getattr(ev, "event", "(unknown)")})
+            except Exception:
+                out.append({})
+    return out

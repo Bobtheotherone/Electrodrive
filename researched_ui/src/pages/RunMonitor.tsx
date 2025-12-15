@@ -535,6 +535,7 @@ export default function RunMonitor() {
     const idx = clamp(frameIndex, 0, frames.length - 1);
     return frames[idx];
   }, [frames, frameIndex]);
+  const latestFrameIndex = latestFrame?.index;
 
   const refreshManifest = async (signal?: AbortSignal) => {
     if (!id) return;
@@ -1035,7 +1036,7 @@ export default function RunMonitor() {
 
         <div style={{ display: "flex", gap: 10, alignItems: "end", flexWrap: "wrap", marginTop: 10 }}>
           <label style={{ display: "grid", gap: 6 }}>
-            <div style={{ fontSize: 12, color: "#6b7280" }}>write_every (>=1; empty clears)</div>
+            <div style={{ fontSize: 12, color: "#6b7280" }}>write_every (&gt;=1; empty clears)</div>
             <input
               value={writeEveryStr}
               onChange={(e) => setWriteEveryStr(e.target.value)}
@@ -1093,7 +1094,7 @@ export default function RunMonitor() {
             <div>
               <div style={{ fontWeight: 700 }}>Frames (FR-5)</div>
               <div style={{ fontSize: 12, color: "#6b7280" }}>
-                Streams <code>viz/*.png</code> as bytes via WS (repo: electrodrive/researched/ws.py /runs/{`{run_id}`}/frames).
+                Streams <code>viz/*.png</code> as bytes via WS (repo: electrodrive/researched/ws.py /runs/{"{run_id}"}/frames).
               </div>
             </div>
             <div style={{ fontSize: 12, color: "#6b7280" }}>
@@ -1115,7 +1116,8 @@ export default function RunMonitor() {
               </label>
 
               <div style={{ fontSize: 12, color: "#6b7280" }}>
-                Showing: <b>{latestFrame?.name ?? "—"}</b> {latestFrame?.index >= 0 ? `(index ${latestFrame.index})` : ""}{" "}
+                Showing: <b>{latestFrame?.name ?? "—"}</b>{" "}
+                {latestFrameIndex !== undefined && latestFrameIndex !== null && latestFrameIndex >= 0 ? `(index ${latestFrameIndex})` : ""}{" "}
                 {latestFrame?.mtime ? `mtime=${latestFrame.mtime.toFixed(2)}` : ""}
               </div>
 
@@ -1219,7 +1221,7 @@ export default function RunMonitor() {
             <div>
               <div style={{ fontWeight: 700 }}>Raw stdout/stderr (FR-5)</div>
               <div style={{ fontSize: 12, color: "#6b7280" }}>
-                Repo provides WS <code>/ws/runs/{`{run_id}`}/stdout</code> and <code>/ws/runs/{`{run_id}`}/stderr</code> (electrodrive/researched/ws.py).
+                Repo provides WS <code>/ws/runs/{"{run_id}"}/stdout</code> and <code>/ws/runs/{"{run_id}"}/stderr</code> (electrodrive/researched/ws.py).
               </div>
             </div>
             <div style={{ fontSize: 12, color: "#6b7280" }}>

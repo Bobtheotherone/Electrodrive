@@ -19,6 +19,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from electrodrive.utils.log_normalize import iter_merged_events
+
 try:
     from PIL import Image, ImageDraw, ImageFont  # type: ignore
 
@@ -88,30 +90,7 @@ def _load_metrics(out_dir: Path) -> Dict[str, Any]:
 
 
 def _load_events(out_dir: Path) -> List[Dict[str, Any]]:
-    # Prefer events.jsonl (PR-1A); fall back to legacy evidence_log.jsonl.
-    ev_path = out_dir / "events.jsonl"
-    if not ev_path.is_file():
-        alt = out_dir / "evidence_log.jsonl"
-        if alt.is_file():
-            ev_path = alt
-        else:
-            return []
-    events: List[Dict[str, Any]] = []
-    try:
-        with ev_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    if isinstance(rec, dict):
-                        events.append(rec)
-                except Exception:
-                    continue
-    except Exception:
-        return []
-    return events
+    return list(iter_merged_events(out_dir))
 
 
 def _extract_solver_trace(

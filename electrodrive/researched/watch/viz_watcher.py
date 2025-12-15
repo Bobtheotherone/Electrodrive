@@ -334,6 +334,21 @@ class VizWatcher:
                 return None
             return self._timeline[-1]
 
+    def latest_frame_path(self) -> Optional[Path]:
+        """
+        Convenience accessor for QC tests: return latest frame path or None.
+        """
+        latest = self.latest()
+        return latest.path if latest else None
+
+    def scan_once(self) -> None:
+        """
+        Synchronous single scan (test-friendly; no background thread required).
+        """
+        self._scan(emit_events=False)
+        with self._lock:
+            self._initialized = True
+
     def drain_events(self, max_n: int = 100) -> List[VizEvent]:
         """
         Drain up to max_n queued events (FIFO order).

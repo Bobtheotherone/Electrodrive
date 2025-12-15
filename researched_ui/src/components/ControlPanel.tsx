@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // Source notes:
 // - Design Doc: FR-6 (control panel: pause/resume/terminate/write_every/snapshot-token; snapshot must be unique string token, not boolean), FR-5 (live monitor UI includes control panel).

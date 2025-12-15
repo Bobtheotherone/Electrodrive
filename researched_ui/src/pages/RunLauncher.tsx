@@ -165,7 +165,7 @@ function describeWorkflowInput(workflow: Workflow): { label: string; placeholder
   return { label: "Spec path", placeholder: "e.g. specs/plane_point.json", keyHint: "spec_path" };
 }
 
-function buildExplainPanel(workflow: Workflow, specPath: string, requestOverrides: unknown, extraArgs: string[]): { cmd: string; env: Record<string, string> } {
+function buildExplainPanel(workflow: Workflow, specPath: string, extraArgs: string[]): { cmd: string; env: Record<string, string> } {
   // This is a best-effort "Explain" panel (FR-2) aligned to repo workflows:
   // - solve: electrodrive/researched/workflows/solve.py builds: python -m electrodrive.cli solve ... --out OUT
   // - images_discover: electrodrive/researched/workflows/images_discover.py builds: python -m electrodrive.tools.images_discover discover --spec ... --out OUT
@@ -257,7 +257,7 @@ export default function RunLauncher() {
 
   const inputDesc = useMemo(() => describeWorkflowInput(workflow), [workflow]);
 
-  const explain = useMemo(() => buildExplainPanel(workflow, specPath, requestOverrides, extraArgs), [workflow, specPath, requestOverrides, extraArgs]);
+  const explain = useMemo(() => buildExplainPanel(workflow, specPath, extraArgs), [workflow, specPath, extraArgs]);
 
   const validationError = useMemo(() => {
     // FR-2: validation guardrails before launch.

@@ -406,12 +406,6 @@ function looksLikeGmresProgress(rec: CanonicalLogRecord): boolean {
   return msg.includes("gmres") && (msg.includes("iter") || msg.includes("progress"));
 }
 
-function findArtifact(artifacts: ArtifactSummary[] | undefined, relPath: string): ArtifactSummary | undefined {
-  const target = normRelPath(relPath);
-  if (!target) return undefined;
-  return (artifacts || []).find((a) => normRelPath(a.path) === target);
-}
-
 function findAnyArtifact(
   artifacts: ArtifactSummary[] | undefined,
   relPaths: Array<string | null | undefined>,

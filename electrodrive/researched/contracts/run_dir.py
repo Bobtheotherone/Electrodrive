@@ -22,6 +22,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
+import uuid
 
 from .manifest_schema import (
     MANIFEST_JSON_NAME,
@@ -577,3 +578,63 @@ def finalize_run(
     # Write both manifests (terminal=True merges into manifest.json).
     _write_manifest_pair(rd, dict(manifest_out), terminal=True)
     return dict(manifest_out)
+
+
+# ----------------------------
+# Thin compatibility helpers
+# ----------------------------
+
+def create_run_dir(
+    *,
+    runs_root: Path | str,
+    workflow: str,
+    inputs: Mapping[str, Any] | None = None,
+    command: Sequence[str] | None = None,
+) -> Path:
+    """
+    Compatibility wrapper used by QC tests: create a new run dir and initialize the contract.
+    """
+    root = Path(runs_root).expanduser()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    run_id = ""
+    try:
+        if isinstance(inputs, Mapping):
+            cand = inputs.get("run_id") or inputs.get("id")
+            if isinstance(cand, str) and cand.strip():
+                run_id = cand.strip()
+    except Exception:
+        run_id = ""
+    if not run_id:
+        run_id = str(uuid.uuid4())
+
+    run_dir = root / run_id
+    argv = list(command or [])
+    if not argv:
+        argv = ["python", "-c", "print('researched')"]
+    init_run(
+        run_dir,
+        workflow=str(workflow),
+        argv=argv,
+        inputs=dict(inputs or {}),
+        repo_root=None,
+        env={},
+        git={},
+    )
+    return run_dir
+
+
+def init_run_dir(
+    *,
+    runs_root: Path | str,
+    workflow: str,
+    inputs: Mapping[str, Any] | None = None,
+    command: Sequence[str] | None = None,
+) -> Path:
+    """
+    Alias for create_run_dir; provided for API flexibility in QC tests.
+    """
+    return create_run_dir(runs_root=runs_root, workflow=workflow, inputs=inputs, command=command)

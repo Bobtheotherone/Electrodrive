@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // Source notes:
 // - Design Doc: FR-5 (live visualization frame viewer), FR-3 (run-dir artifacts: viz/*.png).

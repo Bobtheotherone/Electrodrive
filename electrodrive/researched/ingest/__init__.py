@@ -15,7 +15,7 @@ This package is deliberately stdlib-only and defensive: public functions should 
 
 from .learn_message_json import extract_event_from_message_json, try_parse_message_json
 from .log_coverage import LogCoverage
-from .merge import DedupCache, dedup_key, merge_streams, stable_hash_fields
+from .merge import DedupCache, dedup_key, merge_event_files, merge_streams, stable_hash_fields
 from .normalizer import NormalizedEvent, normalize_record, parse_ts_to_epoch_seconds
 from .tailer import JsonlTailer
 
@@ -34,6 +34,7 @@ __all__ = [
     "dedup_key",
     "DedupCache",
     "merge_streams",
+    "merge_event_files",
     # coverage
     "LogCoverage",
 ]

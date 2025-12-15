@@ -11,14 +11,12 @@ import { Link, useSearchParams } from "react-router-dom";
  * - FR-4: Defensive log normalization when sampling logs (event/msg/message; iter/resid variants; events.jsonl + evidence_log.jsonl).
  *
  * Repo anchors inspected (to align UI behavior with Electrodrive reality):
- * - electrodrive/utils/logging.py: JsonlLogger writes events.jsonl with fields ts/level/msg (not necessarily “event”). :contentReference[oaicite:0]{index=0}
- * - electrodrive/viz/live_console.py: legacy tooling tails evidence_log.jsonl and uses event/msg/message + iter/resid variants. :contentReference[oaicite:1]{index=1}
- * - electrodrive/tools/images_discover.py: images_discover writes discovered_system.json and discovery_manifest.json. :contentReference[oaicite:2]{index=2}
- * - electrodrive/cli.py: solve runs write manifest.json (shape differs from unified v1; tolerate missing fields). :contentReference[oaicite:3]{index=3}
- * - electrodrive/images/io.py: discovered_system.json format contains {metadata, system_metadata, images:[{type,params,group_info?,weight}]}. :contentReference[oaicite:4]{index=4}
- * - electrodrive/images/basis.py: group_info serialization includes family_name, conductor_id, motif_index, family (ints coerced). :contentReference[oaicite:5]{index=5}
- * - electrodrive/researched/plot_service.py: PlotService can generate plots/basis_scatter.png, plots/family_mass.png,
- *   plots/gate_dashboard.json, plots/gate_dashboard.png, plots/log_coverage.png (FR-9.1/FR-9.5/FR-9.6). :contentReference[oaicite:6]{index=6}
+ * - JsonlLogger writes events.jsonl with fields ts/level/msg (not necessarily “event”).
+ * - Legacy live console tails evidence_log.jsonl and uses event/msg/message + iter/resid variants.
+ * - images_discover writes discovered_system.json and discovery_manifest.json.
+ * - solve runs write manifest.json; formats may vary so tolerate missing fields.
+ * - discovered_system.json contains metadata/system_metadata/images entries with optional group_info.
+ * - PlotService can generate basis and gate dashboards (plots/basis_scatter.png, plots/family_mass.png, plots/gate_dashboard.json/png, plots/log_coverage.png).
  */
 
 /* ------------------------------- Types (local) ------------------------------ */
@@ -90,7 +88,7 @@ type DiscoveredSystem = {
 };
 
 type GateDashboard = {
-  // plot_service.py writes plots/gate_dashboard.json (FR-9.5) and includes log_coverage (FR-9.6). :contentReference[oaicite:7]{index=7}
+// plot_service.py writes plots/gate_dashboard.json (FR-9.5) and includes log_coverage (FR-9.6).
   run_id?: string;
   workflow?: string;
   gate2_status?: string;
@@ -582,7 +580,7 @@ function MultiLineChart(props: {
       <AxisLabel x={pad.l - 10} y={pad.t + 8} text={props.yLabel ?? "y"} anchor="end" />
 
       {/* series */}
-      {props.series.map((s, si) => {
+      {props.series.map((s) => {
         const pts = s.points.filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
         if (pts.length < 2) return null;
         const d = pts
@@ -699,7 +697,7 @@ function sampleJsonlCoverage(text: string, maxLines: number): CoverageComputed {
   }
 
   if (counts.msg > 0 && counts.event === 0) {
-    // Repo truth: JsonlLogger uses msg (electrodrive/utils/logging.py) :contentReference[oaicite:8]{index=8}
+  // Repo truth: JsonlLogger uses msg (electrodrive/utils/logging.py)
     warnings.push("Logs use 'msg' as label (not 'event'); older parsers that require 'event' will miss events (FR-9.6).");
   }
   if (!residualDetected.has("resid") && (residualDetected.has("resid_precond") || residualDetected.has("resid_true"))) {
@@ -1105,7 +1103,7 @@ function computeBasisPlotsFromDiscoveredSystem(sys: DiscoveredSystem): {
   familyMass: Array<{ family: string; mass: number; count: number }>;
   warnings: string[];
 } {
-  // FR-9.1 acceptance: from discovered_system.json alone (Design Doc FR-9.1). Repo format: images[].weight + group_info + params (io.py). :contentReference[oaicite:9]{index=9}
+// FR-9.1 acceptance: from discovered_system.json alone (Design Doc FR-9.1). Repo format: images[].weight + group_info + params (io.py).
   const images = Array.isArray(sys.images) ? sys.images : [];
   const warnings: string[] = [];
 
@@ -1179,7 +1177,7 @@ function extractGateScores(manifest?: ManifestV1 | null, gateDashboard?: GateDas
       novelty_score: safeNumber((g as any).novelty_score),
     };
   }
-  // images_discover discovery_manifest.json has gate*_status fields but may not include scores (repo: images_discover.py). :contentReference[oaicite:11]{index=11}
+// images_discover discovery_manifest.json has gate*_status fields but may not include scores (repo: images_discover.py).
   if (discoveryManifest && typeof discoveryManifest === "object") {
     const dm = discoveryManifest as any;
     return {
@@ -1399,7 +1397,7 @@ export default function Upgrades() {
       }
 
       if (activeTab === "gates" || activeTab === "audit") {
-        // Prefer PlotService outputs under plots/ (repo: electrodrive/researched/plot_service.py). :contentReference[oaicite:12]{index=12}
+        // Prefer PlotService outputs under plots/ (repo: electrodrive/researched/plot_service.py).
         if (has("plots/gate_dashboard.json")) void needJson<GateDashboard>(runId, "plots/gate_dashboard.json");
         if (has("discovery_manifest.json")) void needJson<JsonObject>(runId, "discovery_manifest.json");
       }
@@ -1488,7 +1486,7 @@ export default function Upgrades() {
   }, [selectedRuns, trendRuns]);
 
   const panelAudit = useMemo(() => {
-    // Prefer PlotService coverage if available (plots/gate_dashboard.json includes log_coverage). :contentReference[oaicite:13]{index=13}
+    // Prefer PlotService coverage if available (plots/gate_dashboard.json includes log_coverage).
     const perRun: Record<string, { best?: CoverageComputed; from: string; raw?: GateDashboard["log_coverage"] | null }> = {};
 
     for (const r of selectedRuns) {
@@ -1787,7 +1785,7 @@ export default function Upgrades() {
                         <div style={{ display: "grid", gap: 6 }}>
                           <div style={{ color: "#b91c1c", fontSize: 13 }}>Failed to parse discovered_system.json: {result.error}</div>
                           <div style={{ fontSize: 12, color: "#6b7280" }}>
-                            File written by images_discover (repo: electrodrive/tools/images_discover.py). :contentReference[oaicite:14]{index=14}
+                            File written by images_discover (repo: electrodrive/tools/images_discover.py).
                           </div>
                         </div>
                       ) : null}
@@ -1851,7 +1849,7 @@ export default function Upgrades() {
                             <div style={{ display: "grid", gap: 10 }}>
                               <div style={{ fontWeight: 700 }}>Precomputed plots (optional)</div>
                               <div style={{ fontSize: 12, color: "#6b7280" }}>
-                                If PlotService ran, it may have produced these PNGs (repo: electrodrive/researched/plot_service.py). :contentReference[oaicite:15]{index=15}
+                                If PlotService ran, it may have produced these PNGs (repo: electrodrive/researched/plot_service.py).
                               </div>
                               {hasScatterPng ? renderPngIfAvailable(r, "plots/basis_scatter.png") : null}
                               {hasMassPng ? renderPngIfAvailable(r, "plots/family_mass.png") : null}
@@ -2007,7 +2005,7 @@ export default function Upgrades() {
               })}
 
               <div style={{ fontSize: 12, color: "#6b7280" }}>
-                Repo note: JsonlLogger schema uses <code>msg</code> (not <code>event</code>) in events.jsonl (electrodrive/utils/logging.py). :contentReference[oaicite:17]{index=17}
+                Repo note: JsonlLogger schema uses <code>msg</code> (not <code>event</code>) in events.jsonl (electrodrive/utils/logging.py).
               </div>
             </div>
           </Card>
@@ -2029,7 +2027,7 @@ export default function Upgrades() {
                 const coll = findFirstArtifactByPredicate(artifacts, (a) => a.path.toLowerCase().includes("collocation") && a.path.toLowerCase().endsWith(".json"));
                 const oracle = findFirstArtifactByPredicate(artifacts, (a) => a.path.toLowerCase().includes("oracle") && a.path.toLowerCase().endsWith(".json"));
                 const subtractFlag = (() => {
-                  // images_discover logs subtract_physical in discovery_manifest.json metadata (repo). :contentReference[oaicite:18]{index=18}
+                  // images_discover logs subtract_physical in discovery_manifest.json metadata (repo).
                   const dm = r.files["discovery_manifest.json"];
                   if (dm && dm.status === "ok") return Boolean((dm.value as any)?.subtract_physical);
                   return undefined;
@@ -2095,7 +2093,7 @@ export default function Upgrades() {
                     )}
 
                     <div style={{ fontSize: 12, color: "#6b7280" }}>
-                      Repo note: images_discover exposes <code>--subtract-physical</code> and passes it into discovery as <code>subtract_physical_potential</code> (electrodrive/tools/images_discover.py). :contentReference[oaicite:19]{index=19}
+                      Repo note: images_discover exposes <code>--subtract-physical</code> and passes it into discovery as <code>subtract_physical_potential</code> (electrodrive/tools/images_discover.py).
                     </div>
                   </div>
                 );
@@ -2239,7 +2237,7 @@ export default function Upgrades() {
                       </div>
                     ) : (
                       <div style={{ fontSize: 12, color: "#b45309" }}>
-                        Missing <code>plots/gate_dashboard.json</code>. PlotService can generate it (repo: electrodrive/researched/plot_service.py). :contentReference[oaicite:20]{index=20}
+                        Missing <code>plots/gate_dashboard.json</code>. PlotService can generate it (repo: electrodrive/researched/plot_service.py).
                       </div>
                     )}
 
@@ -2284,17 +2282,31 @@ export default function Upgrades() {
 
               {selectedRuns.map((r) => {
                 const artifacts = r.artifacts || [];
-                const hasEvents = !!findArtifact(artifacts, "events.jsonl"); // repo JsonlLogger writes this (electrodrive/utils/logging.py). :contentReference[oaicite:21]{index=21}
-                const hasEvidence = !!findArtifact(artifacts, "evidence_log.jsonl"); // legacy (electrodrive/viz/live_console.py). :contentReference[oaicite:22]{index=22}
+                const hasEvents = !!findArtifact(artifacts, "events.jsonl"); // repo JsonlLogger writes this (electrodrive/utils/logging.py).
+                const hasEvidence = !!findArtifact(artifacts, "evidence_log.jsonl"); // legacy (electrodrive/viz/live_console.py).
 
                 const audit = panelAudit[r.runId];
                 const fromPayload = (r.upgradesPayload as any)?._client_sampled_coverage as CoverageComputed | undefined;
 
                 // Prefer PlotService coverage; else show artifacts-only coverage; optionally show client-sampled.
-                const cov = fromPayload ?? audit.best;
+                const cov = fromPayload ?? audit?.best;
+                const covDisplay: CoverageComputed = cov ?? {
+                  files_present: { events_jsonl: false, evidence_log_jsonl: false, other: [] },
+                  event_name_source_counts: { event: 0, msg: 0, message: 0, parsed_message_json: 0, missing: 0 },
+                  residual_fields_detected: [],
+                  total_records: 0,
+                  parsed_records: 0,
+                  warnings: [],
+                };
 
-                const eventCounts = cov.event_name_source_counts;
-                const residuals = cov.residual_fields_detected;
+                const eventCounts = covDisplay.event_name_source_counts ?? {
+                  event: 0,
+                  msg: 0,
+                  message: 0,
+                  parsed_message_json: 0,
+                  missing: 0,
+                };
+                const residuals = covDisplay.residual_fields_detected ?? [];
 
                 const fixIts: string[] = [];
                 if (eventCounts.msg > 0 && eventCounts.event === 0) fixIts.push("Records labeled via msg (not event). Update consumers or normalize (FR-4).");
@@ -2307,7 +2319,7 @@ export default function Upgrades() {
                     <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
                       <div style={{ fontWeight: 700 }}>{r.runId}</div>
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                        <div style={{ fontSize: 12, color: "#6b7280" }}>source: <b>{audit.from}{fromPayload ? " + client sample" : ""}</b></div>
+                        <div style={{ fontSize: 12, color: "#6b7280" }}>source: <b>{audit?.from ?? "n/a"}{fromPayload ? " + client sample" : ""}</b></div>
                         <SmallButton onClick={() => void computeSampleCoverage(r.runId)} title="Optional: sample manageable JSONL logs to estimate coverage (FR-4).">
                           Sample logs
                         </SmallButton>
@@ -2336,11 +2348,11 @@ export default function Upgrades() {
                           <tbody>
                             <tr>
                               <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>total_records (sampled)</td>
-                              <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>{cov.total_records}</td>
+                              <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>{covDisplay.total_records}</td>
                             </tr>
                             <tr>
                               <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>parsed_records (sampled)</td>
-                              <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>{cov.parsed_records}</td>
+                              <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>{covDisplay.parsed_records}</td>
                             </tr>
                             <tr>
                               <td style={{ padding: "6px 8px", borderBottom: "1px solid #f3f4f6" }}>event_name_source_counts</td>
@@ -2368,9 +2380,9 @@ export default function Upgrades() {
                         </div>
                       )}
 
-                      {cov.warnings.length ? (
+                      {covDisplay.warnings.length ? (
                         <div style={{ fontSize: 12, color: "#6b7280" }}>
-                          Notes: {cov.warnings.join(" • ")}
+                          Notes: {covDisplay.warnings.join(" • ")}
                         </div>
                       ) : null}
 
@@ -2385,7 +2397,7 @@ export default function Upgrades() {
                     </div>
 
                     <div style={{ fontSize: 12, color: "#6b7280" }}>
-                      Repo grounding: live_console demonstrates legacy behavior (evidence_log.jsonl + event/msg/message + resid variants). :contentReference[oaicite:23]{index=23}
+                      Repo grounding: live_console demonstrates legacy behavior (evidence_log.jsonl + event/msg/message + resid variants).
                     </div>
                   </div>
                 );
@@ -2398,7 +2410,7 @@ export default function Upgrades() {
       {/* Footer note */}
       <div style={{ fontSize: 12, color: "#6b7280" }}>
         Tip: if PlotService has already generated <code>plots/gate_dashboard.json</code> and <code>plots/log_coverage.png</code>,
-        the audit and gates panels become richer (repo: electrodrive/researched/plot_service.py). :contentReference[oaicite:24]{index=24}
+        the audit and gates panels become richer (repo: electrodrive/researched/plot_service.py).
       </div>
     </div>
   );

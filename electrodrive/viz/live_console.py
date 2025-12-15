@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
+from electrodrive.utils.log_normalize import iter_merged_events, stable_hash_fields
+
 # -----------------------------------------------------------------------------
 # TTY / encoding helpers
 # -----------------------------------------------------------------------------
@@ -325,57 +327,8 @@ def _prompt_label(timeout: float = 10.0) -> str:
 
 
 # -----------------------------------------------------------------------------
-# JSONL tailer
+# JSONL normalization + merge helpers
 # -----------------------------------------------------------------------------
-
-
-def _open_log_if_needed(state: TailState) -> None:
-    if state.fh is not None:
-        return
-    try:
-        fh = state.path.open("r", encoding="utf-8", errors="ignore")
-        st = state.path.stat()
-        state.fh = fh
-        state.inode = getattr(st, "st_ino", None)
-        state.offset = 0
-    except FileNotFoundError:
-        # Caller handles "waiting for log".
-        pass
-    except Exception:
-        # Best-effort; ignore.
-        pass
-
-
-def _detect_rotation_or_truncation(state: TailState) -> None:
-    if state.fh is None:
-        return
-    try:
-        st = state.path.stat()
-    except FileNotFoundError:
-        # Log removed -> close & reset.
-        state.close()
-        state.inode = None
-        state.offset = 0
-        return
-    except Exception:
-        return
-
-    cur_ino = getattr(st, "st_ino", None)
-    size = st.st_size
-    if state.inode is not None and cur_ino is not None and cur_ino != state.inode:
-        # File replaced (rotation).
-        state.close()
-        state.inode = cur_ino
-        state.offset = 0
-        _open_log_if_needed(state)
-    elif state.offset > size:
-        # Truncated.
-        try:
-            state.fh.seek(0)
-        except Exception:
-            state.close()
-            _open_log_if_needed(state)
-        state.offset = 0
 
 
 def _first_present(obj: Dict[str, object], keys) -> object:
@@ -385,10 +338,6 @@ def _first_present(obj: Dict[str, object], keys) -> object:
             if v is not None:
                 return v
     return None
-
-
-def _event_name(obj: Dict[str, object]) -> str:
-    return str(obj.get("event") or obj.get("msg") or obj.get("message") or "")
 
 
 def _safe_float(v: object) -> Optional[float]:
@@ -402,14 +351,14 @@ def _safe_float(v: object) -> Optional[float]:
     return None
 
 
-def _parse_progress_line(obj: Dict[str, object]) -> Optional[Tuple[int, float]]:
+def _parse_progress_line(obj: Dict[str, object]) -> Optional[Tuple[int, float, Optional[float]]]:
     """
-    Extract (iter, resid) from a JSON object if it looks like GMRES progress.
+    Extract (iter, resid, t) from a normalized JSON object if it looks like GMRES progress.
     """
     if not isinstance(obj, dict):
         return None
 
-    msg = _event_name(obj).lower()
+    msg = str(obj.get("event") or obj.get("msg") or obj.get("message") or "").lower()
     if msg and "gmres" not in msg:
         return None
 
@@ -423,75 +372,51 @@ def _parse_progress_line(obj: Dict[str, object]) -> Optional[Tuple[int, float]]:
     if it_val is None or resid_val is None:
         return None
 
+    t_val = _safe_float(obj.get("t") if "t" in obj else obj.get("ts"))
+
     try:
-        return int(it_val), float(resid_val)
+        return int(it_val), float(resid_val), t_val
     except Exception:
         return None
 
-    return None
 
-
-def _tail_jsonl(state: TailState, window: ResidualWindow) -> None:
+def _progress_from_merged(run_dir: Path, seen_keys: set, window: ResidualWindow) -> Tuple[int, float, Optional[float]]:
     """
-    Read newly appended lines from evidence_log.jsonl, updating:
-
-        - window.values with residuals
-        - state.last_iter
-        - state.last_resid
-        - state.last_ts (monotonic: time of last parsed progress)
-
-    Robust to:
-        - missing/truncated/rotated logs
-        - malformed JSON lines
-        - unrelated events in the JSONL
-
-    Never raises.
+    Parse merged events.jsonl/evidence_log.jsonl and update the residual window.
     """
-    _open_log_if_needed(state)
-    if state.fh is None:
-        return
+    last_iter = -1
+    last_resid = math.nan
+    last_ts = None
 
-    _detect_rotation_or_truncation(state)
-    if state.fh is None:
-        return
-
-    try:
-        state.fh.seek(state.offset)
-    except Exception:
-        # Re-open if seek fails.
-        state.close()
-        _open_log_if_needed(state)
-        if state.fh is None:
-            return
-
-    while True:
-        try:
-            line = state.fh.readline()
-        except Exception:
-            break
-
-        if not line:
-            break  # EOF
-
-        state.offset = state.fh.tell()
-        line = line.strip()
-        if not line:
+    for ev in iter_merged_events(run_dir):
+        key = (
+            round(float(ev.get("t") or 0.0), 3) if isinstance(ev.get("t"), (int, float)) else None,
+            str(ev.get("event") or "").lower(),
+            stable_hash_fields(ev.get("fields") or {}),
+        )
+        if key in seen_keys:
             continue
+        seen_keys.add(key)
 
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-
-        parsed = _parse_progress_line(obj)
+        parsed = _parse_progress_line(ev)
         if parsed is None:
             continue
-
-        it, resid = parsed
-        state.last_iter = max(state.last_iter, it)
-        state.last_resid = resid
-        state.last_ts = time.time()
+        it, resid, t_val = parsed
         window.append(resid)
+        if it > last_iter:
+            last_iter = it
+            last_resid = resid
+            last_ts = time.time() if t_val is None else t_val
+
+    # Bound seen_keys to avoid unbounded growth.
+    if len(seen_keys) > 5000:
+        for _ in range(1000):
+            try:
+                seen_keys.pop()
+            except KeyError:
+                break
+
+    return last_iter, last_resid, last_ts
 
 
 # -----------------------------------------------------------------------------
@@ -699,10 +624,9 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
 
     events_log = run_path / "events.jsonl"
     evidence_log = run_path / "evidence_log.jsonl"
-    log_path = events_log if events_log.exists() else evidence_log
-    tail = TailState(path=log_path)
     win = ResidualWindow.create(maxlen=max(10, int(window) if window > 0 else 200))
     ctrl = ControlWriter(run_path, min_interval=0.1)
+    seen_keys: set = set()
 
     is_tty = _is_tty(sys.stdout)
     use_utf8 = _supports_utf8()
@@ -713,7 +637,7 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
 
     last_print = 0.0
     quiet_start = time.time()
-    last_progress_ts = 0.0
+    last_progress_ts: Optional[float] = None
 
     # Non-interactive: only status at ~1 Hz; exit after long inactivity.
     non_tty_print_interval = 5.0
@@ -734,34 +658,21 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
             # GPU sync (best-effort)
             _maybe_cuda_sync()
 
-            preferred_log = events_log if events_log.exists() else evidence_log
-            if preferred_log != tail.path:
-                tail.close()
-                tail.path = preferred_log
-                tail.inode = None
-                tail.offset = 0
-            log_path = tail.path
+            have_any_log = events_log.exists() or evidence_log.exists()
+            if not have_any_log and not warned_waiting:
+                print(f"[live] Waiting for log at {events_log} or {evidence_log} ...", file=sys.stderr)
+                warned_waiting = True
+            elif have_any_log:
+                warned_waiting = False
 
-            # Tail log for new residuals
-            _tail_jsonl(tail, win)
-            if tail.last_ts > 0:
-                last_progress_ts = tail.last_ts
-                quiet_start = loop_start  # reset quiet timer on progress
-
-            # If log missing, print once and keep waiting
-            if tail.fh is None and not log_path.exists():
-                if not warned_waiting:
-                    print(f"[live] Waiting for log at {log_path} ...", file=sys.stderr)
-                    warned_waiting = True
-            elif tail.fh is None and log_path.exists():
-                # Try reopen soon; message once
-                if not warned_waiting:
-                    print(f"[live] Opening log {log_path} ...", file=sys.stderr)
-                    warned_waiting = True
+            last_iter, last_resid, ts_val = _progress_from_merged(run_path, seen_keys, win)
+            if last_iter >= 0:
+                quiet_start = loop_start
+                last_progress_ts = ts_val if ts_val is not None else time.time()
 
             # Compute lag and age
             now = loop_start
-            if last_progress_ts > 0:
+            if last_progress_ts is not None:
                 lag_s = max(0.0, now - last_progress_ts)
                 age_s = lag_s
             else:
@@ -773,9 +684,9 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
 
             # Render status line
             vals = win.as_list()
-            resid = tail.last_resid if math.isfinite(tail.last_resid) else (vals[-1] if vals else math.nan)
+            resid = last_resid if math.isfinite(last_resid) else (vals[-1] if vals else math.nan)
             status = _render_line(
-                iter_idx=tail.last_iter,
+                iter_idx=last_iter,
                 resid=resid,
                 window_vals=vals,
                 paused=paused,
@@ -860,7 +771,6 @@ def live_console(run_dir: str, refresh_hz: float = 4.0, window: int = 200) -> in
             pass
         return 0
     finally:
-        tail.close()
         if is_tty:
             try:
                 sys.stdout.write("\n")

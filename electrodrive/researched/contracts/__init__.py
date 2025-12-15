@@ -27,6 +27,8 @@ from .run_dir import (
     ensure_run_dir,
     finalize_run,
     init_run,
+    init_run_dir,
+    create_run_dir,
     write_command_txt,
 )
 
@@ -48,5 +50,7 @@ __all__ = [
     "write_command_txt",
     "ensure_log_compat",
     "init_run",
+    "init_run_dir",
+    "create_run_dir",
     "finalize_run",
 ]

@@ -13,7 +13,7 @@ This module is stdlib-only and defensive: normalize_record never raises.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 from .learn_message_json import extract_event_from_message_json
 
@@ -22,7 +22,7 @@ _ENVELOPE_KEYS = {"ts", "t", "level", "msg", "message", "event"}
 
 
 @dataclass(frozen=True)
-class NormalizedEvent:
+class NormalizedEvent(Mapping[str, Any]):
     ts: Optional[str]
     t: float
     level: Optional[str]
@@ -36,6 +36,42 @@ class NormalizedEvent:
     source: Optional[str]
     event_name_source: str  # "event"|"msg"|"message"|"message_json"|"unknown"
     residual_sources: Dict[str, str]  # canonical->source_key (e.g., {"resid":"resid_true_l2"})
+
+    def as_dict(self) -> Dict[str, Any]:
+        """
+        Mapping view used by tests and JSON serialization.
+
+        This keeps attribute access working for existing code (merge_streams/ws)
+        while allowing bracket access in QC tests.
+        """
+        return {
+            "ts": self.ts,
+            "t": self.t,
+            "level": self.level,
+            "event": self.event,
+            "iter": self.iter,
+            "resid": self.resid,
+            "resid_precond": self.resid_precond,
+            "resid_true": self.resid_true,
+            "fields": self.fields,
+            "raw": self.raw,
+            "source": self.source,
+            "event_name_source": self.event_name_source,
+            "residual_sources": self.residual_sources,
+        }
+
+    # Mapping interface for compatibility with dict-style access in tests.
+    def __getitem__(self, key: str) -> Any:
+        return self.as_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.as_dict())
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return len(self.as_dict())
+
+    def items(self) -> Iterable[Tuple[str, Any]]:  # pragma: no cover - convenience
+        return self.as_dict().items()
 
 
 def parse_ts_to_epoch_seconds(ts: Any) -> Optional[float]:

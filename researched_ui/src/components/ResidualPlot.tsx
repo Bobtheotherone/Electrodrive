@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 // Source notes:
 // - Design Doc: FR-4 (normalization rules; iter/resid variants), FR-5 (live convergence plot).

@@ -1142,8 +1142,8 @@ export default function CompareRuns() {
 
                 <div style={{ marginTop: 6, fontSize: 12, color: "#6b7280" }}>
                   Key metrics:{" "}
-                  {pickKeyMetrics(b.metrics).length ? (
-                    pickKeyMetrics(b.metrics).map(([k, v]) => (
+                  {pickKeyMetrics(b.metrics ?? null).length ? (
+                    pickKeyMetrics(b.metrics ?? null).map(([k, v]) => (
                       <span key={k} style={{ marginRight: 10 }}>
                         <code>{k}</code>=<code>{String(v)}</code>
                       </span>

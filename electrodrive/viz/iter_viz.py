@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from electrodrive.utils.logging import JsonlLogger
+from electrodrive.utils.log_normalize import iter_merged_events
 
 # -----------------------------------------------------------------------------
 # Optional imports (lazy where possible)
@@ -145,43 +146,42 @@ class IterSample:
 
 def _parse_iter_event(rec: Dict[str, Any]) -> Optional[IterSample]:
     """
-    Extract IterSample from a single JSONL record, if it looks like a GMRES iteration.
+    Extract IterSample from a normalized record (log_normalize.normalize_record output).
     """
-    msg = _event_name(rec).lower()
+    msg = str(rec.get("event") or rec.get("msg") or rec.get("message") or "").lower()
     if msg and "gmres" not in msg:
         return None
 
-    i_raw = _first_present(rec, ("iter", "iters", "step", "k"))
-    r_raw = _first_present(
-        rec,
-        ("resid", "resid_true", "resid_precond", "resid_true_l2", "resid_precond_l2"),
-    )
-
-    i_f = _safe_float(i_raw)
-    r_f = _safe_float(r_raw)
+    i_f = _safe_float(rec.get("iter"))
+    if i_f is None:
+        i_f = _safe_float(rec.get("iters") or rec.get("k") or rec.get("step") or fields.get("iter") or fields.get("iters") or fields.get("k") or fields.get("step"))
+    fields = rec.get("fields") if isinstance(rec.get("fields"), dict) else {}
+    resid_precond = _safe_float(rec.get("resid_precond") or rec.get("resid_precond_l2") or fields.get("resid_precond") or fields.get("resid_precond_l2"))
+    resid_true = _safe_float(rec.get("resid_true") or rec.get("resid_true_l2") or fields.get("resid_true") or fields.get("resid_true_l2"))
+    r_primary = _safe_float(rec.get("resid"))
+    r_f = r_primary if r_primary is not None else (resid_precond if resid_precond is not None else resid_true)
     if i_f is None or r_f is None:
         return None
 
-    # Tile hints: prefer explicit src/tgt if present; otherwise tile_size.
-    tile_src = rec.get("tile_src")
-    tile_tgt = rec.get("tile_tgt")
-    ts = rec.get("tile_size")
-    # Normalize tile fields to ints when meaningful.
+    fields = rec.get("fields") if isinstance(rec.get("fields"), dict) else {}
+    tile_src = rec.get("tile_src") or fields.get("tile_src")
+    tile_tgt = rec.get("tile_tgt") or fields.get("tile_tgt")
+    ts = rec.get("tile_size") or fields.get("tile_size")
     ts_i = int(ts) if isinstance(ts, (int, float)) else None
     t_src_i = int(tile_src) if isinstance(tile_src, (int, float)) else None
     t_tgt_i = int(tile_tgt) if isinstance(tile_tgt, (int, float)) else None
 
-    # Iteration timing: accept ms or sec fields if present.
     t_ms = None
     for key in ("t_iter_ms", "t_ms", "ms_per_iter"):
-        if key in rec:
-            t_ms = _safe_float(rec.get(key))
-            break
-    if t_ms is None and "t_iter" in rec:
-        # assume seconds
-        val = _safe_float(rec.get("t_iter"))
-        if val is not None:
-            t_ms = 1e3 * val
+        if key in rec or key in fields:
+            t_ms = _safe_float(rec.get(key) if key in rec else fields.get(key))
+            if t_ms is not None:
+                break
+    if t_ms is None:
+        val = rec.get("t_iter") if "t_iter" in rec else fields.get("t_iter")
+        v = _safe_float(val)
+        if v is not None:
+            t_ms = 1e3 * v
 
     return IterSample(
         iter=int(i_f),
@@ -197,58 +197,16 @@ def _read_evidence_incremental(
     offset_path: Path,
 ) -> Tuple[List[IterSample], int]:
     """
-    Incrementally parse evidence_log.jsonl from a stored byte offset.
-
-    Returns (samples, new_offset).
-    All errors are swallowed; on error, behaves as if no samples.
+    Compatibility shim: parse merged events (events.jsonl + evidence_log.jsonl).
+    Offset is retained in the signature for callers but unused.
     """
-    samples: List[IterSample] = []
-    if not evidence_path.is_file():
-        return samples, 0
-
     try:
-        start = 0
-        if offset_path.is_file():
-            try:
-                raw = offset_path.read_text(encoding="utf-8").strip()
-                if raw:
-                    start = int(raw)
-            except Exception:
-                start = 0
-
-        with evidence_path.open("r", encoding="utf-8") as f:
-            if start > 0:
-                try:
-                    f.seek(start)
-                except Exception:
-                    # Seek may fail if file shrunk; restart from 0
-                    f.seek(0)
-            while True:
-                pos = f.tell()
-                line = f.readline()
-                if not line:
-                    new_off = pos
-                    break
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(rec, dict):
-                    sample = _parse_iter_event(rec)
-                    if sample is not None:
-                        samples.append(sample)
-
-        # In case loop exited via break with new_off
-        try:
-            new_offset = new_off  # type: ignore[name-defined]
-        except NameError:
-            # If we never read, keep previous
-            new_offset = start
-
-        return samples, int(new_offset)
+        samples: List[IterSample] = []
+        for ev in iter_merged_events(evidence_path.parent):
+            s = _parse_iter_event(ev)
+            if s is not None:
+                samples.append(s)
+        return samples, 0
     except Exception:
         return [], 0
 
@@ -365,39 +323,10 @@ def overlay_metrics_on_frames(out_dir: Path, logger: JsonlLogger) -> None:
         if not viz_dir.is_dir():
             return
 
-        events_path = out_dir / "events.jsonl"
-        evidence_path = out_dir / "evidence_log.jsonl"
-        log_path = events_path if events_path.is_file() else evidence_path
         metrics_path = out_dir / "metrics.json"
 
         offset_path = viz_dir / ".overlay_offset"
-        samples, new_offset = _read_evidence_incremental(log_path, offset_path)
-        if new_offset and new_offset != 0:
-            try:
-                offset_path.write_text(str(new_offset), encoding="utf-8")
-            except Exception:
-                pass
-
-        # Even if no new samples from incremental read, we want last-known values
-        # so we may parse whole file once if needed.
-        if not samples and log_path.is_file():
-            # Best-effort full scan in fallback mode
-            try:
-                with log_path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                        except Exception:
-                            continue
-                        if isinstance(rec, dict):
-                            s = _parse_iter_event(rec)
-                            if s is not None:
-                                samples.append(s)
-            except Exception:
-                samples = []
+        samples, _ = _read_evidence_incremental(out_dir / "events.jsonl", offset_path)
 
         metrics = _load_metrics_info(metrics_path)
 

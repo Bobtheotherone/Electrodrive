@@ -43,8 +43,8 @@ def _fastapi_install_error(exc: BaseException | None = None) -> ImportError:
 
 
 def create_app(
-    runs_root: Path | str,
-    db_path: Path | str,
+    runs_root: Path | str | None = None,
+    db_path: Path | str | None = None,
     static_dir: Path | str | None = None,
 ) -> "FastAPI":
     """
@@ -66,8 +66,14 @@ def create_app(
     except Exception as exc:  # pragma: no cover
         raise _fastapi_install_error(exc)
 
-    runs_root_p = Path(runs_root).expanduser()
-    db_path_p = Path(db_path).expanduser()
+    # Default path resolution (env-aware for QC tests/imports).
+    runs_root_val = runs_root if runs_root is not None else os.getenv(_ENV_RUNS_ROOT, "runs")
+    runs_root_p = Path(runs_root_val).expanduser()
+
+    db_default = db_path if db_path is not None else os.getenv(_ENV_DB_PATH, "")
+    if not db_default:
+        db_default = Path(runs_root_p) / "researched.sqlite"
+    db_path_p = Path(db_default).expanduser()
 
     # Treat empty-string static_dir as None (common when CLI passes "").
     static_p: Optional[Path]
@@ -148,8 +154,16 @@ def create_app(
     from .api import get_api_router
     from .ws import get_ws_router
 
-    app.include_router(get_api_router(), prefix="/api/v1")
-    app.include_router(get_ws_router(), prefix="/ws")
+    api_router_v1 = get_api_router()
+    app.include_router(api_router_v1, prefix="/api/v1")
+    # Compatibility prefix for UI clients that assume /api rather than /api/v1.
+    app.include_router(get_api_router(), prefix="/api")
+
+    ws_router = get_ws_router()
+    app.include_router(ws_router, prefix="/ws")
+    # Compatibility prefixes so UI WebSocket fallbacks connect without extra retries.
+    app.include_router(get_ws_router(), prefix="/api/ws")
+    app.include_router(get_ws_router(), prefix="/api/v1/ws")
 
     # Root behavior: static UI if present; otherwise a small JSON hello.
     ui_dir = static_p
@@ -186,6 +200,32 @@ def create_app(
                 },
             }
 
+    # Compatibility endpoints for QC tests and legacy clients.
+    @app.get("/health")
+    def _health() -> Any:
+        return {
+            "ok": True,
+            "runs_root": str(app.state.runs_root) if getattr(app.state, "runs_root", None) is not None else None,
+            "db_path": str(app.state.db_path) if getattr(app.state, "db_path", None) is not None else None,
+            "version": __version__,
+        }
+
+    @app.get("/api/health")
+    def _health_api() -> Any:
+        return _health()
+
+    @app.get("/runs")
+    def _runs_list() -> Any:
+        try:
+            from .api import _index_runs  # type: ignore
+        except Exception:
+            return []
+        return _index_runs(Path(getattr(app.state, "runs_root", "runs")))
+
+    @app.get("/api/runs")
+    def _runs_list_api() -> Any:
+        return _runs_list()
+
     return app
 
 
@@ -201,3 +241,10 @@ def create_app_from_env() -> "FastAPI":
     static_dir = os.getenv(_ENV_STATIC_DIR, "")
     static_val: Optional[str] = static_dir.strip() or None
     return create_app(runs_root=runs_root, db_path=db_path, static_dir=static_val)
+
+
+# Export a ready-to-use app for TestClient / uvicorn entrypoints.
+try:  # pragma: no cover - best-effort import convenience
+    app = create_app_from_env()
+except Exception:
+    app = None  # type: ignore[assignment]

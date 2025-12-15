@@ -242,8 +242,6 @@ export default function LogCoveragePanel(props: LogCoveragePanelProps) {
     const eventCount = src.event ?? 0;
     const msgCount = src.msg ?? 0;
     const embeddedCount = src.embedded_json ?? 0;
-    const messageCount = src.message ?? 0;
-    const fallbackCount = src.fallback ?? 0;
     const totalSrc = sumCounts(src);
 
     if (eventCount === 0 && msgCount > 0) {

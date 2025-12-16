@@ -11,7 +11,6 @@ import torch
 
 from electrodrive.utils.config import K_E
 from electrodrive.orchestration.parser import CanonicalSpec
-from electrodrive.layers import DCIMCompilerConfig, SpectralKernelSpec, compile_dcim, layerstack_from_spec
 
 
 @dataclass
@@ -1363,64 +1362,87 @@ def generate_candidate_basis(
             print("dcim basis skipped: requires CUDA device for compilation.")
         else:
             try:
-                stack = layerstack_from_spec(spec)
-                kernel = SpectralKernelSpec(
-                    source_region=0,
-                    obs_region=0,
-                    component="potential",
-                    bc_kind="dielectric_interfaces",
+                from electrodrive.layers import (
+                    DCIMCompilerConfig,
+                    SpectralKernelSpec,
+                    compile_dcim,
+                    layerstack_from_spec,
                 )
-                z_src = 0.2
-                if point_charges:
-                    try:
-                        z_src = float(point_charges[0]["pos"][2])
-                    except Exception:
-                        z_src = 0.2
-                cfg = DCIMCompilerConfig(
-                    k_min=0.05,
-                    k_mid=2.0,
-                    k_max=6.0,
-                    n_low=64,
-                    n_mid=64,
-                    n_high=0,
-                    log_low=False,
-                    log_high=False,
-                    vf_enabled=False,
-                    vf_for_images=False,
-                    exp_fit_enabled=True,
-                    exp_fit_requires_uniform_grid=True,
-                    exp_N=6,
-                    spectral_tol=0.3,
-                    spatial_tol=0.2,
-                    sample_points=[(0.3, 0.6), (0.5, 1.0), (0.2, 0.6)],
-                    cache_enabled=True,
-                    cache_path=Path("runs/dcim_cache.jsonl"),
-                    device=dev,
-                    dtype=torch.complex128,
-                    runtime_eval_mode="image_only",
-                    source_z=z_src,
-                    source_charge=1.0,
-                )
-                block = compile_dcim(stack, kernel, cfg)
             except Exception as exc:
-                print(f"dcim basis compile failed: {exc}")
+                print(f"dcim basis imports failed: {exc}")
             else:
-                if not block.certificate.stable and not allow_unstable_dcim:
-                    print("dcim basis skipped: unstable certificate")
+                try:
+                    stack = layerstack_from_spec(spec)
+                    kernel = SpectralKernelSpec(
+                        source_region=0,
+                        obs_region=0,
+                        component="potential",
+                        bc_kind="dielectric_interfaces",
+                    )
+                    x_src = 0.0
+                    y_src = 0.0
+                    z_src = 0.2
+                    q_src = 1.0
+                    if point_charges:
+                        try:
+                            pos0 = point_charges[0].get("pos", [0.0, 0.0, 0.2])
+                            x_src = float(pos0[0])
+                            y_src = float(pos0[1])
+                            z_src = float(pos0[2])
+                            q_src = float(point_charges[0].get("charge", point_charges[0].get("q", 1.0)))
+                        except Exception:
+                            pass
+                    cfg = DCIMCompilerConfig(
+                        k_min=0.05,
+                        k_mid=2.0,
+                        k_max=6.0,
+                        n_low=64,
+                        n_mid=64,
+                        n_high=0,
+                        log_low=False,
+                        log_high=False,
+                        vf_enabled=False,
+                        vf_for_images=False,
+                        exp_fit_enabled=True,
+                        exp_fit_requires_uniform_grid=True,
+                        exp_N=6,
+                        spectral_tol=0.3,
+                        spatial_tol=0.2,
+                        sample_points=[(0.3, 0.6), (0.5, 1.0), (0.2, 0.6)],
+                        cache_enabled=True,
+                        cache_path=Path("runs/dcim_cache.jsonl"),
+                        device=dev,
+                        dtype=torch.complex128,
+                        runtime_eval_mode="image_only",
+                        source_z=z_src,
+                        source_charge=q_src,
+                        source_pos=(x_src, y_src, z_src),
+                    )
+                    with torch.inference_mode():
+                        block = compile_dcim(stack, kernel, cfg)
+                except Exception as exc:
+                    print(f"dcim basis compile failed: {exc}")
                 else:
-                    from electrodrive.images.basis_dcim import dcim_basis_from_block
+                    if not block.certificate.stable and not allow_unstable_dcim:
+                        print("dcim basis skipped: unstable certificate")
+                    else:
+                        from electrodrive.images.basis_dcim import dcim_basis_from_block
 
-                    elems = dcim_basis_from_block(block)
-                    for idx, elem in enumerate(elems):
-                        annotate_group_info(
-                            elem,
-                            conductor_id=0,
-                            family_name="dcim_images",
-                            motif_index=idx,
-                        )
-                        candidates.append(elem)
-                        if len(candidates) >= n_candidates:
-                            break
+                        elems = dcim_basis_from_block(block)
+                        max_dcim_elems = min(2 * cfg.exp_N, 32)
+                        added = 0
+                        for idx, elem in enumerate(elems):
+                            image_idx = idx // 2
+                            annotate_group_info(
+                                elem,
+                                conductor_id=0,
+                                family_name="dcim_images",
+                                motif_index=image_idx,
+                            )
+                            candidates.append(elem)
+                            added += 1
+                            if added >= max_dcim_elems or len(candidates) >= n_candidates:
+                                break
 
     # Mirror-stack candidates for parallel planes (experimental).
     planes = [c for c in conductors if c.get("type") == "plane"]

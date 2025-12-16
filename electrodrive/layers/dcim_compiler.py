@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -47,7 +47,9 @@ class DCIMCompilerConfig:
     spatial_tol: float = 5e-2
     sample_points: Optional[Sequence[Tuple[float, float]]] = None  # (rho, z)
     source_z: float = 0.2
+    source_pos: Optional[Tuple[float, float, float]] = None
     source_charge: float = 1.0
+    z_ref: Optional[float] = None
 
     cache_enabled: bool = False
     cache_path: Optional[Path] = None
@@ -115,15 +117,19 @@ def _potential_from_reflection(
     z: torch.Tensor,
     z0: float,
     q: float,
+    z_ref: Optional[float] = None,
 ) -> torch.Tensor:
     k_real = torch.real(k)
     kr = torch.outer(k_real, rho)
     j0 = torch.special.bessel_j0(kr)
-    exp_dir = torch.exp(-torch.outer(k_real, torch.abs(z - z0)))
-    exp_ref = torch.exp(-torch.outer(k_real, z + z0)) * R[:, None]
+    z_ref_val = float(z_ref) if z_ref is not None else 0.0
+    z_rel = z - z_ref_val
+    z0_rel = z0 - z_ref_val
+    exp_dir = torch.exp(-torch.outer(k_real, torch.abs(z_rel - z0_rel)))
+    exp_ref = torch.exp(-torch.outer(k_real, z_rel + z0_rel)) * R[:, None]
     integrand = k_real[:, None].to(R.dtype) * (exp_dir.to(R.dtype) + exp_ref) * j0.to(R.dtype)
     integral = torch.trapz(integrand, k_real.to(R.dtype), dim=0)
-    direct = q / (4.0 * math.pi * eps_source) * (1.0 / torch.sqrt(rho * rho + (z - z0) ** 2).clamp_min(1e-9))
+    direct = q / (4.0 * math.pi * eps_source) * (1.0 / torch.sqrt(rho * rho + (z_rel - z0_rel) ** 2).clamp_min(1e-9))
     reflected = (q / (2.0 * math.pi * 2.0 * eps_source)) * integral
     return direct + reflected
 
@@ -136,11 +142,15 @@ def _reflected_potential(
     z: torch.Tensor,
     z0: float,
     q: float,
+    z_ref: Optional[float] = None,
 ) -> torch.Tensor:
     k_real = torch.real(k)
     kr = torch.outer(k_real, rho)
     j0 = torch.special.bessel_j0(kr)
-    exp_ref = torch.exp(-torch.outer(k_real, z + z0)) * R[:, None]
+    z_ref_val = float(z_ref) if z_ref is not None else 0.0
+    z_rel = z - z_ref_val
+    z0_rel = z0 - z_ref_val
+    exp_ref = torch.exp(-torch.outer(k_real, z_rel + z0_rel)) * R[:, None]
     integrand = k_real[:, None].to(R.dtype) * exp_ref * j0.to(R.dtype)
     integral = torch.trapz(integrand, k_real.to(R.dtype), dim=0)
     return (q / (2.0 * math.pi * 2.0 * eps_source)) * integral
@@ -155,6 +165,7 @@ def _image_domain_potential(
     q: float,
     device: torch.device,
     dtype: torch.dtype,
+    z_ref: Optional[float] = None,
 ) -> torch.Tensor:
     assert rho.device.type == "cuda" and z.device.type == "cuda", "image-domain eval must run on CUDA."
     real_dtype = torch.empty((), dtype=dtype).real.dtype
@@ -163,10 +174,13 @@ def _image_domain_potential(
     V = torch.zeros_like(rho, device=device, dtype=dtype)
     if not images:
         return torch.real(V)
+    z_ref_val = float(z_ref) if z_ref is not None else 0.0
+    z = z - z_ref_val
+    z0_ref = torch.as_tensor(z0 - z_ref_val, device=device, dtype=dtype)
     for img in images:
         depth = torch.as_tensor(img.depth, device=device, dtype=dtype)
         weight = torch.as_tensor(img.weight, device=device, dtype=dtype)
-        d = z.to(dtype) + torch.as_tensor(z0, device=device, dtype=dtype) + depth
+        d = z.to(dtype) + z0_ref + depth
         r_sq = rho * rho + d * d
         r = torch.sqrt(r_sq)
         contrib = weight * (q / (2.0 * math.pi * 2.0 * eps1)) * (d / (r * r * r))
@@ -193,16 +207,46 @@ def _spatial_certificate(
         z_vals = [p[1] for p in cfg.sample_points]
     rho = torch.tensor(rho_vals, device=device, dtype=real_dtype)
     z = torch.tensor(z_vals, device=device, dtype=real_dtype)
+    src_z = cfg.source_pos[2] if cfg.source_pos is not None else cfg.source_z
+    z_ref = cfg.z_ref
 
-    V_ref = _reflected_potential(k, R_ref, float(eps1.real), rho, z, cfg.source_z, cfg.source_charge)
+    V_ref = _reflected_potential(
+        k,
+        R_ref,
+        float(eps1.real),
+        rho,
+        z,
+        src_z,
+        cfg.source_charge,
+        z_ref=z_ref,
+    )
     try:
-        V_img = _image_domain_potential(images, rho, z, cfg.source_z, float(eps1.real), cfg.source_charge, device, dtype)
+        V_img = _image_domain_potential(
+            images,
+            rho,
+            z,
+            src_z,
+            float(eps1.real),
+            cfg.source_charge,
+            device,
+            dtype,
+            z_ref=z_ref,
+        )
     except Exception as exc:
         print(f"dcim_compile: image-domain eval failed: {exc}")
         return float("inf"), float("inf")
     V_pred = V_img
     if cfg.runtime_eval_mode != "image_only":
-        V_vf_ref = _reflected_potential(k, R_vf, float(eps1.real), rho, z, cfg.source_z, cfg.source_charge)
+        V_vf_ref = _reflected_potential(
+            k,
+            R_vf,
+            float(eps1.real),
+            rho,
+            z,
+            src_z,
+            cfg.source_charge,
+            z_ref=z_ref,
+        )
         V_pred = V_vf_ref + V_img
     diff = V_pred - V_ref
     l2 = (torch.linalg.norm(diff) / torch.linalg.norm(V_ref).clamp_min(1e-12)).item()
@@ -226,11 +270,24 @@ def _cache_key(stack: LayerStack, kernel_spec: SpectralKernelSpec, cfg: DCIMComp
             "k_min": cfg.k_min,
             "k_mid": cfg.k_mid,
             "k_max": cfg.k_max,
+            "n_low": cfg.n_low,
+            "n_mid": cfg.n_mid,
+            "n_high": cfg.n_high,
+            "log_low": cfg.log_low,
+            "log_high": cfg.log_high,
             "vf_M": cfg.vf_M,
             "exp_N": cfg.exp_N,
             "vf_enabled": cfg.vf_enabled,
+            "vf_tol": cfg.vf_tol,
+            "exp_fit_enabled": cfg.exp_fit_enabled,
+            "exp_fit_requires_uniform_grid": cfg.exp_fit_requires_uniform_grid,
             "runtime_eval_mode": cfg.runtime_eval_mode,
             "vf_for_images": cfg.vf_for_images,
+            "source_z": cfg.source_z,
+            "source_pos": tuple(cfg.source_pos) if cfg.source_pos is not None else None,
+            "source_charge": cfg.source_charge,
+            "z_ref": cfg.z_ref,
+            "sample_points": tuple(cfg.sample_points) if cfg.sample_points is not None else None,
         },
     }
     blob = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -281,6 +338,24 @@ def compile_dcim(
     if cache_path:
         cached = _load_cache(cache_path, key)
         if cached is not None:
+            meta = dict(cached.certificate.meta or {})
+            if "source_pos" not in meta:
+                src_pos_cache = cfg.source_pos if cfg.source_pos is not None else (0.0, 0.0, cfg.source_z)
+                meta["source_pos"] = [float(src_pos_cache[0]), float(src_pos_cache[1]), float(src_pos_cache[2])]
+                meta.setdefault("source_z", src_pos_cache[2])
+            if "source_charge" not in meta:
+                meta["source_charge"] = cfg.source_charge
+            if cfg.z_ref is not None and "z_ref" not in meta:
+                meta["z_ref"] = float(cfg.z_ref)
+            if meta != cached.certificate.meta:
+                new_cert = replace(cached.certificate, meta=meta)
+                cached = DCIMBlock(
+                    stack=cached.stack,
+                    kernel=cached.kernel,
+                    poles=cached.poles,
+                    images=cached.images,
+                    certificate=new_cert,
+                )
             return cached
 
     F = effective_reflection(stack, k, source_region=kernel_spec.source_region, direction="down", device=device, dtype=dtype)
@@ -390,6 +465,23 @@ def compile_dcim(
             for i in range(vf_poles.numel())
         )
 
+    src_pos = cfg.source_pos if cfg.source_pos is not None else (0.0, 0.0, cfg.source_z)
+    meta = {
+        "vf": {
+            "M": cfg.vf_M,
+            "iters": cfg.vf_max_iters,
+            "d": complex(vf_d.item()),
+            "h": complex(vf_h.item()),
+        },
+        "exp_N": cfg.exp_N,
+        "source_z": src_pos[2],
+        "source_pos": [float(src_pos[0]), float(src_pos[1]), float(src_pos[2])],
+        "source_charge": cfg.source_charge,
+        "runtime_eval_mode": cfg.runtime_eval_mode,
+    }
+    if cfg.z_ref is not None:
+        meta["z_ref"] = float(cfg.z_ref)
+
     certificate = DCIMCertificate(
         k_grid=tuple(float(x) for x in torch.real(k).detach().cpu().tolist()),
         fit_residual_L2=fit_L2,
@@ -397,18 +489,7 @@ def compile_dcim(
         spatial_check_rel_L2=spatial_L2,
         spatial_check_rel_Linf=spatial_Linf,
         stable=stable,
-        meta={
-            "vf": {
-                "M": cfg.vf_M,
-                "iters": cfg.vf_max_iters,
-                "d": complex(vf_d.item()),
-                "h": complex(vf_h.item()),
-            },
-            "exp_N": cfg.exp_N,
-            "source_z": cfg.source_z,
-            "source_charge": cfg.source_charge,
-            "runtime_eval_mode": cfg.runtime_eval_mode,
-        },
+        meta=meta,
     )
 
     block = DCIMBlock(

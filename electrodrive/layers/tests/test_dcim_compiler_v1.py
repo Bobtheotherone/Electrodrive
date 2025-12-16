@@ -37,6 +37,7 @@ def test_compile_dcim_produces_images_and_certificate():
     device = torch.device("cuda")
     dtype = torch.complex128
     spec = _three_layer_spec()
+    src_pos = spec.charges[0]["pos"]
     stack = layerstack_from_spec(spec)
     kernel = SpectralKernelSpec(source_region=0, obs_region=0, component="potential", bc_kind="dielectric_interfaces")
     cfg = DCIMCompilerConfig(
@@ -55,6 +56,8 @@ def test_compile_dcim_produces_images_and_certificate():
         device=device,
         dtype=dtype,
         runtime_eval_mode="composite",
+        source_pos=(float(src_pos[0]), float(src_pos[1]), float(src_pos[2])),
+        source_charge=float(spec.charges[0].get("charge", spec.charges[0].get("q", 1.0))),
     )
 
     block = compile_dcim(stack, kernel, cfg)
@@ -102,13 +105,16 @@ def test_compile_dcim_produces_images_and_certificate():
     real_dtype = torch.empty((), dtype=dtype).real.dtype
     rho = torch.tensor([0.15, 0.25, 0.35], device=device, dtype=real_dtype)
     z = torch.tensor([0.3, 0.5, 0.7], device=device, dtype=real_dtype)
-    V_fit_img = _image_domain_potential(block.images, rho, z, z0=0.2, eps1=eps1, q=1.0, device=device, dtype=dtype)
+    z0 = float(block.certificate.meta["source_pos"][2])
+    q_src = float(block.certificate.meta.get("source_charge", 1.0))
+    z_ref = block.certificate.meta.get("z_ref", None)
+    V_fit_img = _image_domain_potential(block.images, rho, z, z0=z0, eps1=eps1, q=q_src, device=device, dtype=dtype, z_ref=z_ref)
     V_vf_ref = torch.zeros_like(rho, device=device, dtype=dtype)
     if vf_poles_t.numel() > 0:
         Vmat = 1.0 / (k[:, None] - vf_poles_t[None, :])
         F_vf = torch.sum(vf_residues_t[None, :] * Vmat, dim=1) + d_t + h_t * k
-        V_vf_ref = _reflected_potential(k, F_vf, eps1, rho, z, z0=0.2, q=1.0)
+        V_vf_ref = _reflected_potential(k, F_vf, eps1, rho, z, z0=z0, q=q_src, z_ref=z_ref)
     V_pred = V_vf_ref + V_fit_img
-    V_reflected = _reflected_potential(k, F_ref, eps1, rho, z, z0=0.2, q=1.0)
+    V_reflected = _reflected_potential(k, F_ref, eps1, rho, z, z0=z0, q=q_src, z_ref=z_ref)
     rel_spatial = torch.linalg.norm(V_pred - V_reflected) / torch.linalg.norm(V_reflected).clamp_min(1e-12)
     assert rel_spatial < cfg.spatial_tol

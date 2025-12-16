@@ -31,6 +31,7 @@ def test_compile_dcim_image_only_stable_and_image_valid():
     device = torch.device("cuda")
     dtype = torch.complex128
     spec = _three_layer_spec(eps2=4.0, h=0.4)
+    src_pos = spec.charges[0]["pos"]
     stack = layerstack_from_spec(spec)
     kernel = SpectralKernelSpec(source_region=0, obs_region=0, component="potential", bc_kind="dielectric_interfaces")
     cfg = DCIMCompilerConfig(
@@ -54,6 +55,8 @@ def test_compile_dcim_image_only_stable_and_image_valid():
         device=device,
         dtype=dtype,
         runtime_eval_mode="image_only",
+        source_pos=(float(src_pos[0]), float(src_pos[1]), float(src_pos[2])),
+        source_charge=float(spec.charges[0].get("charge", spec.charges[0].get("q", 1.0))),
     )
 
     block = compile_dcim(stack, kernel, cfg)
@@ -67,11 +70,12 @@ def test_compile_dcim_image_only_stable_and_image_valid():
     real_dtype = torch.empty((), dtype=dtype).real.dtype
     rho = torch.tensor([0.3, 0.5, 0.2], device=device, dtype=real_dtype)
     z = torch.tensor([0.6, 1.0, 0.6], device=device, dtype=real_dtype)
+    z0 = float(block.certificate.meta["source_pos"][2])
 
-    V_pred = _image_domain_potential(block.images, rho, z, z0=0.2, eps1=eps1, q=1.0, device=device, dtype=dtype)
+    V_pred = _image_domain_potential(block.images, rho, z, z0=z0, eps1=eps1, q=1.0, device=device, dtype=dtype)
     from electrodrive.layers.rt_recursion import effective_reflection as _eff
 
     R_ref = _eff(stack, k, source_region=0, direction="down", device=device, dtype=dtype)
-    V_reflected = _reflected_potential(k, R_ref, eps1, rho, z, z0=0.2, q=1.0)
+    V_reflected = _reflected_potential(k, R_ref, eps1, rho, z, z0=z0, q=1.0)
     rel_err = torch.linalg.norm(V_pred - V_reflected) / torch.linalg.norm(V_reflected).clamp_min(1e-12)
     assert rel_err < cfg.spatial_tol

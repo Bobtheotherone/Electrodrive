@@ -11,6 +11,7 @@ import torch
 
 from electrodrive.utils.config import K_E
 from electrodrive.orchestration.parser import CanonicalSpec
+from electrodrive.layers import DCIMCompilerConfig, SpectralKernelSpec, compile_dcim, layerstack_from_spec
 
 
 @dataclass
@@ -113,6 +114,10 @@ class ImageBasisElement:
                 elem = SphereKelvinImageBasis(params)
             elif t == "sphere_equatorial_ring":
                 elem = SphereEquatorialRingBasis(params)
+            elif t.startswith("dcim_block"):
+                from electrodrive.images.basis_dcim import DCIMBlockBasis
+
+                elem = DCIMBlockBasis.deserialize(data)
             else:
                 raise ValueError(f"Unknown basis element type: {t}")
 
@@ -1060,6 +1065,9 @@ def generate_candidate_basis(
     wants_rich_inner = "rich_inner_rim" in basis_types
     wants_three_layer = "three_layer_images" in basis_types
     wants_three_layer = wants_three_layer and bool(getattr(spec, "dielectrics", None))
+    wants_dcim = any(t in ("three_layer_dcim", "layered_dcim") for t in basis_types)
+    wants_dcim = wants_dcim and bool(getattr(spec, "dielectrics", None))
+    allow_unstable_dcim = "dcim_allow_unstable" in basis_types
 
     # Sphere Kelvin ladder: image charges inside each spherical conductor.
     if wants_sphere_kelvin and spheres and point_charges:
@@ -1348,6 +1356,71 @@ def generate_candidate_basis(
                                 motif_index=motif,
                             )
                             candidates.append(elem)
+
+    if wants_dcim and getattr(spec, "BCs", None) == "dielectric_interfaces":
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            print("dcim basis skipped: requires CUDA device for compilation.")
+        else:
+            try:
+                stack = layerstack_from_spec(spec)
+                kernel = SpectralKernelSpec(
+                    source_region=0,
+                    obs_region=0,
+                    component="potential",
+                    bc_kind="dielectric_interfaces",
+                )
+                z_src = 0.2
+                if point_charges:
+                    try:
+                        z_src = float(point_charges[0]["pos"][2])
+                    except Exception:
+                        z_src = 0.2
+                cfg = DCIMCompilerConfig(
+                    k_min=0.05,
+                    k_mid=2.0,
+                    k_max=6.0,
+                    n_low=64,
+                    n_mid=64,
+                    n_high=0,
+                    log_low=False,
+                    log_high=False,
+                    vf_enabled=False,
+                    vf_for_images=False,
+                    exp_fit_enabled=True,
+                    exp_fit_requires_uniform_grid=True,
+                    exp_N=6,
+                    spectral_tol=0.3,
+                    spatial_tol=0.2,
+                    sample_points=[(0.3, 0.6), (0.5, 1.0), (0.2, 0.6)],
+                    cache_enabled=True,
+                    cache_path=Path("runs/dcim_cache.jsonl"),
+                    device=dev,
+                    dtype=torch.complex128,
+                    runtime_eval_mode="image_only",
+                    source_z=z_src,
+                    source_charge=1.0,
+                )
+                block = compile_dcim(stack, kernel, cfg)
+            except Exception as exc:
+                print(f"dcim basis compile failed: {exc}")
+            else:
+                if not block.certificate.stable and not allow_unstable_dcim:
+                    print("dcim basis skipped: unstable certificate")
+                else:
+                    from electrodrive.images.basis_dcim import dcim_basis_from_block
+
+                    elems = dcim_basis_from_block(block)
+                    for idx, elem in enumerate(elems):
+                        annotate_group_info(
+                            elem,
+                            conductor_id=0,
+                            family_name="dcim_images",
+                            motif_index=idx,
+                        )
+                        candidates.append(elem)
+                        if len(candidates) >= n_candidates:
+                            break
 
     # Mirror-stack candidates for parallel planes (experimental).
     planes = [c for c in conductors if c.get("type") == "plane"]

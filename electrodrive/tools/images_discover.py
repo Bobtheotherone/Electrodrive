@@ -11,7 +11,24 @@ import torch  # noqa: F401
 
 from electrodrive.utils.logging import JsonlLogger
 from electrodrive.orchestration.parser import CanonicalSpec
-from electrodrive.images.search import AugLagrangeConfig, discover_images
+from electrodrive.images.search import (
+    AugLagrangeConfig,
+    discover_images,
+    assemble_basis_matrix,
+    get_collocation_data,
+    solve_sparse,
+)
+from electrodrive.images.optim import (
+    ADMMConfig,
+    ConstraintSpec,
+    OuterSolveConfig,
+    SparseSolveRequest,
+    optimize_theta_adam,
+    optimize_theta_lbfgs,
+    refine_and_certify,
+    search as global_search,
+)
+from electrodrive.images.basis import compute_group_ids
 from electrodrive.images.io import save_image_system
 from electrodrive.images.geo_encoder import GeoEncoder, load_geo_components_from_checkpoint
 from electrodrive.images.learned_solver import load_lista_from_checkpoint
@@ -33,6 +50,19 @@ def _load_spec(path: Path) -> CanonicalSpec:
 def _parse_basis_arg(basis: str) -> List[str]:
     items = [b.strip() for b in basis.split(",") if b.strip()]
     return items or ["point"]
+
+
+def _parse_mode_indices(text: Optional[str]) -> List[tuple[int, int]]:
+    if not text:
+        return []
+    tokens = text.replace(";", " ").split()
+    modes: List[tuple[int, int]] = []
+    for tok in tokens:
+        parts = [p for p in tok.split(",") if p]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid mode token: {tok}")
+        modes.append((int(parts[0]), int(parts[1])))
+    return modes
 
 
 def run_discover(args: argparse.Namespace) -> int:
@@ -72,6 +102,67 @@ def run_discover(args: argparse.Namespace) -> int:
     lambda_group = args.lambda_group
     if solver_choice == "lista" and (lambda_group is None or lambda_group == 0.0):
         lambda_group = 1e-3
+
+    outer_choice = str(getattr(args, "outer_opt", "none") or "none").strip().lower()
+    global_choice = str(getattr(args, "global_search", "none") or "none").strip().lower()
+    certify_fp64 = bool(getattr(args, "certify_fp64", False))
+    certify_mpmath = bool(getattr(args, "certify_mpmath", False))
+    budget = int(getattr(args, "budget", 0) or 0)
+    seed = getattr(args, "seed", None)
+
+    constraint_specs = None
+    constraint_mode = "none"
+    if getattr(args, "constraint", None):
+        constraint_specs = []
+        mode_indices = _parse_mode_indices(getattr(args, "fft_modes", None))
+        for idx, basis in enumerate(args.constraint):
+            params = {}
+            region = None
+            if basis == "collocation":
+                region = getattr(args, "constraint_region", None)
+                if region == "all":
+                    region = None
+            elif basis == "planar_fft":
+                if args.fft_grid_h is None or args.fft_grid_w is None:
+                    raise ValueError("--fft-grid-h/--fft-grid-w are required for planar_fft constraints.")
+                params["grid_shape"] = (int(args.fft_grid_h), int(args.fft_grid_w))
+                if mode_indices:
+                    params["mode_indices"] = mode_indices
+                params["fft_shift"] = bool(getattr(args, "fft_shift", False))
+            elif basis == "sphere_sh":
+                if args.sh_lmax is None:
+                    raise ValueError("--sh-lmax is required for sphere_sh constraints.")
+                params["Lmax"] = int(args.sh_lmax)
+            else:
+                raise ValueError(f"Unsupported constraint basis: {basis}")
+            constraint_specs.append(
+                ConstraintSpec(
+                    name=f"{basis}_{idx}",
+                    kind=str(getattr(args, "constraint_kind", "eq")),
+                    weight=float(getattr(args, "constraint_weight", 1.0)),
+                    eps=float(getattr(args, "constraint_eps", 0.0)),
+                    region=region,
+                    basis=basis,
+                    params=params,
+                )
+            )
+        constraint_mode = str(getattr(args, "constraint_mode", "admm")).strip().lower() or "admm"
+
+    admm_cfg = None
+    if solver_choice == "admm_constrained":
+        admm_kwargs = {}
+        if args.admm_rho is not None:
+            admm_kwargs["rho"] = float(args.admm_rho)
+        if args.admm_max_iter is not None:
+            admm_kwargs["max_iter"] = int(args.admm_max_iter)
+        if args.admm_tol is not None:
+            admm_kwargs["tol"] = float(args.admm_tol)
+        if args.admm_w_update_iters is not None:
+            admm_kwargs["w_update_iters"] = int(args.admm_w_update_iters)
+        if args.admm_unroll_steps is not None:
+            admm_kwargs["unroll_steps"] = int(args.admm_unroll_steps)
+        if admm_kwargs:
+            admm_cfg = ADMMConfig(**admm_kwargs)
 
     gfn_checkpoint = getattr(args, "gfn_checkpoint", None)
     gfn_seed = getattr(args, "gfn_seed", None)
@@ -196,7 +287,185 @@ def run_discover(args: argparse.Namespace) -> int:
             gfn_seed=gfn_seed,
             subtract_physical_potential=subtract_physical,
             intensive=intensive,
+            constraint_specs=constraint_specs,
+            admm_cfg=admm_cfg,
+            constraint_mode=constraint_mode,
         )
+
+        needs_outer = outer_choice not in {"", "none"}
+        needs_global = global_choice not in {"", "none"}
+        if (needs_outer or needs_global or certify_fp64) and system.elements:
+            logger.info(
+                "Outer/global optimization requested; using experimental column-scale parameterization.",
+                outer_opt=outer_choice,
+                global_search=global_choice,
+                certify_fp64=bool(certify_fp64),
+            )
+            need_boundary = bool(constraint_specs or certify_fp64)
+            colloc_out = get_collocation_data(
+                spec,
+                logger,
+                device=system.device,
+                dtype=system.dtype,
+                return_is_boundary=need_boundary,
+                n_points_override=args.n_points,
+                ratio_override=args.ratio_boundary,
+                subtract_physical_potential=subtract_physical,
+            )
+            if isinstance(colloc_out, tuple) and len(colloc_out) == 3:
+                colloc_pts, target_vec, is_boundary = colloc_out  # type: ignore[misc]
+            else:
+                colloc_pts, target_vec = colloc_out  # type: ignore[misc]
+                is_boundary = None
+
+            if colloc_pts.numel() > 0 and target_vec.numel() > 0:
+                A_base = assemble_basis_matrix(system.elements, colloc_pts)
+
+                class _ColumnScaleObjective:
+                    def __init__(self, A: torch.Tensor, X: torch.Tensor, g: torch.Tensor) -> None:
+                        self.A = A
+                        self.X = X
+                        self.g = g
+
+                    def build_dictionary(self, theta: torch.Tensor):
+                        scale = 1.0 + theta.view(1, 1)
+                        A_scaled = self.A * scale
+                        return A_scaled, self.X, self.g, {"A": A_scaled}
+
+                    def loss(self, theta: torch.Tensor, w: torch.Tensor, metadata: dict):
+                        A = metadata.get("A", self.A)
+                        pred = A.matmul(w)
+                        return torch.mean((pred - self.g) ** 2)
+
+                    def constraints(self, theta: torch.Tensor):
+                        return None
+
+                objective = _ColumnScaleObjective(A_base, colloc_pts, target_vec)
+                theta_init = torch.zeros(1, device=system.device, dtype=system.dtype)
+                inner_solver = "admm_constrained" if constraint_specs else "implicit_lasso"
+                inner_admm_cfg = admm_cfg
+                if inner_solver == "admm_constrained" and needs_outer:
+                    base_cfg = admm_cfg if isinstance(admm_cfg, ADMMConfig) else ADMMConfig()
+                    inner_admm_cfg = ADMMConfig(
+                        rho=base_cfg.rho,
+                        rho_growth=base_cfg.rho_growth,
+                        max_rho=base_cfg.max_rho,
+                        max_iter=base_cfg.max_iter,
+                        tol=base_cfg.tol,
+                        unroll_steps=max(5, int(base_cfg.unroll_steps) if base_cfg.unroll_steps > 0 else 5),
+                        w_update_iters=base_cfg.w_update_iters,
+                        diff_mode=base_cfg.diff_mode,
+                        verbose=base_cfg.verbose,
+                        track_residuals=base_cfg.track_residuals,
+                    )
+                solve_cfg = OuterSolveConfig(
+                    solver=inner_solver,
+                    reg_l1=float(args.reg_l1),
+                    max_iter=200,
+                    tol=1e-6,
+                    lambda_group=float(lambda_group),
+                    group_ids=compute_group_ids(system.elements, device=system.device, dtype=torch.long),
+                    normalize_columns=True,
+                    constraints=constraint_specs,
+                    constraint_mode=constraint_mode,
+                    admm_cfg=inner_admm_cfg,
+                )
+
+                theta_best = theta_init
+                if needs_global and budget > 0:
+                    theta_best, report = global_search(
+                        theta_best,
+                        objective,
+                        solve_cfg,
+                        method=global_choice,
+                        budget=budget,
+                        seed=seed,
+                    )
+                    logger.info(
+                        "Global search complete.",
+                        method=report.method,
+                        best_loss=float(report.best_loss),
+                        evaluations=int(report.evaluations),
+                    )
+
+                if needs_outer:
+                    if outer_choice == "lbfgs":
+                        result = optimize_theta_lbfgs(
+                            theta_best,
+                            objective,
+                            solve_cfg,
+                            max_iter=25,
+                            seed=seed,
+                            restarts=1,
+                        )
+                    else:
+                        result = optimize_theta_adam(
+                            theta_best,
+                            objective,
+                            solve_cfg,
+                            steps=40,
+                            lr=5e-2,
+                            seed=seed,
+                            restarts=1,
+                        )
+                    theta_best = result.theta
+                    logger.info(
+                        "Outer optimization complete.",
+                        method=outer_choice,
+                        loss=float(result.loss),
+                    )
+
+                A_opt, _, g_opt, _ = objective.build_dictionary(theta_best)
+                w_opt, _, stats = solve_sparse(
+                    A_opt,
+                    colloc_pts,
+                    g_opt,
+                    is_boundary if need_boundary else None,
+                    logger,
+                    reg_l1=float(args.reg_l1),
+                    solver=inner_solver,
+                    group_ids=solve_cfg.group_ids,
+                    lambda_group=float(lambda_group),
+                    normalize_columns=True,
+                    constraints=constraint_specs,
+                    constraint_mode=constraint_mode,
+                    admm_cfg=inner_admm_cfg,
+                    return_stats=True,
+                )
+                system.weights = w_opt
+                system.metadata["outer_theta"] = float(theta_best.detach().view(-1)[0].item())
+                system.metadata["outer_stats"] = stats
+
+                if certify_fp64:
+                    req = SparseSolveRequest(
+                        A=A_opt,
+                        X=colloc_pts,
+                        g=g_opt,
+                        is_boundary=is_boundary if need_boundary else None,
+                        lambda_l1=float(args.reg_l1),
+                        lambda_group=float(lambda_group),
+                        group_ids=solve_cfg.group_ids,
+                        weight_prior=None,
+                        lambda_weight_prior=0.0,
+                        normalize_columns=True,
+                        col_norms=None,
+                        constraints=constraint_specs or [],
+                        max_iter=200,
+                        tol=1e-6,
+                        warm_start=w_opt,
+                        return_stats=True,
+                        dtype_policy=None,
+                    )
+                    w64, cert = refine_and_certify(
+                        req,
+                        solver=inner_solver,
+                        admm_cfg=inner_admm_cfg,
+                        w_init=w_opt,
+                        use_mpmath=certify_mpmath,
+                    )
+                    system.weights = w64
+                    system.metadata["certificate"] = cert
+                    logger.info("FP64 certification complete.", certificate=cert)
         save_path = out_dir / "discovered_system.json"
         metadata = {
             "spec_path": str(Path(args.spec).resolve()),
@@ -304,9 +573,109 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_disc.add_argument(
         "--solver",
         type=str,
-        choices=["ista", "lista"],
+        choices=["ista", "lista", "implicit_lasso", "implicit_grouplasso", "admm_constrained"],
         default=None,
         help="Sparse solver backend.",
+    )
+    p_disc.add_argument(
+        "--constraint",
+        type=str,
+        action="append",
+        choices=["collocation", "planar_fft", "sphere_sh"],
+        default=None,
+        help="Add a constraint block (repeatable).",
+    )
+    p_disc.add_argument(
+        "--constraint-kind",
+        type=str,
+        choices=["eq", "l2", "linf"],
+        default="eq",
+        help="Constraint type (equality, l2 bound, or linf bound).",
+    )
+    p_disc.add_argument(
+        "--constraint-eps",
+        type=float,
+        default=0.0,
+        help="Constraint bound (eps).",
+    )
+    p_disc.add_argument(
+        "--constraint-weight",
+        type=float,
+        default=1.0,
+        help="Constraint weight multiplier.",
+    )
+    p_disc.add_argument(
+        "--constraint-region",
+        type=str,
+        choices=["all", "boundary", "interior"],
+        default="all",
+        help="Collocation region selection for collocation constraints.",
+    )
+    p_disc.add_argument(
+        "--constraint-mode",
+        type=str,
+        choices=["none", "admm"],
+        default="admm",
+        help="Constraint handling mode.",
+    )
+    p_disc.add_argument(
+        "--fft-grid-h",
+        type=int,
+        default=None,
+        help="Planar FFT grid height.",
+    )
+    p_disc.add_argument(
+        "--fft-grid-w",
+        type=int,
+        default=None,
+        help="Planar FFT grid width.",
+    )
+    p_disc.add_argument(
+        "--fft-modes",
+        type=str,
+        default=None,
+        help="Planar FFT mode indices as 'ky,kx;ky,kx'.",
+    )
+    p_disc.add_argument(
+        "--fft-shift",
+        action="store_true",
+        help="Apply fftshift before selecting planar FFT modes.",
+    )
+    p_disc.add_argument(
+        "--sh-lmax",
+        type=int,
+        default=None,
+        help="Spherical harmonics maximum degree (Lmax).",
+    )
+    p_disc.add_argument(
+        "--admm-rho",
+        type=float,
+        default=None,
+        help="ADMM rho penalty parameter.",
+    )
+    p_disc.add_argument(
+        "--admm-max-iter",
+        type=int,
+        default=None,
+        help="ADMM maximum iterations.",
+    )
+    p_disc.add_argument(
+        "--admm-tol",
+        type=float,
+        default=None,
+        help="ADMM convergence tolerance.",
+    )
+    p_disc.add_argument(
+        "--admm-w-update-iters",
+        type=int,
+        default=None,
+        help="Inner w-update iterations per ADMM step.",
+    )
+    p_disc.add_argument(
+        "--admm-unroll-steps",
+        type=int,
+        default=None,
+        help="Unrolled ADMM steps for training mode.",
     )
     p_disc.add_argument(
         "--operator-mode",
@@ -341,6 +710,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="If >0, enable LBFGS refinement of weights/positions.",
+    )
+    p_disc.add_argument(
+        "--outer-opt",
+        "--outer_opt",
+        dest="outer_opt",
+        choices=["lbfgs", "adam", "none"],
+        default="none",
+        help="Outer optimization method for experimental continuous parameters.",
+    )
+    p_disc.add_argument(
+        "--global-search",
+        "--global_search",
+        dest="global_search",
+        choices=["cmaes", "basinhop", "multistart", "none"],
+        default="none",
+        help="Global search strategy for experimental continuous parameters.",
+    )
+    p_disc.add_argument(
+        "--budget",
+        type=int,
+        default=16,
+        help="Evaluation budget for global search.",
+    )
+    p_disc.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for outer/global optimization.",
+    )
+    p_disc.add_argument(
+        "--certify-fp64",
+        "--certify_fp64",
+        dest="certify_fp64",
+        action="store_true",
+        help="Re-solve weights in float64 and emit certification stats.",
+    )
+    p_disc.add_argument(
+        "--certify-mpmath",
+        "--certify_mpmath",
+        dest="certify_mpmath",
+        action="store_true",
+        help="Enable optional mpmath verification for tiny problems.",
     )
     p_disc.add_argument(
         "--intensive",

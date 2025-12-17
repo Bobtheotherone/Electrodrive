@@ -463,10 +463,12 @@ def _maybe_shuffle_candidates(
 
 
 def _normalize_generator_mode(mode: Optional[str]) -> str:
-    allowed = {"static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion"}
+    allowed = {"static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion", "gfn"}
     if not mode:
         return "static_only"
     m = mode.strip().lower()
+    if m == "gflownet":
+        m = "gfn"
     if m not in allowed:
         return "static_only"
     return m
@@ -714,6 +716,94 @@ def _build_learned_candidates(
             "Learned candidates generated.",
             n_candidates=len(safe),
             mode="learned",
+        )
+    return safe[:n_candidates]
+
+
+def _build_gfn_candidates(
+    spec: CanonicalSpec,
+    gfn_generator: Any,
+    geo_encoder: Optional[Any],
+    n_candidates: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    logger: JsonlLogger,
+    seed: Optional[int],
+) -> List[ImageBasisElement]:
+    """Invoke a GFlowNetProgramGenerator to produce candidates."""
+    if n_candidates <= 0:
+        return []
+
+    try:
+        from electrodrive.images.geo_encoder import GeoEncoder  # type: ignore[assignment]
+    except Exception:
+        GeoEncoder = None  # type: ignore[assignment]
+    try:
+        from electrodrive.images.learned_generator import SimpleGeoEncoder  # type: ignore[assignment]
+    except Exception:
+        SimpleGeoEncoder = None  # type: ignore[assignment]
+
+    encoder = geo_encoder
+    if encoder is None:
+        choice = os.getenv("EDE_IMAGES_GEO_ENCODER", "egnn").strip().lower()
+        if choice in {"egnn", "geo", "graph"} and GeoEncoder is not None:
+            encoder = GeoEncoder()
+        elif choice in {"simple", "mlp"} and SimpleGeoEncoder is not None:
+            encoder = SimpleGeoEncoder()
+        elif GeoEncoder is not None:
+            encoder = GeoEncoder()
+        elif SimpleGeoEncoder is not None:
+            encoder = SimpleGeoEncoder()
+        else:
+            raise ValueError("GFlowNet generator requested but no GeoEncoder available.")
+
+    try:
+        encoder = encoder.to(device=device)  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    encoder.eval()
+    try:
+        gfn_generator.set_spec(spec)
+    except Exception:
+        pass
+
+    with torch.no_grad():
+        z_global, charge_nodes, conductor_nodes = encoder.encode(
+            spec,
+            device=device,
+            dtype=dtype,
+        )
+        candidates = gfn_generator.generate(
+            spec=spec,
+            spec_embedding=z_global,
+            n_candidates=n_candidates,
+            seed=seed,
+        )
+
+    safe: List[ImageBasisElement] = []
+    for elem in candidates:
+        try:
+            pos = elem.params.get("position", None)
+            if pos is None or not torch.isfinite(pos).all():
+                continue
+            info = getattr(elem, "_group_info", None)
+            if not isinstance(info, dict) or not info:
+                annotate_group_info(
+                    elem,
+                    conductor_id=0,
+                    family_name=elem.type,
+                    motif_index=0,
+                )
+            safe.append(elem)
+        except Exception:
+            continue
+
+    if safe:
+        logger.info(
+            "GFlowNet candidates generated.",
+            n_candidates=len(safe),
+            mode="gfn",
         )
     return safe[:n_candidates]
 
@@ -2269,6 +2359,8 @@ def discover_images(
     lambda_weight_prior: float | torch.Tensor = 0.0,
     weight_prior_label: Optional[str] = None,
     model_checkpoint: Optional[str] = None,
+    gfn_checkpoint: Optional[str] = None,
+    gfn_seed: Optional[int] = None,
     subtract_physical_potential: bool = False,
     intensive: Optional[bool] = None,
 ) -> ImageSystem:
@@ -2338,6 +2430,8 @@ def discover_images(
         operator_mode=bool(use_operator),
         aug_lagrange=bool(aug_cfg is not None),
         model_checkpoint=model_checkpoint,
+        gfn_checkpoint=gfn_checkpoint,
+        gfn_seed=gfn_seed,
         intensive=bool(intensive_mode),
     )
 
@@ -2347,6 +2441,13 @@ def discover_images(
     cand_multiplier = 16 if intensive_mode else 4
     learned_multiplier = max(2, cand_multiplier // 2)
     cand_rng = _make_torch_rng(device)
+    if gfn_seed is None:
+        seed_env = os.getenv("EDE_IMAGES_GFN_SEED", "").strip()
+        if seed_env:
+            try:
+                gfn_seed = int(seed_env)
+            except Exception:
+                gfn_seed = None
 
     if mode in {"diffusion", "hybrid_diffusion"} and basis_generator is None:
         try:
@@ -2368,6 +2469,22 @@ def discover_images(
                 error=str(exc),
             )
             mode = "static_only"
+    if mode == "gfn":
+        try:
+            from electrodrive.gfn.integration import GFlowNetProgramGenerator
+        except Exception as exc:
+            raise ValueError(f"Failed to import GFlowNetProgramGenerator: {exc}") from exc
+        if basis_generator is not None and not isinstance(basis_generator, GFlowNetProgramGenerator):
+            raise ValueError("GFlowNet mode requires a GFlowNetProgramGenerator instance.")
+        if basis_generator is None:
+            if not gfn_checkpoint:
+                raise ValueError("GFlowNet generator requires a checkpoint; random weights are not allowed.")
+            basis_generator = GFlowNetProgramGenerator(
+                checkpoint_path=gfn_checkpoint,
+                device=device,
+                dtype=dtype,
+            )
+        logger.info("Using GFlowNet BasisGenerator.", mode=mode)
 
     static_candidates: List[ImageBasisElement] = []
     if mode in {"static_only", "static_plus_learned", "hybrid_diffusion"}:
@@ -2381,7 +2498,19 @@ def discover_images(
         )
 
     learned_candidates: List[ImageBasisElement] = []
-    if basis_generator is not None and mode in {"static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion"}:
+    gfn_candidates: List[ImageBasisElement] = []
+    if mode == "gfn" and basis_generator is not None:
+        gfn_candidates = _build_gfn_candidates(
+            spec=spec,
+            gfn_generator=basis_generator,
+            geo_encoder=geo_encoder,
+            n_candidates=max(1, n_max * learned_multiplier),
+            device=device,
+            dtype=dtype,
+            logger=logger,
+            seed=gfn_seed,
+        )
+    elif basis_generator is not None and mode in {"static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion"}:
         learned_candidates = _build_learned_candidates(
             spec=spec,
             basis_generator=basis_generator,
@@ -2392,7 +2521,9 @@ def discover_images(
             logger=logger,
         )
 
-    if mode in {"learned_only", "diffusion"}:
+    if mode == "gfn":
+        candidates = gfn_candidates
+    elif mode in {"learned_only", "diffusion"}:
         candidates = learned_candidates
     elif mode in {"static_plus_learned", "hybrid_diffusion"}:
         combined = static_candidates + learned_candidates

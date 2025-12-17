@@ -73,6 +73,8 @@ def run_discover(args: argparse.Namespace) -> int:
     if solver_choice == "lista" and (lambda_group is None or lambda_group == 0.0):
         lambda_group = 1e-3
 
+    gfn_checkpoint = getattr(args, "gfn_checkpoint", None)
+    gfn_seed = getattr(args, "gfn_seed", None)
     logger.info(
         "Images discovery run started.",
         spec=str(args.spec),
@@ -82,6 +84,8 @@ def run_discover(args: argparse.Namespace) -> int:
         restarts=int(args.restarts),
         basis_generator=args.basis_generator,
         basis_generator_mode=args.basis_generator_mode,
+        gfn_checkpoint=gfn_checkpoint,
+        gfn_seed=gfn_seed,
         model_checkpoint=args.model_checkpoint,
         solver=solver_choice,
         solver_explicit=bool(solver_explicit),
@@ -100,6 +104,12 @@ def run_discover(args: argparse.Namespace) -> int:
         lista_model = None
         basis_generator = None
         geo_encoder = None
+        gfn_mode = args.basis_generator == "gfn" or args.basis_generator_mode == "gfn"
+        if gfn_mode and not gfn_checkpoint:
+            logger.error(
+                "GFlowNet generator requires a checkpoint; random weights are not allowed.",
+            )
+            return 1
 
         if args.model_checkpoint:
             lista_model = load_lista_from_checkpoint(args.model_checkpoint)
@@ -127,6 +137,8 @@ def run_discover(args: argparse.Namespace) -> int:
                 return 1
 
         if args.basis_generator == "none":
+            basis_generator = None
+        if gfn_mode:
             basis_generator = None
         if basis_generator is None and args.basis_generator == "mlp":
             choice = args.geo_encoder.lower() if hasattr(args, "geo_encoder") else "egnn"
@@ -157,6 +169,8 @@ def run_discover(args: argparse.Namespace) -> int:
         gen_mode = args.basis_generator_mode
         if args.basis_generator in {"diffusion", "hybrid_diffusion"}:
             gen_mode = args.basis_generator
+        if args.basis_generator == "gfn":
+            gen_mode = "gfn"
 
         system = discover_images(
             spec=spec,
@@ -178,6 +192,8 @@ def run_discover(args: argparse.Namespace) -> int:
             basis_generator_mode=gen_mode,
             geo_encoder=geo_encoder,
             model_checkpoint=args.model_checkpoint,
+            gfn_checkpoint=gfn_checkpoint,
+            gfn_seed=gfn_seed,
             subtract_physical_potential=subtract_physical,
             intensive=intensive,
         )
@@ -190,6 +206,7 @@ def run_discover(args: argparse.Namespace) -> int:
             "restarts": int(args.restarts),
             "basis_generator": args.basis_generator,
             "basis_generator_mode": args.basis_generator_mode,
+            "gfn_checkpoint": gfn_checkpoint,
             "subtract_physical": subtract_physical,
             "solver": solver_choice,
             "lambda_group": float(lambda_group),
@@ -334,8 +351,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basis-generator",
         type=str,
         default="none",
-        choices=["none", "mlp", "diffusion", "hybrid_diffusion"],
-        help="Optional learned candidate generator. 'diffusion' and 'hybrid_diffusion' require a trained checkpoint.",
+        choices=["none", "mlp", "diffusion", "hybrid_diffusion", "gfn"],
+        help="Optional learned candidate generator. 'diffusion' and 'gfn' require a trained checkpoint.",
     )
     p_disc.add_argument(
         "--geo-encoder",
@@ -348,7 +365,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basis-generator-mode",
         type=str,
         default="static_only",
-        choices=["static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion"],
+        choices=["static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion", "gfn"],
         help="How to combine learned candidates with static heuristics.",
     )
     p_disc.add_argument(
@@ -362,6 +379,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional path to a learned model checkpoint (GeoEncoder, BasisGenerator, LISTA).",
+    )
+    p_disc.add_argument(
+        "--gfn-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a GFlowNet generator checkpoint (required for gfn mode).",
+    )
+    p_disc.add_argument(
+        "--gfn-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for GFlowNet program sampling.",
     )
     p_disc.set_defaults(func=run_discover)
 

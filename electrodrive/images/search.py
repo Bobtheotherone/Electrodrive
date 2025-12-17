@@ -1764,6 +1764,11 @@ def solve_sparse(
     tol: float = 1e-6,
     lista_refine: bool = True,
     return_stats: bool = False,
+    constraints: Optional[list] = None,
+    dtype_policy: Optional[Any] = None,
+    warm_start: Optional[torch.Tensor] = None,
+    admm_cfg: Optional[Any] = None,
+    constraint_mode: str = "none",
 ) -> Tuple[torch.Tensor, List[int]] | Tuple[torch.Tensor, List[int], Dict[str, Any]]:
     """Unified sparse solver wrapper handling ISTA, LISTA, and AL."""
     stats: Dict[str, Any] = {"solver": (solver or "ista").strip().lower()}
@@ -1771,7 +1776,7 @@ def solve_sparse(
     stats.setdefault("converged", False)
     stats.setdefault("rel_change", float("nan"))
     solver_mode = (solver or "ista").strip().lower()
-    if solver_mode not in {"ista", "lista"}:
+    if solver_mode not in {"ista", "lista", "implicit_lasso", "implicit_grouplasso", "admm_constrained"}:
         solver_mode = "ista"
 
     if isinstance(A, BasisOperator) and group_ids is None:
@@ -1813,7 +1818,78 @@ def solve_sparse(
     w_out: torch.Tensor
     support_out: List[int]
 
-    if solver_mode == "lista" and lista_model is not None:
+    if solver_mode in {"implicit_lasso", "implicit_grouplasso"}:
+        from electrodrive.images.optim import (
+            SparseSolveRequest,
+            implicit_grouplasso_solve,
+            implicit_lasso_solve,
+        )
+
+        req = SparseSolveRequest(
+            A=A,
+            X=X if isinstance(A, BasisOperator) else None,
+            g=V_gt,
+            is_boundary=is_boundary,
+            lambda_l1=float(reg_l1),
+            lambda_group=lambda_group if lambda_group is not None else 0.0,
+            group_ids=group_ids,
+            weight_prior=weight_prior,
+            lambda_weight_prior=lambda_weight_prior,
+            normalize_columns=normalize_columns,
+            col_norms=None,
+            constraints=constraints or [],
+            max_iter=max_iter,
+            tol=tol,
+            warm_start=warm_start,
+            return_stats=return_stats,
+            dtype_policy=dtype_policy,
+        )
+        if solver_mode == "implicit_grouplasso":
+            result = implicit_grouplasso_solve(req)
+        else:
+            result = implicit_lasso_solve(req)
+        w_out = result.w
+        support_out = [int(i) for i in result.support.to(device="cpu", dtype=torch.long).tolist()]
+        stats.update(result.stats)
+        stats["solver"] = solver_mode
+    elif solver_mode == "admm_constrained":
+        from electrodrive.images.optim import ADMMConfig, SparseSolveRequest, admm_constrained_solve
+
+        constraint_mode_norm = (constraint_mode or "none").strip().lower()
+        constraint_list = [] if constraint_mode_norm in {"none", "off"} else (constraints or [])
+        if isinstance(admm_cfg, ADMMConfig):
+            cfg = admm_cfg
+        elif isinstance(admm_cfg, dict):
+            cfg = ADMMConfig(**admm_cfg)
+        elif admm_cfg is None:
+            cfg = ADMMConfig()
+        else:
+            cfg = admm_cfg
+        req = SparseSolveRequest(
+            A=A,
+            X=X if isinstance(A, BasisOperator) else None,
+            g=V_gt,
+            is_boundary=is_boundary,
+            lambda_l1=float(reg_l1),
+            lambda_group=lambda_group if lambda_group is not None else 0.0,
+            group_ids=group_ids,
+            weight_prior=weight_prior,
+            lambda_weight_prior=lambda_weight_prior,
+            normalize_columns=normalize_columns,
+            col_norms=None,
+            constraints=constraint_list,
+            max_iter=max_iter,
+            tol=tol,
+            warm_start=warm_start,
+            return_stats=return_stats,
+            dtype_policy=dtype_policy,
+        )
+        result = admm_constrained_solve(req, cfg if isinstance(cfg, ADMMConfig) else None)
+        w_out = result.w
+        support_out = [int(i) for i in result.support.to(device="cpu", dtype=torch.long).tolist()]
+        stats.update(result.stats)
+        stats["solver"] = solver_mode
+    elif solver_mode == "lista" and lista_model is not None:
         try:
             lista_model = lista_model.to(device=V_gt.device, dtype=V_gt.dtype)  # type: ignore[assignment]
         except Exception:
@@ -2363,6 +2439,9 @@ def discover_images(
     gfn_seed: Optional[int] = None,
     subtract_physical_potential: bool = False,
     intensive: Optional[bool] = None,
+    constraint_specs: Optional[list[Any]] = None,
+    admm_cfg: Optional[Any] = None,
+    constraint_mode: str = "none",
 ) -> ImageSystem:
     """Top-level entry point for sparse image discovery."""
 
@@ -2769,6 +2848,9 @@ def discover_images(
                     tol=1e-6,
                     lista_refine=True,
                     return_stats=with_stats,
+                    constraints=constraint_specs,
+                    admm_cfg=admm_cfg,
+                    constraint_mode=constraint_mode,
                 )
 
             if two_stage:

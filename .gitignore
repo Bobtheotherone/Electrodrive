@@ -14,8 +14,10 @@ run_out/
 outdir/
 *.log
 *.jsonl
-*.json
 *.tsv
+
+# JSON outputs (CAUTION: this is broad)
+*.json
 
 # --- ResearchED UI exceptions (must come AFTER *.json ignore) ---
 !researched_ui/package.json
@@ -37,15 +39,10 @@ dist/
 # IDE / editors
 .vscode/
 .idea/
-.venv/
-__pycache__/
-.pytest_cache/
-*.pyc
 *.Zone.Identifier
 
 # Local AI/scratch stuff
 temp_AI_upgrade/
-AGENTS.md
 keops_gpu_test.py
 .keops_cache/
 
@@ -58,3 +55,7 @@ electrodrive/researched/flattened_repo_with_contents.txt
 researched_ui/node_modules/
 researched_ui/dist/
 researched_ui/.vite/
+
+# Step-8 verification artifacts / caches
+artifacts/
+tmp_debug/

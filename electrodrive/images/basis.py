@@ -1064,9 +1064,39 @@ def generate_candidate_basis(
     wants_rich_inner = "rich_inner_rim" in basis_types
     wants_three_layer = "three_layer_images" in basis_types
     wants_three_layer = wants_three_layer and bool(getattr(spec, "dielectrics", None))
+    wants_three_layer_complex = "three_layer_complex" in basis_types
+    wants_three_layer_complex = wants_three_layer_complex and bool(getattr(spec, "dielectrics", None))
     wants_dcim = any(t in ("three_layer_dcim", "layered_dcim") for t in basis_types)
     wants_dcim = wants_dcim and bool(getattr(spec, "dielectrics", None))
     allow_unstable_dcim = "dcim_allow_unstable" in basis_types
+
+    if wants_three_layer_complex:
+        try:
+            from electrodrive.images.layered_basis_complex import (
+                generate_three_layer_candidates,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to import layered basis helper: {exc}") from exc
+        try:
+            layered_candidates = generate_three_layer_candidates(
+                spec,
+                device=device,
+                dtype=dtype,
+                max_candidates=min(12, n_candidates),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Layered basis generation failed: {exc}") from exc
+        for cand in layered_candidates:
+            if len(candidates) >= n_candidates:
+                break
+            elem = PointChargeBasis({"position": cand.position}, type_name="three_layer_images")
+            annotate_group_info(
+                elem,
+                conductor_id=cand.conductor_id,
+                family_name=cand.family,
+                motif_index=cand.motif_index,
+            )
+            candidates.append(elem)
 
     # Sphere Kelvin ladder: image charges inside each spherical conductor.
     if wants_sphere_kelvin and spheres and point_charges:

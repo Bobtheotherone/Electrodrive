@@ -544,7 +544,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basis",
         type=str,
         default="point",
-        help="Comma-separated list of basis types (e.g. 'point').",
+        help="Comma-separated list of basis types (e.g. 'point' or 'point,three_layer_complex').",
     )
     p_disc.add_argument(
         "--nmax",

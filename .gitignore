@@ -59,3 +59,6 @@ researched_ui/.vite/
 # Step-8 verification artifacts / caches
 artifacts/
 tmp_debug/
+
+# local outputs
+notes/repro_step2_output.txt

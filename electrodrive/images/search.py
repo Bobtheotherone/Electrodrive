@@ -463,12 +463,22 @@ def _maybe_shuffle_candidates(
 
 
 def _normalize_generator_mode(mode: Optional[str]) -> str:
-    allowed = {"static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion", "gfn"}
+    allowed = {
+        "static_only",
+        "static_plus_learned",
+        "learned_only",
+        "diffusion",
+        "hybrid_diffusion",
+        "gfn",
+        "gfn_flow",
+    }
     if not mode:
         return "static_only"
     m = mode.strip().lower()
     if m == "gflownet":
         m = "gfn"
+    if m in {"gflownet_flow", "gfnflow"}:
+        m = "gfn_flow"
     if m not in allowed:
         return "static_only"
     return m
@@ -729,6 +739,7 @@ def _build_gfn_candidates(
     dtype: torch.dtype,
     logger: JsonlLogger,
     seed: Optional[int],
+    mode: str = "gfn",
 ) -> List[ImageBasisElement]:
     """Invoke a GFlowNetProgramGenerator to produce candidates."""
     if n_candidates <= 0:
@@ -803,7 +814,7 @@ def _build_gfn_candidates(
         logger.info(
             "GFlowNet candidates generated.",
             n_candidates=len(safe),
-            mode="gfn",
+            mode=mode,
         )
     return safe[:n_candidates]
 
@@ -2437,6 +2448,13 @@ def discover_images(
     model_checkpoint: Optional[str] = None,
     gfn_checkpoint: Optional[str] = None,
     gfn_seed: Optional[int] = None,
+    flow_checkpoint: Optional[str] = None,
+    flow_steps: Optional[int] = None,
+    flow_solver: Optional[str] = None,
+    flow_temp: Optional[float] = None,
+    flow_dtype: Optional[str] = None,
+    flow_seed: Optional[int] = None,
+    allow_random_flow: bool = False,
     subtract_physical_potential: bool = False,
     intensive: Optional[bool] = None,
     constraint_specs: Optional[list[Any]] = None,
@@ -2511,6 +2529,13 @@ def discover_images(
         model_checkpoint=model_checkpoint,
         gfn_checkpoint=gfn_checkpoint,
         gfn_seed=gfn_seed,
+        flow_checkpoint=flow_checkpoint,
+        flow_steps=flow_steps,
+        flow_solver=flow_solver,
+        flow_temp=flow_temp,
+        flow_dtype=flow_dtype,
+        flow_seed=flow_seed,
+        allow_random_flow=bool(allow_random_flow),
         intensive=bool(intensive_mode),
     )
 
@@ -2564,6 +2589,40 @@ def discover_images(
                 dtype=dtype,
             )
         logger.info("Using GFlowNet BasisGenerator.", mode=mode)
+    if mode == "gfn_flow":
+        try:
+            from electrodrive.flows.types import FlowConfig
+            from electrodrive.gfn.integration import HybridGFlowFlowGenerator
+        except Exception as exc:
+            raise ValueError(f"Failed to import HybridGFlowFlowGenerator: {exc}") from exc
+        if basis_generator is not None and not isinstance(basis_generator, HybridGFlowFlowGenerator):
+            raise ValueError("gfn_flow mode requires a HybridGFlowFlowGenerator instance.")
+        if basis_generator is None:
+            if not gfn_checkpoint:
+                raise ValueError("gfn_flow requires a GFlowNet checkpoint; random weights are not allowed.")
+            if not flow_checkpoint and not allow_random_flow:
+                raise ValueError("gfn_flow requires a flow checkpoint unless allow_random_flow is enabled.")
+            base_cfg = FlowConfig()
+            flow_cfg = FlowConfig(
+                latent_dim=base_cfg.latent_dim,
+                model_dim=base_cfg.model_dim,
+                max_tokens=base_cfg.max_tokens,
+                max_ast_len=base_cfg.max_ast_len,
+                n_steps=int(flow_steps) if flow_steps is not None else base_cfg.n_steps,
+                solver=str(flow_solver or base_cfg.solver),
+                temperature=float(flow_temp) if flow_temp is not None else base_cfg.temperature,
+                dtype=str(flow_dtype or base_cfg.dtype),
+                seed=flow_seed,
+            )
+            basis_generator = HybridGFlowFlowGenerator(
+                checkpoint_path=gfn_checkpoint,
+                flow_checkpoint_path=flow_checkpoint,
+                flow_config=flow_cfg,
+                allow_random_flow=allow_random_flow,
+                device=device,
+                dtype=dtype,
+            )
+        logger.info("Using Hybrid GFlowFlow BasisGenerator.", mode=mode)
 
     static_candidates: List[ImageBasisElement] = []
     if mode in {"static_only", "static_plus_learned", "hybrid_diffusion"}:
@@ -2578,7 +2637,7 @@ def discover_images(
 
     learned_candidates: List[ImageBasisElement] = []
     gfn_candidates: List[ImageBasisElement] = []
-    if mode == "gfn" and basis_generator is not None:
+    if mode in {"gfn", "gfn_flow"} and basis_generator is not None:
         gfn_candidates = _build_gfn_candidates(
             spec=spec,
             gfn_generator=basis_generator,
@@ -2588,6 +2647,7 @@ def discover_images(
             dtype=dtype,
             logger=logger,
             seed=gfn_seed,
+            mode=mode,
         )
     elif basis_generator is not None and mode in {"static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion"}:
         learned_candidates = _build_learned_candidates(
@@ -2600,7 +2660,7 @@ def discover_images(
             logger=logger,
         )
 
-    if mode == "gfn":
+    if mode in {"gfn", "gfn_flow"}:
         candidates = gfn_candidates
     elif mode in {"learned_only", "diffusion"}:
         candidates = learned_candidates

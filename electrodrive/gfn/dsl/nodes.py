@@ -25,15 +25,22 @@ class AddPrimitiveBlock(Node):
     family_name: str
     conductor_id: int
     motif_id: int
+    schema_id: int | None = None
+    schema_name: str | None = None
     type_name: ClassVar[str] = "add_primitive"
 
     def to_dict(self) -> Mapping[str, Any]:
-        return {
+        data = {
             "type": self.type_name,
             "family_name": self.family_name,
             "conductor_id": self.conductor_id,
             "motif_id": self.motif_id,
         }
+        if self.schema_id is not None:
+            data["schema_id"] = int(self.schema_id)
+        if self.schema_name is not None:
+            data["schema_name"] = str(self.schema_name)
+        return data
 
 
 @dataclass(frozen=True)
@@ -60,14 +67,21 @@ class AddPoleBlock(Node):
 
     interface_id: Union[int, str]
     n_poles: int
+    schema_id: int | None = None
+    schema_name: str | None = None
     type_name: ClassVar[str] = "add_pole"
 
     def to_dict(self) -> Mapping[str, Any]:
-        return {
+        data = {
             "type": self.type_name,
             "interface_id": self.interface_id,
             "n_poles": self.n_poles,
         }
+        if self.schema_id is not None:
+            data["schema_id"] = int(self.schema_id)
+        if self.schema_name is not None:
+            data["schema_name"] = str(self.schema_name)
+        return data
 
 
 @dataclass(frozen=True)
@@ -77,15 +91,22 @@ class AddBranchCutBlock(Node):
     interface_id: Union[int, str]
     approx_type: str
     budget: int
+    schema_id: int | None = None
+    schema_name: str | None = None
     type_name: ClassVar[str] = "add_branch_cut"
 
     def to_dict(self) -> Mapping[str, Any]:
-        return {
+        data = {
             "type": self.type_name,
             "interface_id": self.interface_id,
             "approx_type": self.approx_type,
             "budget": self.budget,
         }
+        if self.schema_id is not None:
+            data["schema_id"] = int(self.schema_id)
+        if self.schema_name is not None:
+            data["schema_name"] = str(self.schema_name)
+        return data
 
 
 @dataclass(frozen=True)

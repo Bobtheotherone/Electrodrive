@@ -166,6 +166,13 @@ def run_discover(args: argparse.Namespace) -> int:
 
     gfn_checkpoint = getattr(args, "gfn_checkpoint", None)
     gfn_seed = getattr(args, "gfn_seed", None)
+    flow_checkpoint = getattr(args, "flow_checkpoint", None)
+    flow_steps = getattr(args, "flow_steps", None)
+    flow_solver = getattr(args, "flow_solver", None)
+    flow_temp = getattr(args, "flow_temp", None)
+    flow_dtype = getattr(args, "flow_dtype", None)
+    flow_seed = getattr(args, "flow_seed", None)
+    allow_random_flow = bool(getattr(args, "allow_random_flow", False))
     logger.info(
         "Images discovery run started.",
         spec=str(args.spec),
@@ -177,6 +184,13 @@ def run_discover(args: argparse.Namespace) -> int:
         basis_generator_mode=args.basis_generator_mode,
         gfn_checkpoint=gfn_checkpoint,
         gfn_seed=gfn_seed,
+        flow_checkpoint=flow_checkpoint,
+        flow_steps=flow_steps,
+        flow_solver=flow_solver,
+        flow_temp=flow_temp,
+        flow_dtype=flow_dtype,
+        flow_seed=flow_seed,
+        allow_random_flow=bool(allow_random_flow),
         model_checkpoint=args.model_checkpoint,
         solver=solver_choice,
         solver_explicit=bool(solver_explicit),
@@ -195,8 +209,16 @@ def run_discover(args: argparse.Namespace) -> int:
         lista_model = None
         basis_generator = None
         geo_encoder = None
-        gfn_mode = args.basis_generator == "gfn" or args.basis_generator_mode == "gfn"
-        if gfn_mode and not gfn_checkpoint:
+        gfn_mode = args.basis_generator in {"gfn", "gfn_flow"} or args.basis_generator_mode in {"gfn", "gfn_flow"}
+        gfn_flow_mode = args.basis_generator == "gfn_flow" or args.basis_generator_mode == "gfn_flow"
+        if gfn_flow_mode:
+            if not gfn_checkpoint:
+                raise SystemExit("gfn_flow requires --gfn-checkpoint; random weights are not allowed.")
+            if not flow_checkpoint and not allow_random_flow:
+                raise SystemExit(
+                    "gfn_flow requires --flow-checkpoint unless --allow-random-flow is set."
+                )
+        elif gfn_mode and not gfn_checkpoint:
             logger.error(
                 "GFlowNet generator requires a checkpoint; random weights are not allowed.",
             )
@@ -260,8 +282,8 @@ def run_discover(args: argparse.Namespace) -> int:
         gen_mode = args.basis_generator_mode
         if args.basis_generator in {"diffusion", "hybrid_diffusion"}:
             gen_mode = args.basis_generator
-        if args.basis_generator == "gfn":
-            gen_mode = "gfn"
+        if args.basis_generator in {"gfn", "gfn_flow"}:
+            gen_mode = args.basis_generator
 
         system = discover_images(
             spec=spec,
@@ -285,6 +307,13 @@ def run_discover(args: argparse.Namespace) -> int:
             model_checkpoint=args.model_checkpoint,
             gfn_checkpoint=gfn_checkpoint,
             gfn_seed=gfn_seed,
+            flow_checkpoint=flow_checkpoint,
+            flow_steps=flow_steps,
+            flow_solver=flow_solver,
+            flow_temp=flow_temp,
+            flow_dtype=flow_dtype,
+            flow_seed=flow_seed,
+            allow_random_flow=allow_random_flow,
             subtract_physical_potential=subtract_physical,
             intensive=intensive,
             constraint_specs=constraint_specs,
@@ -476,6 +505,7 @@ def run_discover(args: argparse.Namespace) -> int:
             "basis_generator": args.basis_generator,
             "basis_generator_mode": args.basis_generator_mode,
             "gfn_checkpoint": gfn_checkpoint,
+            "flow_checkpoint": flow_checkpoint,
             "subtract_physical": subtract_physical,
             "solver": solver_choice,
             "lambda_group": float(lambda_group),
@@ -762,8 +792,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basis-generator",
         type=str,
         default="none",
-        choices=["none", "mlp", "diffusion", "hybrid_diffusion", "gfn"],
-        help="Optional learned candidate generator. 'diffusion' and 'gfn' require a trained checkpoint.",
+        choices=["none", "mlp", "diffusion", "hybrid_diffusion", "gfn", "gfn_flow"],
+        help="Optional learned candidate generator. 'diffusion', 'gfn', and 'gfn_flow' require checkpoints.",
     )
     p_disc.add_argument(
         "--geo-encoder",
@@ -776,7 +806,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--basis-generator-mode",
         type=str,
         default="static_only",
-        choices=["static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion", "gfn"],
+        choices=["static_only", "static_plus_learned", "learned_only", "diffusion", "hybrid_diffusion", "gfn", "gfn_flow"],
         help="How to combine learned candidates with static heuristics.",
     )
     p_disc.add_argument(
@@ -796,6 +826,49 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Path to a GFlowNet generator checkpoint (required for gfn mode).",
+    )
+    p_disc.add_argument(
+        "--flow-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a flow sampler checkpoint (required for gfn_flow unless --allow-random-flow).",
+    )
+    p_disc.add_argument(
+        "--flow-steps",
+        type=int,
+        default=None,
+        help="Number of flow integration steps (1-8 typical).",
+    )
+    p_disc.add_argument(
+        "--flow-solver",
+        type=str,
+        choices=["euler", "heun", "rk4"],
+        default=None,
+        help="Flow ODE solver.",
+    )
+    p_disc.add_argument(
+        "--flow-temp",
+        type=float,
+        default=None,
+        help="Flow sampling temperature.",
+    )
+    p_disc.add_argument(
+        "--flow-dtype",
+        type=str,
+        choices=["bf16", "fp16", "fp32"],
+        default=None,
+        help="Flow sampling dtype.",
+    )
+    p_disc.add_argument(
+        "--flow-seed",
+        type=int,
+        default=None,
+        help="Optional RNG seed for flow parameter sampling.",
+    )
+    p_disc.add_argument(
+        "--allow-random-flow",
+        action="store_true",
+        help="Allow gfn_flow to run with random flow weights if no checkpoint is provided.",
     )
     p_disc.add_argument(
         "--gfn-seed",

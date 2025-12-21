@@ -24,6 +24,7 @@ class Grammar:
     families: Tuple[str, ...] = ("baseline",)
     motifs: Tuple[str, ...] = ("connector",)
     approx_types: Tuple[str, ...] = ("pade",)
+    schema_ids: Tuple[int, ...] = ()
     base_pole_budget: int = 1
     branch_cut_budget: int = 1
     _cached_actions: Tuple[Action, ...] = field(default_factory=tuple, init=False, repr=False, compare=False)
@@ -34,14 +35,25 @@ class Grammar:
             return self._cached_actions
 
         actions: list[Action] = []
-        for family in self.families:
-            actions.append(
-                Action(
-                    action_type="add_primitive",
-                    action_subtype=family,
-                    discrete_args={"family_name": family},
+        if self.schema_ids:
+            for family in self.families:
+                for schema_id in self.schema_ids:
+                    actions.append(
+                        Action(
+                            action_type="add_primitive",
+                            action_subtype=family,
+                            discrete_args={"family_name": family, "schema_id": schema_id},
+                        )
+                    )
+        else:
+            for family in self.families:
+                actions.append(
+                    Action(
+                        action_type="add_primitive",
+                        action_subtype=family,
+                        discrete_args={"family_name": family},
+                    )
                 )
-            )
         for motif in self.motifs:
             actions.append(
                 Action(
@@ -50,22 +62,46 @@ class Grammar:
                     discrete_args={"motif_type": motif},
                 )
             )
-        actions.append(
-            Action(
-                action_type="add_pole",
-                discrete_args={"interface_id": 0, "n_poles": self.base_pole_budget},
+        if self.schema_ids:
+            for schema_id in self.schema_ids:
+                actions.append(
+                    Action(
+                        action_type="add_pole",
+                        discrete_args={
+                            "interface_id": 0,
+                            "n_poles": self.base_pole_budget,
+                            "schema_id": schema_id,
+                        },
+                    )
+                )
+                actions.append(
+                    Action(
+                        action_type="add_branch_cut",
+                        discrete_args={
+                            "interface_id": 0,
+                            "approx_type": self.approx_types[0],
+                            "budget": self.branch_cut_budget,
+                            "schema_id": schema_id,
+                        },
+                    )
+                )
+        else:
+            actions.append(
+                Action(
+                    action_type="add_pole",
+                    discrete_args={"interface_id": 0, "n_poles": self.base_pole_budget},
+                )
             )
-        )
-        actions.append(
-            Action(
-                action_type="add_branch_cut",
-                discrete_args={
-                    "interface_id": 0,
-                    "approx_type": self.approx_types[0],
-                    "budget": self.branch_cut_budget,
-                },
+            actions.append(
+                Action(
+                    action_type="add_branch_cut",
+                    discrete_args={
+                        "interface_id": 0,
+                        "approx_type": self.approx_types[0],
+                        "budget": self.branch_cut_budget,
+                    },
+                )
             )
-        )
         actions.append(Action(action_type="conjugate_pair", discrete_args={"block_ref": 0}))
         actions.append(Action(action_type="stop"))
 

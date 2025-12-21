@@ -221,6 +221,12 @@ class ElectrodriveProgramEnv:
         interface_id = int(action.discrete_args.get("interface_id", -1))
         arg0 = -1
         arg1 = -1
+        schema_id = action.discrete_args.get("schema_id")
+        if schema_id is not None:
+            try:
+                arg1 = int(schema_id)
+            except Exception:
+                arg1 = -1
 
         if action.action_type == "add_primitive":
             family = action.discrete_args.get("family_name") or action.action_subtype
@@ -286,6 +292,8 @@ class ElectrodriveProgramEnv:
                 discrete_args["conductor_id"] = conductor_id
             if motif_id >= 0:
                 discrete_args["motif_id"] = motif_id
+            if arg1 >= 0:
+                discrete_args["schema_id"] = arg1
         elif action_type == "add_motif":
             if motif_id >= 0:
                 motif_name = self.id_to_motif.get(motif_id, "unknown")
@@ -296,6 +304,8 @@ class ElectrodriveProgramEnv:
                 discrete_args["interface_id"] = interface_id
             if arg0 >= 0:
                 discrete_args["n_poles"] = arg0
+            if arg1 >= 0:
+                discrete_args["schema_id"] = arg1
         elif action_type == "add_branch_cut":
             if interface_id >= 0:
                 discrete_args["interface_id"] = interface_id
@@ -303,6 +313,8 @@ class ElectrodriveProgramEnv:
                 discrete_args["approx_type"] = self.id_to_approx.get(subtype_id, "unknown")
             if arg0 >= 0:
                 discrete_args["budget"] = arg0
+            if arg1 >= 0:
+                discrete_args["schema_id"] = arg1
         elif action_type == "conjugate_pair":
             if arg0 >= 0:
                 discrete_args["block_ref"] = arg0
@@ -384,11 +396,22 @@ class ElectrodriveProgramEnv:
 
     def _action_to_node(self, action: Action) -> object:
         """Convert an action into the corresponding AST node."""
+        schema_id = action.discrete_args.get("schema_id")
+        if schema_id is not None:
+            try:
+                schema_id = int(schema_id)
+            except Exception:
+                schema_id = None
         if action.action_type == "add_primitive":
             family = action.discrete_args.get("family_name") or action.action_subtype or "baseline"
             conductor = int(action.discrete_args.get("conductor_id", 0))
             motif_id = int(action.discrete_args.get("motif_id", 0))
-            return AddPrimitiveBlock(family_name=str(family), conductor_id=conductor, motif_id=motif_id)
+            return AddPrimitiveBlock(
+                family_name=str(family),
+                conductor_id=conductor,
+                motif_id=motif_id,
+                schema_id=schema_id,
+            )
         if action.action_type == "add_motif":
             motif = action.discrete_args.get("motif_type") or action.action_subtype or "connector"
             args = action.discrete_args.copy()
@@ -397,12 +420,17 @@ class ElectrodriveProgramEnv:
         if action.action_type == "add_pole":
             interface_id = action.discrete_args.get("interface_id", 0)
             n_poles = int(action.discrete_args.get("n_poles", 1))
-            return AddPoleBlock(interface_id=interface_id, n_poles=n_poles)
+            return AddPoleBlock(interface_id=interface_id, n_poles=n_poles, schema_id=schema_id)
         if action.action_type == "add_branch_cut":
             interface_id = action.discrete_args.get("interface_id", 0)
             approx_type = action.discrete_args.get("approx_type") or action.action_subtype or "pade"
             budget = int(action.discrete_args.get("budget", 1))
-            return AddBranchCutBlock(interface_id=interface_id, approx_type=str(approx_type), budget=budget)
+            return AddBranchCutBlock(
+                interface_id=interface_id,
+                approx_type=str(approx_type),
+                budget=budget,
+                schema_id=schema_id,
+            )
         if action.action_type == "conjugate_pair":
             block_ref = int(action.discrete_args.get("block_ref", 0))
             return ConjugatePair(block_ref=block_ref)
@@ -411,10 +439,13 @@ class ElectrodriveProgramEnv:
         raise ValueError(f"Unknown action type {action.action_type}")
 
     def _action_key(self, action: Action) -> tuple:
-        items = tuple(
-            sorted((key, self._normalize_action_value(value)) for key, value in action.discrete_args.items())
-        )
-        return (action.action_type, action.action_subtype or "", items)
+        items = []
+        for key, value in action.discrete_args.items():
+            normalized = self._normalize_action_value(value)
+            if key == "schema_id" and normalized in ("", 0, -1):
+                continue
+            items.append((key, normalized))
+        return (action.action_type, action.action_subtype or "", tuple(sorted(items)))
 
     @staticmethod
     def _normalize_action_value(value: object) -> object:
@@ -437,6 +468,9 @@ class ElectrodriveProgramEnv:
             motif_id = action.discrete_args.get("motif_id")
             if motif_id is not None and int(motif_id) != node.motif_id:
                 return False
+            schema_id = action.discrete_args.get("schema_id")
+            if schema_id is not None and int(schema_id) != int(node.schema_id or 0):
+                return False
             return True
         if isinstance(node, AddMotifBlock):
             motif = action.discrete_args.get("motif_type") or action.action_subtype
@@ -455,6 +489,9 @@ class ElectrodriveProgramEnv:
             n_poles = action.discrete_args.get("n_poles")
             if n_poles is not None and int(n_poles) != node.n_poles:
                 return False
+            schema_id = action.discrete_args.get("schema_id")
+            if schema_id is not None and int(schema_id) != int(node.schema_id or 0):
+                return False
             return True
         if isinstance(node, AddBranchCutBlock):
             interface_id = action.discrete_args.get("interface_id")
@@ -465,6 +502,9 @@ class ElectrodriveProgramEnv:
                 return False
             budget = action.discrete_args.get("budget")
             if budget is not None and int(budget) != node.budget:
+                return False
+            schema_id = action.discrete_args.get("schema_id")
+            if schema_id is not None and int(schema_id) != int(node.schema_id or 0):
                 return False
             return True
         if isinstance(node, ConjugatePair):

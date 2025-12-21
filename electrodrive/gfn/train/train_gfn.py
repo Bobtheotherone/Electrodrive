@@ -66,21 +66,46 @@ def train_gfn_step(
 
     reward_terms_list = []
     diag_counts = {"empty_compilation": 0, "solver_failed": 0, "nonfinite": 0}
-    for state, spec_item in zip(trajectories.final_states, spec_batch):
-        if state is None:
-            raise ValueError("Rollout produced empty final states.")
-        reward_terms_list.append(
-            reward_computer.compute(
-                state.program,
-                spec_item.spec,
-                device=device,
-                seed=spec_item.seed,
-            )
+    if reward_computer.param_sampler is not None and hasattr(reward_computer, "compute_batch"):
+        programs = []
+        specs = []
+        spec_embeddings_list = []
+        seeds = []
+        for state, spec_item in zip(trajectories.final_states, spec_batch):
+            if state is None:
+                raise ValueError("Rollout produced empty final states.")
+            programs.append(state.program)
+            specs.append(spec_item.spec)
+            spec_embeddings_list.append(spec_item.spec_embedding)
+            seeds.append(spec_item.seed)
+        reward_terms_list = reward_computer.compute_batch(
+            programs,
+            specs,
+            device=device,
+            seeds=seeds,
+            spec_embeddings=spec_embeddings_list,
         )
-        last_diag = reward_computer.last_diagnostics
-        for key in diag_counts:
-            if last_diag.get(key):
-                diag_counts[key] += 1
+        for last_diag in getattr(reward_computer, "last_diagnostics_batch", []):
+            for key in diag_counts:
+                if last_diag.get(key):
+                    diag_counts[key] += 1
+    else:
+        for state, spec_item in zip(trajectories.final_states, spec_batch):
+            if state is None:
+                raise ValueError("Rollout produced empty final states.")
+            reward_terms_list.append(
+                reward_computer.compute(
+                    state.program,
+                    spec_item.spec,
+                    device=device,
+                    seed=spec_item.seed,
+                    spec_embedding=spec_item.spec_embedding,
+                )
+            )
+            last_diag = reward_computer.last_diagnostics
+            for key in diag_counts:
+                if last_diag.get(key):
+                    diag_counts[key] += 1
     logR = torch.stack([terms.logR for terms in reward_terms_list], dim=0)
 
     loss_tb = tb_loss(

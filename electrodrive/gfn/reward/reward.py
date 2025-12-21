@@ -5,11 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from collections import OrderedDict
+import os
 import time
 
 import numpy as np
 import torch
 
+from electrodrive.flows.device_guard import ensure_cuda, resolve_dtype
+from electrodrive.flows.types import FlowConfig, ParamPayload, ParamSampler
 from electrodrive.gfn.dsl.program import Program
 from electrodrive.gfn.integration.compile import compile_program_to_basis
 from electrodrive.images.basis import ImageBasisElement
@@ -163,12 +166,20 @@ class RewardComputer:
         *,
         device: Optional[torch.device] = None,
         config: Optional[RewardConfig] = None,
+        param_sampler: Optional[ParamSampler] = None,
+        flow_config: Optional[FlowConfig] = None,
+        flow_checkpoint_path: Optional[str] = None,
+        flow_checkpoint_id: Optional[str] = None,
     ) -> None:
         self.device = device or get_default_device()
         self.config = config or RewardConfig()
-        self._compile_cache: OrderedDict[Tuple[str, str, str], Tuple[Any, torch.Tensor, Mapping[str, Any]]] = OrderedDict()
+        self.param_sampler = param_sampler
+        self.flow_config = flow_config or FlowConfig()
+        self.flow_checkpoint_id = flow_checkpoint_id or _flow_checkpoint_identity(flow_checkpoint_path)
+        self._compile_cache: OrderedDict[Tuple[object, ...], Tuple[Any, torch.Tensor, Mapping[str, Any]]] = OrderedDict()
         self._colloc_cache: OrderedDict[Tuple[str, int, int, float, str], Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = OrderedDict()
         self.last_diagnostics: Dict[str, Any] = {}
+        self.last_diagnostics_batch: List[Dict[str, Any]] = []
 
     def compute(
         self,
@@ -178,6 +189,8 @@ class RewardComputer:
         *,
         seed: Optional[int] = None,
         config: Optional[RewardConfig] = None,
+        spec_embedding: Optional[torch.Tensor] = None,
+        param_payload: Optional[ParamPayload] = None,
     ) -> RewardTerms:
         """Compute reward terms for a program/spec pair."""
         cfg = config or self.config
@@ -189,7 +202,17 @@ class RewardComputer:
             timer = _LatencyTimer(device)
             timer.start()
 
-            elements, group_ids, meta = self._compile_program(program, spec, device, dtype, cfg)
+            param_seed = self._resolve_param_seed(seed)
+            elements, group_ids, meta = self._compile_program(
+                program,
+                spec,
+                device,
+                dtype,
+                cfg,
+                param_seed=param_seed,
+                spec_embedding=spec_embedding,
+                param_payload=param_payload,
+            )
             if not elements:
                 timer.stop()
                 return self._empty_reward(program, device, dtype, cfg, timer.elapsed_ms())
@@ -301,6 +324,97 @@ class RewardComputer:
                 torch.cuda.manual_seed_all(int(seed))
             return _run()
 
+    def compute_batch(
+        self,
+        programs: Sequence[Program],
+        specs: Sequence[object],
+        device: Optional[torch.device] = None,
+        *,
+        seeds: Optional[Sequence[Optional[int]]] = None,
+        config: Optional[RewardConfig] = None,
+        spec_embeddings: Optional[Sequence[torch.Tensor]] = None,
+    ) -> List[RewardTerms]:
+        """Compute reward terms for a batch of programs/specs, batching param sampling when available."""
+        if len(programs) != len(specs):
+            raise ValueError("programs and specs must have the same length.")
+        batch = len(programs)
+        if batch == 0:
+            self.last_diagnostics_batch = []
+            return []
+
+        cfg = config or self.config
+        device = device or self.device
+        seeds_list = list(seeds) if seeds is not None else [None] * batch
+        if len(seeds_list) != batch:
+            raise ValueError("seeds must be the same length as programs.")
+        if spec_embeddings is not None and len(spec_embeddings) != batch:
+            raise ValueError("spec_embeddings must be the same length as programs.")
+
+        if self.param_sampler is None:
+            results: List[RewardTerms] = []
+            diags: List[Dict[str, Any]] = []
+            for program, spec, seed, spec_embedding in zip(
+                programs,
+                specs,
+                seeds_list,
+                spec_embeddings or [None] * batch,
+            ):
+                results.append(
+                    self.compute(
+                        program,
+                        spec,
+                        device=device,
+                        seed=seed,
+                        config=cfg,
+                        spec_embedding=spec_embedding,
+                    )
+                )
+                diags.append(dict(self.last_diagnostics))
+            self.last_diagnostics_batch = diags
+            return results
+
+        if spec_embeddings is None:
+            raise ValueError("spec_embeddings is required when param_sampler is provided.")
+        if len(spec_embeddings) != batch:
+            raise ValueError("spec_embeddings must be the same length as programs.")
+
+        groups: Dict[str, List[int]] = {}
+        for idx, spec in enumerate(specs):
+            spec_hash = _infer_spec_hash(spec)
+            groups.setdefault(spec_hash, []).append(idx)
+
+        results: List[RewardTerms] = [None] * batch  # type: ignore[list-item]
+        diags: List[Dict[str, Any]] = [None] * batch  # type: ignore[list-item]
+        for indices in groups.values():
+            group_programs = [programs[i] for i in indices]
+            group_specs = [specs[i] for i in indices]
+            group_embeddings = torch.stack(
+                [spec_embeddings[i].detach().to(device) for i in indices],
+                dim=0,
+            )
+            group_seeds = [self._resolve_param_seed(seeds_list[i]) for i in indices]
+            payload = self._sample_param_payload(
+                group_programs,
+                group_specs[0],
+                group_embeddings,
+                device,
+                param_seed=group_seeds,
+            )
+            for local_idx, idx in enumerate(indices):
+                results[idx] = self.compute(
+                    programs[idx],
+                    specs[idx],
+                    device=device,
+                    seed=seeds_list[idx],
+                    config=cfg,
+                    spec_embedding=None,
+                    param_payload=payload.for_program(local_idx),
+                )
+                diags[idx] = dict(self.last_diagnostics)
+
+        self.last_diagnostics_batch = diags
+        return list(results)
+
     def _compile_program(
         self,
         program: Program,
@@ -308,23 +422,129 @@ class RewardComputer:
         device: torch.device,
         dtype: torch.dtype,
         cfg: RewardConfig,
+        *,
+        param_seed: Optional[int],
+        spec_embedding: Optional[torch.Tensor],
+        param_payload: Optional[ParamPayload] = None,
     ) -> Tuple[List[ImageBasisElement], torch.Tensor, Mapping[str, Any]]:
         spec_hash = _infer_spec_hash(spec)
         program_hash = program.hash(spec_hash)
-        cache_key = (program_hash, str(device), str(dtype))
+        cache_key = self._compile_cache_key(
+            program_hash,
+            device,
+            dtype,
+            param_seed=param_seed,
+        )
         if cache_key in self._compile_cache:
             elems_cached, group_ids, meta = self._compile_cache[cache_key]
             self._compile_cache.move_to_end(cache_key)
             elements = _restore_elements(elems_cached, device, dtype)
             return elements, group_ids.to(device=device), meta
+        param_payload_local = param_payload
+        if param_payload_local is None and self.param_sampler is not None:
+            if spec_embedding is None:
+                raise ValueError("spec_embedding is required when param_sampler is provided.")
+            device = ensure_cuda(device)
+            param_payload_local = self._sample_param_payload(
+                [program],
+                spec,
+                spec_embedding,
+                device,
+                param_seed=param_seed,
+            ).for_program(0)
 
-        elements, group_ids, meta = compile_program_to_basis(program, spec, device)
-        stored = _serialize_elements(elements) if (device.type == "cuda" and not cfg.cache_on_gpu) else elements
-        group_ids_cpu = group_ids.detach().to("cpu") if torch.is_tensor(group_ids) else torch.tensor([], dtype=torch.long)
-        self._compile_cache[cache_key] = (stored, group_ids_cpu, meta)
+        if param_payload_local is not None:
+            elements, group_ids, meta = compile_program_to_basis(
+                program,
+                spec,
+                device,
+                param_payload=param_payload_local,
+                strict=True,
+            )
+        else:
+            elements, group_ids, meta = compile_program_to_basis(program, spec, device)
+        cache_on_gpu = bool(cfg.cache_on_gpu and device.type == "cuda")
+        serialize = device.type == "cuda" and not cache_on_gpu
+        stored = _serialize_elements(elements) if serialize else elements
+        # group_ids are tiny; keep them on-device to preserve GPU-first policy.
+        if torch.is_tensor(group_ids):
+            group_ids_cached = group_ids.detach()
+        else:
+            group_ids_cached = torch.tensor([], device=device, dtype=torch.long)
+        self._compile_cache[cache_key] = (stored, group_ids_cached, meta)
         if len(self._compile_cache) > cfg.compile_cache_size:
             self._compile_cache.popitem(last=False)
         return elements, group_ids, meta
+
+    def _resolve_param_seed(self, seed: Optional[int]) -> Optional[int]:
+        if self.param_sampler is None:
+            return None
+        if self.flow_config.seed is not None:
+            return int(self.flow_config.seed)
+        return seed
+
+    def _compile_cache_key(
+        self,
+        program_hash: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        param_seed: Optional[int],
+    ) -> Tuple[object, ...]:
+        if self.param_sampler is None:
+            return (program_hash, str(device), str(dtype))
+        flow_dtype = resolve_dtype(self.flow_config.dtype)
+        max_tokens = self.flow_config.max_tokens
+        max_ast_len = self.flow_config.max_ast_len
+        return (
+            program_hash,
+            str(device),
+            str(dtype),
+            int(param_seed) if param_seed is not None else "none",
+            int(self.flow_config.latent_dim),
+            int(self.flow_config.model_dim),
+            str(self.flow_config.solver),
+            int(self.flow_config.n_steps),
+            float(self.flow_config.temperature),
+            int(max_tokens) if max_tokens is not None else "none",
+            int(max_ast_len) if max_ast_len is not None else "none",
+            str(flow_dtype),
+            str(self.flow_checkpoint_id),
+        )
+
+    def _sample_param_payload(
+        self,
+        programs: Sequence[Program],
+        spec: object,
+        spec_embedding: torch.Tensor,
+        device: torch.device,
+        *,
+        param_seed: int | Sequence[int | None] | None,
+    ) -> "ParamPayload":
+        if self.param_sampler is None:
+            raise RuntimeError("param_sampler is required for flow payload sampling.")
+        flow_dtype = resolve_dtype(self.flow_config.dtype)
+        program_batch = None
+        if hasattr(self.param_sampler, "build_program_batch"):
+            program_batch = self.param_sampler.build_program_batch(
+                programs,
+                device=device,
+                max_ast_len=self.flow_config.max_ast_len,
+                max_tokens=self.flow_config.max_tokens,
+            )
+        return self.param_sampler.sample(
+            program_batch or programs,
+            spec,
+            spec_embedding,
+            seed=param_seed,
+            device=device,
+            dtype=flow_dtype,
+            n_steps=self.flow_config.n_steps,
+            solver=self.flow_config.solver,
+            temperature=self.flow_config.temperature,
+            max_tokens=self.flow_config.max_tokens,
+            max_ast_len=self.flow_config.max_ast_len,
+        )
 
     def _get_collocation(
         self,
@@ -449,6 +669,16 @@ def _infer_spec_hash(spec: object) -> str:
         if hasattr(spec, attr):
             return str(getattr(spec, attr))
     return str(spec)
+
+
+def _flow_checkpoint_identity(path: Optional[str]) -> str:
+    if not path:
+        return "none"
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return f"{path}:missing"
+    return f"{path}:{int(stat.st_mtime)}"
 
 
 def _serialize_elements(elements: Sequence[ImageBasisElement]) -> List[Mapping[str, Any]]:

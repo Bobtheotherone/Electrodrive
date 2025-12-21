@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import torch
 
-from electrodrive.gfn.dsl.nodes import AddPrimitiveBlock, StopProgram
+from electrodrive.flows.device_guard import ensure_cuda
+from electrodrive.flows.schemas import REGISTRY, SCHEMA_REAL_POINT
+from electrodrive.flows.types import ParamPayload
+from electrodrive.gfn.dsl.nodes import (
+    AddBranchCutBlock,
+    AddPoleBlock,
+    AddPrimitiveBlock,
+    ConjugatePair,
+    StopProgram,
+)
 from electrodrive.gfn.dsl.program import Program
 from electrodrive.images.basis import ImageBasisElement, PointChargeBasis, annotate_group_info, compute_group_ids
 
@@ -15,8 +25,15 @@ def compile_program_to_basis(
     program: Program,
     spec: Any,
     device: torch.device,
+    *,
+    param_payload: ParamPayload | None = None,
+    strict: bool | None = None,
 ) -> Tuple[List[ImageBasisElement], Sequence[Any], Mapping[str, Any]]:
     """Compile a program into basis elements compatible with the solver stack."""
+    strict_payload = _strict_param_payload() if strict is None else bool(strict)
+    if strict_payload and param_payload is None:
+        raise RuntimeError("ParamPayload required when strict param payload is enabled.")
+
     dtype = torch.float32
     elements: List[ImageBasisElement] = []
     warnings: List[str] = []
@@ -26,33 +43,64 @@ def compile_program_to_basis(
     program_hash = program.hash(spec_hash)
     canonical_hex = program.canonical_bytes.hex()
 
-    for node in program.nodes:
+    payload = None
+    node_to_token: List[int] = []
+    if param_payload is not None:
+        payload = _coerce_payload(param_payload)
+        device = ensure_cuda(payload.device)
+        if not payload.u_latent.is_cuda:
+            raise ValueError("ParamPayload.u_latent must be on CUDA.")
+        if payload.device.type != "cuda":
+            raise ValueError(f"ParamPayload.device must be CUDA, got {payload.device}.")
+        dtype = payload.dtype
+        node_to_token = _normalize_node_to_token(payload.node_to_token, len(program.nodes))
+
+    node_to_element: Dict[int, int] = {}
+    for node_idx, node in enumerate(program.nodes):
         if isinstance(node, StopProgram):
             continue
-        if not isinstance(node, AddPrimitiveBlock):
-            warnings.append(f"Skipped unsupported node type: {type(node).__name__}")
-            continue
+        if isinstance(node, ConjugatePair):
+            element = _compile_conjugate_pair(node, elements, node_to_element, device, dtype, warnings)
+            if element is None:
+                continue
+        elif payload is not None:
+            element = _compile_param_node(
+                node,
+                node_idx,
+                payload,
+                node_to_token,
+                spec,
+                device,
+                dtype,
+                warnings,
+            )
+            if element is None:
+                continue
+        else:
+            if not isinstance(node, AddPrimitiveBlock):
+                warnings.append(f"Skipped unsupported node type: {type(node).__name__}")
+                continue
+            family = str(node.family_name)
+            conductor_id = int(node.conductor_id)
+            motif_index = int(node.motif_id)
 
-        family = str(node.family_name)
-        conductor_id = int(node.conductor_id)
-        motif_index = int(node.motif_id)
-
-        element = _compile_primitive(
-            family=family,
-            conductor_id=conductor_id,
-            motif_index=motif_index,
-            spec=spec,
-            device=device,
-            dtype=dtype,
-            warnings=warnings,
-        )
-        if element is None:
-            continue
+            element = _compile_primitive(
+                family=family,
+                conductor_id=conductor_id,
+                motif_index=motif_index,
+                spec=spec,
+                device=device,
+                dtype=dtype,
+                warnings=warnings,
+            )
+            if element is None:
+                continue
 
         info = getattr(element, "_group_info", {})
         family_name = str(info.get("family_name", element.type))
         family_counts[family_name] = family_counts.get(family_name, 0) + 1
         elements.append(element)
+        node_to_element[node_idx] = len(elements) - 1
 
     group_ids = compute_group_ids(elements, device=device, dtype=torch.long)
     meta = {
@@ -62,6 +110,233 @@ def compile_program_to_basis(
         "warnings": warnings,
     }
     return elements, group_ids, meta
+
+
+def _strict_param_payload() -> bool:
+    raw = os.getenv("EDE_STRICT_PARAM_PAYLOAD", "").strip().lower()
+    return raw not in ("", "0", "false", "no")
+
+
+def _coerce_payload(payload: ParamPayload) -> ParamPayload:
+    needs_slice = False
+    if payload.u_latent.dim() >= 3:
+        if payload.u_latent.shape[0] != 1:
+            raise ValueError("ParamPayload is batched; call ParamPayload.for_program() first.")
+        needs_slice = True
+    if payload.node_mask.dim() >= 2 and payload.node_mask.shape[0] == 1:
+        needs_slice = True
+    if payload.schema_ids.dim() >= 2 and payload.schema_ids.shape[0] == 1:
+        needs_slice = True
+    if isinstance(payload.node_to_token, torch.Tensor) and payload.node_to_token.dim() >= 2:
+        if payload.node_to_token.shape[0] == 1:
+            needs_slice = True
+    if needs_slice:
+        return payload.for_program(0)
+    return payload
+
+
+def _normalize_node_to_token(node_to_token: Sequence[Sequence[int]] | torch.Tensor, count: int) -> List[int]:
+    mapping: List[int]
+    if isinstance(node_to_token, torch.Tensor):
+        if node_to_token.is_cuda:
+            raise ValueError("node_to_token must be CPU metadata to avoid GPU sync.")
+        if node_to_token.dim() > 1:
+            if node_to_token.shape[0] != 1:
+                raise ValueError("ParamPayload.node_to_token is batched; call ParamPayload.for_program().")
+            node_to_token = node_to_token[0]
+        mapping = [int(v) for v in node_to_token.detach().tolist()]
+    else:
+        if node_to_token and isinstance(node_to_token[0], (list, tuple)):
+            if len(node_to_token) != 1:
+                raise ValueError("ParamPayload.node_to_token is batched; call ParamPayload.for_program().")
+            node_to_token = node_to_token[0]
+        mapping = [int(v) for v in node_to_token]
+    if len(mapping) < count:
+        mapping.extend([-1] * (count - len(mapping)))
+    return mapping
+
+
+def _compile_conjugate_pair(
+    node: ConjugatePair,
+    elements: Sequence[ImageBasisElement],
+    node_to_element: Mapping[int, int],
+    device: torch.device,
+    dtype: torch.dtype,
+    warnings: List[str],
+) -> ImageBasisElement | None:
+    try:
+        ref = int(node.block_ref)
+    except Exception:
+        warnings.append(f"Invalid conjugate_pair block_ref: {node.block_ref}")
+        return None
+    elem_idx = node_to_element.get(ref)
+    if elem_idx is None or elem_idx < 0 or elem_idx >= len(elements):
+        warnings.append(f"ConjugatePair missing reference element for block_ref={ref}")
+        return None
+    base = elements[elem_idx]
+    params = {k: v.clone() for k, v in base.params.items()}
+    z_imag = params.get("z_imag")
+    if z_imag is None:
+        z_imag = torch.zeros((), device=device, dtype=dtype)
+    else:
+        z_imag = z_imag.to(device=device, dtype=dtype)
+    params["z_imag"] = -z_imag
+    if isinstance(base, PointChargeBasis):
+        elem = PointChargeBasis(params, type_name=base.type)
+    else:
+        try:
+            elem = base.__class__(params)
+        except Exception:
+            warnings.append(f"ConjugatePair unsupported basis type: {type(base).__name__}")
+            return None
+    info = getattr(base, "_group_info", None)
+    if isinstance(info, dict):
+        setattr(elem, "_group_info", dict(info))
+    return elem
+
+
+def _compile_param_node(
+    node: object,
+    node_idx: int,
+    payload: ParamPayload,
+    node_to_token: Sequence[int],
+    spec: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+    warnings: List[str],
+) -> ImageBasisElement | None:
+    if not isinstance(node, (AddPrimitiveBlock, AddPoleBlock, AddBranchCutBlock)):
+        warnings.append(f"Skipped unsupported node type: {type(node).__name__}")
+        return None
+
+    token_idx = node_to_token[node_idx] if node_idx < len(node_to_token) else -1
+    if token_idx < 0:
+        warnings.append(f"Missing token slot for node index {node_idx}")
+        return None
+
+    if payload.node_mask.numel() > 0:
+        try:
+            if not bool(payload.node_mask[token_idx].item()):
+                warnings.append(f"Token slot masked for node index {node_idx}")
+                return None
+        except Exception:
+            warnings.append(f"Invalid node_mask for token index {token_idx}")
+            return None
+
+    u_latent = payload.u_latent
+    if u_latent.dim() == 2:
+        u = u_latent[token_idx]
+    elif u_latent.dim() == 1:
+        u = u_latent
+    else:
+        warnings.append("ParamPayload.u_latent has unsupported rank.")
+        return None
+
+    schema_id = _resolve_schema_id(payload, node, token_idx, warnings)
+    schema = REGISTRY.get_by_id(schema_id)
+    if schema is None:
+        warnings.append(f"Unknown schema_id {schema_id}; falling back to real_point.")
+        schema = REGISTRY.get_by_id(SCHEMA_REAL_POINT)
+    if schema is None:
+        warnings.append("Schema registry missing default real_point.")
+        return None
+
+    node_ctx = _node_context(node)
+    params = schema.transform(u, spec, node_ctx=node_ctx)
+    elem = _element_from_params(node, params, device, dtype, warnings)
+    return elem
+
+
+def _resolve_schema_id(
+    payload: ParamPayload,
+    node: object,
+    token_idx: int,
+    warnings: List[str],
+) -> int:
+    schema_id = 0
+    if payload.schema_ids.numel() > 0:
+        try:
+            schema_id = int(payload.schema_ids[token_idx].item())
+        except Exception:
+            schema_id = 0
+
+    node_schema_id = getattr(node, "schema_id", None)
+    if node_schema_id is not None:
+        try:
+            node_schema_id = int(node_schema_id)
+        except Exception:
+            node_schema_id = None
+
+    if schema_id <= 0 and node_schema_id:
+        schema_id = node_schema_id
+    elif schema_id > 0 and node_schema_id and node_schema_id != schema_id:
+        warnings.append(f"Schema id mismatch: payload={schema_id}, node={node_schema_id}")
+
+    if schema_id <= 0:
+        schema_name = getattr(node, "schema_name", None)
+        if schema_name:
+            schema = REGISTRY.get_by_name(str(schema_name))
+            if schema is not None:
+                schema_id = int(schema.schema_id)
+
+    if schema_id <= 0:
+        schema_id = SCHEMA_REAL_POINT
+    return schema_id
+
+
+def _node_context(node: object) -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {}
+    for key in ("conductor_id", "interface_id", "family_name", "motif_type", "schema_id", "schema_name"):
+        if hasattr(node, key):
+            value = getattr(node, key)
+            if value is not None:
+                ctx[key] = value
+    return ctx
+
+
+def _element_from_params(
+    node: object,
+    params: Mapping[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    warnings: List[str],
+) -> ImageBasisElement | None:
+    family = getattr(node, "family_name", None)
+    schema_name = getattr(node, "schema_name", None)
+    family_name = None
+    if family is not None:
+        family_name = str(family)
+    elif schema_name is not None:
+        family_name = str(schema_name)
+    type_name = _resolve_basis_type_name(family_name) if family_name is not None else "point"
+    position = params.get("position")
+    if position is None:
+        warnings.append(f"Param node missing position for {type(node).__name__}")
+        return None
+
+    pos = position.to(device=device, dtype=dtype)
+    params_out = dict(params)
+    params_out["position"] = pos
+    if "z_imag" not in params_out:
+        params_out["z_imag"] = torch.zeros((), device=device, dtype=dtype)
+    elem = PointChargeBasis(params_out, type_name=type_name)
+
+    conductor_id = _coerce_int(getattr(node, "conductor_id", 0), 0)
+    motif_index = _coerce_int(getattr(node, "motif_id", 0), 0)
+    annotate_group_info(
+        elem,
+        conductor_id=conductor_id,
+        family_name=family_name,
+        motif_index=motif_index,
+    )
+    return elem
+
+
+def _coerce_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def _compile_primitive(
@@ -81,7 +356,10 @@ def _compile_primitive(
         return None
     idx = motif_index % len(pool)
     pos, family_name = pool[idx]
-    elem = PointChargeBasis({"position": pos}, type_name=type_name)
+    elem = PointChargeBasis(
+        {"position": pos, "z_imag": torch.zeros((), device=pos.device, dtype=pos.dtype)},
+        type_name=type_name,
+    )
     annotate_group_info(
         elem,
         conductor_id=conductor_id,

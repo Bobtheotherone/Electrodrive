@@ -30,9 +30,13 @@ def _sample_boundary(
     ctype = c.get("type")
     if ctype == "plane":
         z = float(c.get("z", 0.0))
+        # SobolEngine draws on CPU; move to CUDA immediately to keep sampling GPU-resident.
         xy = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=seed).draw(n).to(device=device, dtype=dtype)
         xy = (xy - 0.5) * 4.0
-        return torch.stack([xy[:, 0], xy[:, 1], torch.full((n,), z, device=device, dtype=dtype)], dim=1)
+        pts = torch.stack([xy[:, 0], xy[:, 1], torch.full((n,), z, device=device, dtype=dtype)], dim=1)
+        if not pts.is_cuda:
+            raise ValueError("Gate B boundary samples must be CUDA")
+        return pts
     if ctype == "sphere":
         radius = float(c.get("radius", 1.0))
         center = torch.tensor(c.get("center", [0.0, 0.0, 0.0]), device=device, dtype=dtype)
@@ -41,7 +45,10 @@ def _sample_boundary(
         x = center[0] + radius * torch.sin(phi) * torch.cos(theta)
         y = center[1] + radius * torch.sin(phi) * torch.sin(theta)
         z = center[2] + radius * torch.cos(phi)
-        return torch.stack([x, y, z], dim=1)
+        pts = torch.stack([x, y, z], dim=1)
+        if not pts.is_cuda:
+            raise ValueError("Gate B boundary samples must be CUDA")
+        return pts
     return None
 
 
@@ -152,6 +159,7 @@ def run_gate(
     if dielectrics:
         interfaces = _interfaces(dielectrics)
         if interfaces:
+            # SobolEngine draws on CPU; move to CUDA immediately to keep sampling GPU-resident.
             xy = torch.quasirandom.SobolEngine(dimension=2, scramble=True, seed=seed + 1).draw(n_samples).to(device=device, dtype=dtype)
             xy = (xy - 0.5) * 2.0
             for z_val, eps_up, eps_down in interfaces:

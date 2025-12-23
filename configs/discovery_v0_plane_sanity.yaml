@@ -1,0 +1,61 @@
+seed: 0
+
+run:
+  tag: "discovery_v0_plane_sanity"
+  generations: 5
+  population_B: 256
+  topK_fast: 32
+  topk_mid: 4
+  topk_final: 2
+  use_hi_oracle: false
+  sanity_bc_threshold: 1.0e-3
+  sanity_force_baseline: true
+
+points:
+  bc_train: 1024
+  bc_holdout: 1024
+  interior_train: 1024
+  interior_holdout: 1024
+
+reward:
+  w_bc: 1.0
+  w_pde: 0.5
+  w_complexity: 0.05
+  w_latency: 0.25
+  w_stability: 0.25
+  stability_perturb_sigma: 1.0e-3
+
+model:
+  dtype: "bf16"
+  compile: false
+  use_tf32: true
+  geom_encoder:
+    name: "current"
+    hidden_dim: 256
+    layers: 6
+  structure_policy:
+    name: "gflownet"
+    max_steps: 64
+    replay_size: 200000
+  param_sampler:
+    name: "none"
+
+solver:
+  name: "differentiable_lasso"
+  max_iters: 64
+  warm_start: true
+  group_lasso: true
+  implicit_grads: true
+
+oracle:
+  fast:
+    name: "fast"
+    dtype: "fp32"
+  mid:
+    name: "mid"
+    dtype: "fp32"
+
+spec:
+  family: "plane"
+  source_height_range: [0.2, 0.8]
+  domain_scale: 1.0

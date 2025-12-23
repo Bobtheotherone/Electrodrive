@@ -1,0 +1,58 @@
+seed: 0
+
+run:
+  tag: "discovery_v0_dcim_fast"
+  generations: 4
+  population_B: 512
+  topK_fast: 32
+  topk_mid: 8
+  topk_final: 4
+  use_hi_oracle: false
+
+points:
+  bc_train: 1024
+  bc_holdout: 1024
+  interior_train: 512
+  interior_holdout: 512
+
+reward:
+  w_bc: 1.0
+  w_pde: 0.5
+  w_complexity: 0.02
+  w_latency: 0.10
+  w_stability: 0.10
+  stability_perturb_sigma: 1e-3
+
+model:
+  dtype: "bf16"
+  compile: false
+  use_tf32: true
+  geom_encoder: { name: "current", hidden_dim: 256, layers: 6 }
+  structure_policy: { name: "gflownet", max_steps: 64, replay_size: 200000 }
+  param_sampler:
+    name: "flow"
+    steps: 4
+    solver: "euler"
+    temperature: 1.0
+    dtype: "bf16"
+
+solver:
+  name: "differentiable_lasso"
+  max_iters: 24
+  tol: 1e-6
+  reg_l1: 1e-3
+
+oracle:
+  fast: { name: "fast", dtype: "fp32" }
+  mid:  { name: "mid",  dtype: "fp32" }
+
+spec:
+  family: "layered_3layer"
+  eps_range: [1.0, 80.0]
+  thickness_range: [0.02, 1.0]
+  source_height_range: [0.001, 2.0]
+  domain_scale: 1.0
+
+paths:
+  gfn_checkpoint: "artifacts/step10_gfn_flow_smoke/gfn_ckpt.pt"
+  flow_checkpoint: "artifacts/step10_gfn_flow_smoke/flow_ckpt.pt"

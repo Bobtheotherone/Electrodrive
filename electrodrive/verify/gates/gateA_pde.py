@@ -46,11 +46,12 @@ def _sample_interior(
     exclusion_radius: float,
 ) -> torch.Tensor:
     (x0, x1), (y0, y1), (z0, z1) = _bounds_from_spec(spec)
+    # SobolEngine draws on CPU; transfer immediately to CUDA to keep hot paths on GPU.
     engine = torch.quasirandom.SobolEngine(dimension=3, scramble=True, seed=seed)
-    pts = engine.draw(n).to(dtype=dtype)
-    span = torch.tensor([x1 - x0, y1 - y0, z1 - z0], dtype=dtype)
-    base = torch.tensor([x0, y0, z0], dtype=dtype)
-    pts = (pts * span + base).to(device=device)
+    pts = engine.draw(n).to(device=device, dtype=dtype)
+    span = torch.tensor([x1 - x0, y1 - y0, z1 - z0], device=device, dtype=dtype)
+    base = torch.tensor([x0, y0, z0], device=device, dtype=dtype)
+    pts = pts * span + base
 
     charges = spec.get("charges", []) or []
     if charges:
@@ -61,6 +62,8 @@ def _sample_interior(
             pts = pts[mask]
     if pts.numel() == 0:
         pts = torch.rand(n, 3, device=device, dtype=dtype) * 2.0 - 1.0
+    if not pts.is_cuda:
+        raise ValueError("Gate A sampling produced CPU tensor (GPU-first rule)")
     return pts.contiguous()
 
 

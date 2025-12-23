@@ -42,5 +42,5 @@ where = ["."]
 markers = [
     "slow: long-running tests",
 ]
-addopts = "--ignore=staging"
-norecursedirs = ["staging"]
+addopts = "--ignore=staging --ignore=temp_AI_upgrade"
+norecursedirs = ["staging", "temp_AI_upgrade"]

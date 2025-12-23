@@ -91,6 +91,10 @@ class ImageBasisElement:
                 elem = PointChargeBasis(params, type_name="axis_point")
             elif t == "three_layer_images":
                 elem = PointChargeBasis(params, type_name="three_layer_images")
+            elif t == "dcim_pole":
+                elem = DCIMPoleImageBasis(params)
+            elif t == "dcim_branch_cut":
+                elem = DCIMBranchCutImageBasis(params)
             elif t == "ring":
                 elem = RingImageBasis(params, type_name="ring")
             elif t == "ring_gauss":
@@ -157,13 +161,56 @@ class PointChargeBasis(ImageBasisElement):
             # Be tolerant of [1,3] shapes coming from scripts.
             pos = pos.view(3)
         params["position"] = pos
+        z_imag = params.get("z_imag")
+        use_complex = False
+        if z_imag is not None:
+            try:
+                if torch.is_tensor(z_imag):
+                    # One-time CPU sync to avoid branching in hot path.
+                    use_complex = bool((z_imag.detach().abs() > 0).any().item())
+                else:
+                    use_complex = abs(float(z_imag)) > 0
+            except Exception:
+                use_complex = False
+        self._use_complex = use_complex
         super().__init__(type_name, params)
 
     def potential(self, targets: torch.Tensor) -> torch.Tensor:
         """Potential of a unit-weight point charge in physical units."""
         pos = self.params["position"].to(targets.device, targets.dtype)
-        R = torch.linalg.norm(targets - pos, dim=1).clamp_min(1e-12)
-        return K_E / R
+        if not self._use_complex:
+            R = torch.linalg.norm(targets - pos, dim=1).clamp_min(1e-12)
+            return K_E / R
+
+        z_imag = self.params.get("z_imag")
+        if z_imag is None:
+            R = torch.linalg.norm(targets - pos, dim=1).clamp_min(1e-12)
+            return K_E / R
+
+        z_imag = torch.as_tensor(z_imag, device=targets.device, dtype=torch.float32).view(())
+        tgt = targets.to(device=targets.device, dtype=torch.float32)
+        pos_f = pos.to(device=targets.device, dtype=torch.float32)
+        delta = tgt - pos_f
+        dx, dy, dz = delta[:, 0], delta[:, 1], delta[:, 2]
+        dz_complex = torch.complex(dz, z_imag.expand_as(dz))
+        r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
+        inv_r = 1.0 / torch.sqrt(r2_complex)
+        phi = 2.0 * inv_r.real
+        return K_E * phi
+
+
+class DCIMPoleImageBasis(PointChargeBasis):
+    """DCIM pole image basis element with distinct type identity."""
+
+    def __init__(self, params: Dict[str, torch.Tensor]):
+        super().__init__(params, type_name="dcim_pole")
+
+
+class DCIMBranchCutImageBasis(PointChargeBasis):
+    """DCIM branch-cut image basis element with distinct type identity."""
+
+    def __init__(self, params: Dict[str, torch.Tensor]):
+        super().__init__(params, type_name="dcim_branch_cut")
 
 
 class RingImageBasis(ImageBasisElement):

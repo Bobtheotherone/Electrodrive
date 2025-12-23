@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
+import math
 
 import torch
 
@@ -18,7 +19,14 @@ from electrodrive.gfn.dsl.nodes import (
     StopProgram,
 )
 from electrodrive.gfn.dsl.program import Program
-from electrodrive.images.basis import ImageBasisElement, PointChargeBasis, annotate_group_info, compute_group_ids
+from electrodrive.images.basis import (
+    DCIMBranchCutImageBasis,
+    DCIMPoleImageBasis,
+    ImageBasisElement,
+    PointChargeBasis,
+    annotate_group_info,
+    compute_group_ids,
+)
 
 
 def compile_program_to_basis(
@@ -55,11 +63,17 @@ def compile_program_to_basis(
         dtype = payload.dtype
         node_to_token = _normalize_node_to_token(payload.node_to_token, len(program.nodes))
 
+    layered_ctx = _layered_context(spec, device=device, dtype=dtype)
+    is_layered = layered_ctx is not None
+
     node_to_element: Dict[int, int] = {}
     for node_idx, node in enumerate(program.nodes):
         if isinstance(node, StopProgram):
             continue
         if isinstance(node, ConjugatePair):
+            if is_layered:
+                # Layered DCIM uses folded complex pairs; skip explicit conjugate nodes.
+                continue
             element = _compile_conjugate_pair(node, elements, node_to_element, device, dtype, warnings)
             if element is None:
                 continue
@@ -72,6 +86,7 @@ def compile_program_to_basis(
                 spec,
                 device,
                 dtype,
+                layered_ctx,
                 warnings,
             )
             if element is None:
@@ -91,6 +106,7 @@ def compile_program_to_basis(
                 spec=spec,
                 device=device,
                 dtype=dtype,
+                layered_ctx=layered_ctx,
                 warnings=warnings,
             )
             if element is None:
@@ -181,7 +197,7 @@ def _compile_conjugate_pair(
     else:
         z_imag = z_imag.to(device=device, dtype=dtype)
     params["z_imag"] = -z_imag
-    if isinstance(base, PointChargeBasis):
+    if isinstance(base, PointChargeBasis) and base.__class__ is PointChargeBasis:
         elem = PointChargeBasis(params, type_name=base.type)
     else:
         try:
@@ -203,6 +219,7 @@ def _compile_param_node(
     spec: Any,
     device: torch.device,
     dtype: torch.dtype,
+    layered_ctx: Dict[str, Any] | None,
     warnings: List[str],
 ) -> ImageBasisElement | None:
     if not isinstance(node, (AddPrimitiveBlock, AddPoleBlock, AddBranchCutBlock)):
@@ -243,6 +260,14 @@ def _compile_param_node(
 
     node_ctx = _node_context(node)
     params = schema.transform(u, spec, node_ctx=node_ctx)
+    params = _apply_layered_param_overrides(
+        node,
+        node_idx,
+        params,
+        layered_ctx,
+        device=device,
+        dtype=dtype,
+    )
     elem = _element_from_params(node, params, device, dtype, warnings)
     return elem
 
@@ -319,7 +344,12 @@ def _element_from_params(
     params_out["position"] = pos
     if "z_imag" not in params_out:
         params_out["z_imag"] = torch.zeros((), device=device, dtype=dtype)
-    elem = PointChargeBasis(params_out, type_name=type_name)
+    if isinstance(node, AddPoleBlock):
+        elem = DCIMPoleImageBasis(params_out)
+    elif isinstance(node, AddBranchCutBlock):
+        elem = DCIMBranchCutImageBasis(params_out)
+    else:
+        elem = PointChargeBasis(params_out, type_name=type_name)
 
     conductor_id = _coerce_int(getattr(node, "conductor_id", 0), 0)
     motif_index = _coerce_int(getattr(node, "motif_id", 0), 0)
@@ -339,6 +369,164 @@ def _coerce_int(value: object, default: int) -> int:
         return default
 
 
+def _layered_context(spec: Any, *, device: torch.device, dtype: torch.dtype) -> Dict[str, Any] | None:
+    if getattr(spec, "BCs", "") != "dielectric_interfaces":
+        return None
+    source_vals = _layered_source_values(spec)
+    source_pos = (
+        torch.tensor(source_vals, device=device, dtype=dtype).view(3) if source_vals is not None else None
+    )
+    slab = _layered_slab_info(spec)
+    return {"source_vals": source_vals, "source_pos": source_pos, "slab": slab}
+
+
+def _layered_source_values(spec: Any) -> Tuple[float, float, float] | None:
+    charges = getattr(spec, "charges", None) or []
+    for ch in charges:
+        if ch.get("type") != "point":
+            continue
+        pos = ch.get("pos")
+        if not isinstance(pos, (list, tuple)) or len(pos) != 3:
+            continue
+        try:
+            return float(pos[0]), float(pos[1]), float(pos[2])
+        except Exception:
+            continue
+    return None
+
+
+def _layered_slab_info(spec: Any) -> Dict[str, float] | None:
+    layers = getattr(spec, "dielectrics", None) or []
+    best = None
+    best_thickness = None
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        try:
+            z_min = float(layer.get("z_min"))
+            z_max = float(layer.get("z_max"))
+        except Exception:
+            continue
+        thickness = abs(z_max - z_min)
+        if thickness <= 0.0:
+            continue
+        eps_raw = layer.get("epsilon", layer.get("eps", 1.0))
+        try:
+            eps_val = float(eps_raw)
+        except Exception:
+            eps_val = 1.0
+        info = {
+            "z_min": min(z_min, z_max),
+            "z_max": max(z_min, z_max),
+            "eps": eps_val,
+            "h": thickness,
+        }
+        if layer.get("name") == "slab":
+            return info
+        if best_thickness is None or thickness < best_thickness:
+            best_thickness = thickness
+            best = info
+    return best
+
+
+def _eps_scale(eps: float | None) -> float:
+    if eps is None:
+        return 1.0
+    try:
+        eps_val = float(eps)
+    except Exception:
+        return 1.0
+    eps_val = max(eps_val, 0.0)
+    scale = math.log1p(eps_val)
+    scale = min(max(scale, 1.0), 5.0) / 5.0
+    return scale
+
+
+def _apply_layered_xy_override(
+    pos: torch.Tensor,
+    layered_ctx: Dict[str, Any] | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if layered_ctx is None:
+        return pos.to(device=device, dtype=dtype)
+    source_pos = layered_ctx.get("source_pos")
+    if source_pos is None:
+        return pos.to(device=device, dtype=dtype)
+    pos = pos.to(device=device, dtype=dtype).view(3)
+    pos = pos.clone()
+    pos[:2] = source_pos[:2]
+    return pos
+
+
+def _apply_layered_param_overrides(
+    node: object,
+    node_idx: int,
+    params: Mapping[str, torch.Tensor],
+    layered_ctx: Dict[str, Any] | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, torch.Tensor]:
+    if layered_ctx is None:
+        return dict(params)
+
+    params_out: Dict[str, torch.Tensor] = dict(params)
+    pos = params_out.get("position")
+    if pos is not None:
+        pos = _apply_layered_xy_override(pos, layered_ctx, device=device, dtype=dtype)
+        params_out["position"] = pos
+
+    if not isinstance(node, (AddPoleBlock, AddBranchCutBlock)):
+        return params_out
+
+    slab = layered_ctx.get("slab")
+    source_vals = layered_ctx.get("source_vals")
+    if slab is None or source_vals is None:
+        return params_out
+
+    h = max(float(slab.get("h", 0.0)), 1e-6)
+    z0 = float(source_vals[2])
+    k = _coerce_int(getattr(node, "motif_id", node_idx), node_idx)
+    scale = _eps_scale(slab.get("eps"))
+
+    if isinstance(node, AddPoleBlock):
+        alpha = (0.15, 0.35, 0.75)[k % 3]
+        z_real_default = -(z0 + 2.0 * k * h)
+        z_imag_default = alpha * h * scale
+    else:
+        beta = (0.6, 1.2, 2.0)[k % 3]
+        z_real_default = -(z0 + (2.0 * k + 1.0) * h)
+        z_imag_default = beta * h * scale
+
+    if pos is None:
+        pos = torch.tensor([source_vals[0], source_vals[1], z_real_default], device=device, dtype=dtype)
+    else:
+        pos = pos.to(device=device, dtype=dtype).view(3)
+
+    z_imag = params_out.get("z_imag")
+    if z_imag is None:
+        z_imag = torch.zeros((), device=device, dtype=dtype)
+    z_imag = z_imag.to(device=device, dtype=dtype).view(())
+
+    min_imag = max(1e-3 * h, 1e-6)
+    min_imag_t = torch.tensor(min_imag, device=device, dtype=dtype)
+    z_imag_abs = z_imag.abs()
+    zero_mask = z_imag_abs <= 1e-12
+    z_imag_default_t = torch.tensor(z_imag_default, device=device, dtype=dtype)
+    z_real_default_t = torch.tensor(z_real_default, device=device, dtype=dtype)
+    z_imag_final = torch.where(zero_mask, z_imag_default_t, z_imag_abs)
+    z_imag_final = torch.clamp(z_imag_final, min=min_imag_t)
+    z_real_final = torch.where(zero_mask, z_real_default_t, pos[2])
+
+    pos = pos.clone()
+    pos[2] = z_real_final
+    params_out["position"] = pos
+    params_out["z_imag"] = z_imag_final
+    return params_out
+
+
 def _compile_primitive(
     *,
     family: str,
@@ -347,6 +535,7 @@ def _compile_primitive(
     spec: Any,
     device: torch.device,
     dtype: torch.dtype,
+    layered_ctx: Dict[str, Any] | None,
     warnings: List[str],
 ) -> ImageBasisElement | None:
     type_name = _resolve_basis_type_name(family)
@@ -356,6 +545,7 @@ def _compile_primitive(
         return None
     idx = motif_index % len(pool)
     pos, family_name = pool[idx]
+    pos = _apply_layered_xy_override(pos, layered_ctx, device=device, dtype=dtype)
     elem = PointChargeBasis(
         {"position": pos, "z_imag": torch.zeros((), device=pos.device, dtype=pos.dtype)},
         type_name=type_name,

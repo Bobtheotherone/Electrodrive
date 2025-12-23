@@ -2590,6 +2590,8 @@ def discover_images(
             )
         logger.info("Using GFlowNet BasisGenerator.", mode=mode)
     if mode == "gfn_flow":
+        if device.type == "cpu" and torch.cuda.is_available():
+            device = torch.device("cuda")
         try:
             from electrodrive.flows.types import FlowConfig
             from electrodrive.gfn.integration import HybridGFlowFlowGenerator

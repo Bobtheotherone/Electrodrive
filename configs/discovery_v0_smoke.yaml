@@ -1,0 +1,68 @@
+seed: 0
+
+run:
+  tag: "discovery_v0_smoke"
+  generations: 2
+  population_B: 64
+  topK_fast: 8
+  topk_mid: 2
+  topk_final: 2
+  use_hi_oracle: false
+
+points:
+  bc_train: 256
+  bc_holdout: 256
+  interior_train: 256
+  interior_holdout: 256
+
+reward:
+  w_bc: 1.0
+  w_pde: 0.5
+  w_complexity: 0.05
+  w_latency: 0.25
+  w_stability: 0.25
+  stability_perturb_sigma: 1e-3
+
+model:
+  dtype: "bf16"
+  compile: true
+  use_tf32: true
+
+  geom_encoder:
+    name: "simple"
+    hidden_dim: 8
+    layers: 4
+
+  structure_policy:
+    name: "gflownet"
+    max_steps: 2
+
+  param_sampler:
+    name: "flow"
+    steps: 4
+    solver: "euler"
+    temperature: 1.0
+    dtype: "bf16"
+
+solver:
+  name: "differentiable_lasso"
+  max_iters: 32
+  tol: 1e-6
+  reg_l1: 1e-3
+
+oracle:
+  fast:
+    name: "fast"
+    dtype: "fp32"
+  mid:
+    name: "mid"
+    dtype: "fp32"
+
+spec:
+  family: "plane"
+  source_height_range: [0.2, 0.6]
+  domain_scale: 1.0
+
+paths:
+  gfn_checkpoint: "artifacts/step10_gfn_flow_smoke/gfn_ckpt.pt"
+  flow_checkpoint: "artifacts/step10_gfn_flow_smoke/flow_ckpt.pt"

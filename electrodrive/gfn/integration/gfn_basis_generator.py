@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, List, Mapping, Optional, Sequence
 
 import torch
@@ -57,9 +57,15 @@ class GFlowNetProgramGenerator(BasisGenerator):
 
         payload = self._load_checkpoint(checkpoint_path)
         self.grammar = payload.grammar
+        max_length = int(payload.max_length)
+        if max_steps is not None:
+            max_length = max(max_length, int(max_steps))
+        policy_config = payload.policy_config
+        if int(policy_config.max_seq_len) != max_length:
+            policy_config = replace(policy_config, max_seq_len=max_length)
         self.env = ElectrodriveProgramEnv(
             grammar=self.grammar,
-            max_length=payload.max_length,
+            max_length=max_length,
             min_length_for_stop=payload.min_length_for_stop,
             device=self.device,
         )
@@ -68,11 +74,11 @@ class GFlowNetProgramGenerator(BasisGenerator):
         if payload.action_vocab is not None:
             _validate_action_vocab(payload.action_vocab, self.factor_table.vocab_sizes)
 
-        self.policy = PolicyNet(payload.policy_config, factor_sizes, device=self.device)
+        self.policy = PolicyNet(policy_config, factor_sizes, device=self.device)
         self.policy.load_state_dict(payload.policy_state)
         self.policy.eval()
 
-        self.logz = LogZNet(payload.policy_config.spec_dim, device=self.device)
+        self.logz = LogZNet(policy_config.spec_dim, device=self.device)
         self.logz.load_state_dict(payload.logz_state)
         self.logz.eval()
 

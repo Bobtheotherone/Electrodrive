@@ -1,416 +1,388 @@
-````markdown
-# AGENTS.md — Operation Black Hammer (Codex Surgical Playbook)
+# AGENTS.md — Operation Black Hammer (Repo Standard + Experimental Discovery Protocol)
 
-This repository is an active research/codebase for **Operation Black Hammer**: intensively repair, upgrade, and dramatically increase the scientific precision of the repo while enabling experiments whose core directive is:
+This repository is an active research + engineering codebase for **Operation Black Hammer**.
 
-> **Discover a completely new analytical Green’s Function using a method-of-images–based AI implementation.**
+**Core directive:** discover **new analytical (or analytically distillable) Green’s functions** using an **AI + method-of-images program representation**, with **GPU-first** implementation and **scientific-grade verification**.
 
-Codex must **prioritize GPU-first execution** and **must not allow repo health to decline**. If repo health declines and Codex cannot confidently identify/fix the cause, Codex must **EMERGENCY STOP** to prevent thrashing and damage to existing code.
+This file is written for Codex. Follow it exactly.
 
 ---
 
 ## 0) Hardware + performance doctrine (non-negotiable)
 
 Target machine:
-
-- Laptop: **ROG Zephyrus G16 GU605CX_GU605CX**
-- CPU: **Intel(R) Core(TM) Ultra 9 285H (2.90 GHz)**
-- GPU: **NVIDIA Blackwell RTX 5090, 24 GB VRAM**
-- RAM: **32 GB**
+- Laptop: ROG Zephyrus G16 GU605CX_GU605CX
+- CPU: Intel(R) Core(TM) Ultra 9 285H (2.90 GHz)
+- GPU: NVIDIA Blackwell RTX 5090 Laptop GPU, 24 GB VRAM (capability 12.0)
+- RAM: 32 GB
 
 Doctrine:
-
-1. **GPU is the primary compute device.** Prefer GPU even if it requires more engineering (e.g., custom CUDA/Triton kernels).
-2. **CPU is only allowed** when:
-   - the operation is not supported on GPU, or
-   - the CPU is certainly more efficient (rare), or
-   - it is strictly non-hot-path (I/O, orchestration, logging).
-3. Any **implicit CPU fallback** in hot paths is a **bug**. Examples: `.cpu()` in inner loops, `.numpy()` conversions, host-device ping-pong, Python loops over large tensors.
-4. Mixed precision policy:
-   - Proposal / generative models may use **BF16/FP16**.
-   - Solver / verification uses **FP32**.
-   - Certification / final numerical validation uses **FP64** when necessary.
+1. **GPU-first** for anything performance-relevant. CPU is allowed only for I/O, orchestration, or when GPU support is impossible.
+2. **No silent CPU fallbacks in hot paths.** Any `.cpu()`, `.numpy()`, host sync `.item()` in inner loops is a bug unless explicitly justified.
+3. Mixed precision policy:
+   - Proposal / generative models: BF16/FP16 allowed
+   - Solver + verification: FP32
+   - Certification / final numeric checks: FP64 as needed
+4. Prefer vectorization, batching, fused kernels (Triton/CUDA) over Python loops.
 
 ---
 
-## 1) Environment: ALWAYS run inside venv
+## 1) Environment + commands (always use venv)
 
-**Every command must start with:**
+Every shell session begins with:
 ```bash
 source .venv/bin/activate
 ````
 
-Sanity checks (run early, and whenever GPU issues arise):
+GPU sanity:
 
 ```bash
-python -c "import torch; print('torch', torch.__version__); print('cuda?', torch.cuda.is_available()); print('dev', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None); print('cap', torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)"
+python scripts/print_cuda_env.py
+pytest -q tests/test_cuda_smoke.py -vv -rs --maxfail=1
 ```
 
-If building CUDA extensions:
-
-* Prefer setting:
-
-  * `TORCH_CUDA_ARCH_LIST="12.0+PTX"` (Blackwell target) when appropriate in your environment.
-* Keep builds reproducible; never hardcode machine-local absolute paths.
-
----
-
-## 2) Repo health definition + gatekeeping
-
-### 2.1 Repo health = “no regressions”
-
-Repo health includes:
-
-* Tests: existing test suite must not gain new failures.
-* Behavior: no silent changes to numerical meaning without explicit versioning and docs.
-* Performance: no new CPU/GPU transfer regressions in hot loops.
-* Structure: no breaking imports, packaging, or CLI entrypoints unless explicitly upgraded with migration notes.
-
-### 2.2 Full test command (canonical)
-
-When instructed to run full pytest (or before merging major changes), use **exactly**:
+**Canonical full pytest command** (use only at milestone checkpoints and before large experiments):
 
 ```bash
-source .venv/bin/activate
 pytest --ignore=staging --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py --ignore=temp_AI_upgrade -vv -rs -q --maxfail=1
 ```
 
-### 2.3 “Baseline first” protocol (MANDATORY)
-
-At the start of any run:
-
-1. Ensure a clean working tree:
-
-   ```bash
-   git status --porcelain
-   ```
-2. Record baseline:
-
-   * Save the current commit hash: `git rev-parse HEAD`
-   * Run the full test command once and save output to a file:
-
-     * `.blackhammer/baseline_pytest.txt`
-3. Record “protected file set”:
-
-   ```bash
-   mkdir -p .blackhammer
-   git ls-files > .blackhammer/protected_files_at_start.txt
-   ```
-
 ---
 
-## 3) Emergency stop (anti-thrashing safety system)
+## 2) Repo health guardrails
 
-### 3.1 When to trigger EMERGENCY STOP
+### 2.1 Definition of “repo health”
 
-Trigger an EMERGENCY STOP if **any** occurs and you cannot confidently fix within the next minimal edit:
+Repo health means:
 
-* New test failures appear that:
+* tests do not regress,
+* imports/packaging do not break,
+* numerical meaning does not silently change,
+* no new GPU→CPU transfer regressions in hot loops,
+* new features are gated (default OFF) unless explicitly intended.
 
-  * are outside the intended change scope, or
-  * are widespread / non-localized, or
-  * imply you may have broken core infrastructure (imports, packaging, device placement, numerics).
-* Performance collapses due to accidental CPU fallback and the cause isn’t obvious.
-* You detect repetitive edit-test-fail cycles without clear progress.
+### 2.2 Working discipline
 
-### 3.2 What EMERGENCY STOP means
-
-When EMERGENCY STOP triggers:
-
-1. **Immediately revert** changes to existing (“protected”) code:
-
-   ```bash
-   git reset --hard HEAD
-   git clean -fd
-   ```
-2. **Freeze modifications** to any file that existed at the start of the run:
-
-   * Those are listed in `.blackhammer/protected_files_at_start.txt`.
-3. You may continue working **only** on:
-
-   * New files created during this run, and/or
-   * Files explicitly created under a new experimental namespace (recommended):
-
-     * `staging/black_hammer_experiments/` (or similar)
-4. Add a short incident report in:
-
-   * `.blackhammer/emergency_stop_report.md`
-     including:
-   * what you changed,
-   * what broke (copy errors),
-   * hypotheses,
-   * what you reverted.
-
-**Do not resume editing protected code** unless a future instruction explicitly expands scope or you have a surgical, test-backed fix.
-
----
-
-## 4) Surgical workflow (how Codex must operate)
-
-### 4.1 Change discipline
-
+* Keep changes **surgical**.
 * Make **small, atomic commits**.
-* After each commit:
-
-  * run the narrowest relevant tests (if available),
-  * then periodically run the full test command.
-* Avoid “refactor everything” edits.
-* Never mass-format unrelated files.
-* Never change public APIs without a migration note and tests.
-
-### 4.2 GPU-first implementation discipline
-
-When touching performance-critical code:
-
-* Add a device assertion in hot paths when appropriate:
-
-  * e.g., `assert x.is_cuda` (or explicit `device` plumbing).
-* Avoid Python loops over tensor groups; prefer fused kernels or vectorized ops.
-* Avoid host synchronization (`.item()`, implicit prints, frequent timing calls) inside loops.
-* Minimize kernel launch overhead by batching operations.
-
-### 4.3 Numerical rigor discipline
-
-* Prefer **relative error metrics** and report them.
-* Add explicit tests for:
-
-  * symmetry/reciprocity (where physically required),
-  * boundary condition satisfaction,
-  * near-singularity behavior (x≈y),
-  * far-field asymptotics (sanity scaling).
+* Run **targeted tests** after each commit.
+* Avoid mass refactors and mass formatting.
 
 ---
 
-## 5) Operation Black Hammer phases (0 → 5) — Implementation playbook
+## 3) Emergency stop (anti-thrashing, mandatory)
 
-Codex must be able to execute tasks from any phase below. Each task must include:
+### 3.1 Trigger conditions
 
-* code changes,
-* tests,
-* documentation updates (brief),
-* and a rollback path.
+If any of these occur and you cannot confidently fix immediately:
 
-### Phase 0 — Toolchain lock-in for Blackwell
+* new failures appear outside your intended scope,
+* failures are widespread or unclear,
+* GPU/CPU device behavior becomes inconsistent,
+* you are stuck in edit-test-fail loops.
 
-**Goal:** guarantee the stack runs natively on the GPU and builds kernels for Blackwell.
+### 3.2 Emergency stop procedure
 
-Tasks may include:
-
-* Add a script `scripts/print_cuda_env.py` that prints:
-
-  * torch version, cuda availability, device name, capability, dtype support.
-* Ensure any custom extension build config targets Blackwell (`sm_120`/`12.0`) and includes PTX fallback where appropriate.
-* Add a minimal GPU smoke test in `tests/` that:
-
-  * allocates tensors on CUDA,
-  * runs a representative kernel,
-  * verifies output deterministically.
-
-Acceptance:
-
-* GPU smoke test passes.
-* No CPU fallback in core hot paths.
-
----
-
-### Phase 1 — Repo hardening (packaging, imports, determinism)
-
-**Goal:** everything is importable, tested, deterministic.
-
-Key targets (search and repair):
-
-* Broken imports / dead modules.
-* Test collection failures.
-* Non-deterministic seeds in experiment loops.
-
-Typical surgical tasks:
-
-* If a module exists but is not importable (packaging/layout mismatch), fix package structure:
-
-  * create/repair `__init__.py`,
-  * update import paths,
-  * update `pyproject.toml` / `setup.cfg` if needed,
-  * add tests that enforce importability.
-
-Acceptance:
-
-* Full test command passes.
-* `python -c "import <top-level-package>"` passes reliably.
-
----
-
-### Phase 2 — GPU-first performance refactor
-
-**Goal:** remove structural CPU bottlenecks.
-
-High-priority patterns to locate with ripgrep:
+1. Revert protected code to clean state:
 
 ```bash
-rg -n "\.cpu\(|\.numpy\(|torch\.unique\(|for .* in range\(|\.item\(" electrodrive
+git reset --hard HEAD
+git clean -fd
 ```
 
-Typical upgrades:
+2. Freeze modifications to any file that existed at the start of the run.
+3. You may continue only in **new files** or a clearly isolated experimental namespace.
+4. Write an incident report:
 
-* Remove forced `.cpu()` in matvec/solver paths.
-* Replace Python loops over groups with vectorized scatter/segment operations.
-* Batch basis evaluation and fuse operations (Triton/CUDA if needed).
-* Optional: CUDA graphs / `torch.compile` once shapes are stabilized.
-
-Acceptance:
-
-* No new CPU↔GPU transfers introduced.
-* Performance microbench improves or remains stable.
-* Numerics remain within verified tolerance.
+* `.blackhammer/emergency_stop_report.md` (what changed, what broke, why you stopped)
 
 ---
 
-### Phase 3 — Scientific precision + verification
+## 4) Black Hammer experimental goal: quick analytical win
 
-**Goal:** make “discovered Green’s functions” defensible.
+We want a **fast analytical surrogate** that:
 
-Add/upgrade verification utilities:
+* matches a trusted oracle (BEM / DCIM / verifier) to high accuracy,
+* is **significantly faster** than the oracle for repeated queries,
+* is compact enough to **distill to an analytic form** (or near-analytic template),
+* is valuable for engineering workflows (e.g., accelerating repeated solves in FEA/BEM contexts).
 
-* multi-region checks (near-singular / boundary / far-field),
-* reciprocity / symmetry tests,
-* FP64 certification mode for final candidates.
+**A “quick win” target** should have:
 
-Acceptance:
+* a strong existing oracle in this repo,
+* repeated-query value (many sources/targets),
+* a compact image-template likely exists (finite or small structured family).
 
-* Verification tests exist and run on CI (or local full pytest command).
-* Failures are informative and localized.
+Examples of good early targets (choose what the repo already supports best):
 
----
-
-### Phase 4 — Integrate best academic patterns without losing interpretability
-
-**Goal:** adopt SOTA ideas (operator learning, integral constraints, singular handling) while preserving “program/images” interpretability.
-
-Implementation patterns:
-
-* Support decomposition: `G = G_singular + G_smooth`.
-* Support constraint-based training objectives (boundary-integral residuals, PDE residuals).
-* Keep outputs interpretable by recording program templates, motif usage, and learned parameters.
-
-Acceptance:
-
-* New capabilities gated behind flags/configs.
-* Backwards compatibility maintained (unless explicitly versioned).
+* planar / layered-media Green’s surrogates (compact image templates approximating a known expensive oracle),
+* repeated source evaluation scenarios where speedups are monetizable.
 
 ---
 
-### Phase 5 — Discovery campaign pipeline (new analytic Green’s function)
+## 5) Experimental run protocol (Codex must follow)
 
-**Goal:** scale search and distill stable analytic structure.
+### 5.1 Preflight (required)
 
-Expected deliverables:
+Before ANY discovery run:
 
-* A multi-fidelity evaluation ladder (cheap → expensive oracle).
-* Reward shaping that favors:
-
-  * low complexity,
-  * stable motifs,
-  * symmetry compliance,
-  * low error.
-* A distillation tool that:
-
-  * clusters solutions by structural fingerprints,
-  * fits parameter laws across families of source conditions,
-  * exports datasets for symbolic regression.
-
-Acceptance:
-
-* A reproducible experiment entrypoint exists (script/CLI).
-* Outputs are saved with:
-
-  * program templates,
-  * parameters,
-  * solver stats,
-  * verification stats,
-  * git commit hash.
-
----
-
-## 6) Logging + artifacts (required for credible science)
-
-Every experimental run must record:
-
-* git commit hash,
-* command invocation,
-* seeds,
-* device details,
-* dtype policy,
-* config,
-* summary metrics (error, latency, complexity, novelty),
-* verification outcomes.
-
-Recommended directory:
-
-* `runs/black_hammer/<timestamp>_<short_hash>/`
-
----
-
-## 7) Documentation rule
-
-If you change behavior, add a short note in:
-
-* `docs/black_hammer_changes.md` (create if missing)
-  including:
-* what changed,
-* why it changed,
-* how to reproduce,
-* how to validate.
-
----
-
-## 8) What Codex must NEVER do
-
-* Never “fix” failing tests by disabling them unless explicitly instructed and justified.
-* Never introduce CPU fallbacks in hot paths as a convenience.
-* Never mass-reformat or rename unrelated files.
-* Never repeatedly thrash protected code after EMERGENCY STOP.
-* Never remove numerical checks/certification in the name of speed.
-
----
-
-## 9) Quick command reference
-
-Activate venv:
+1. Clean tree:
 
 ```bash
-source .venv/bin/activate
+git status --porcelain
 ```
 
-Full test suite (canonical):
+Must be empty or STOP.
+2. GPU sanity:
 
 ```bash
-pytest --ignore=staging --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py --ignore=temp_AI_upgrade -vv -rs -q --maxfail=1
+python scripts/print_cuda_env.py
+pytest -q tests/test_cuda_smoke.py -vv -rs --maxfail=1
 ```
 
-Search for CPU fallbacks / performance smells:
+3. Run minimal correctness suite for recently touched critical parts (examples; adjust if files move):
 
 ```bash
-rg -n "\.cpu\(|\.numpy\(|\.item\(|torch\.unique\(" electrodrive
+pytest -q electrodrive/gfdsl/tests -vv -rs --maxfail=1
+pytest -q electrodrive/images/optim/tests/test_group_prox.py -vv -rs --maxfail=1
+pytest -q electrodrive/images/tests/test_imagesystem_batched_potential.py -vv -rs --maxfail=1
+pytest -q electrodrive/verify/tests/test_green_checks.py -vv -rs --maxfail=1
 ```
 
-GPU capability sanity:
+### 5.2 Run structure + artifacts
 
-```bash
-python -c "import torch; print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))"
-```
+All discovery runs must write to:
+
+* `runs/black_hammer/<timestamp>_<tag>/`
+
+Each run directory must include:
+
+* `config.yaml` (or equivalent)
+* `env.json` (CUDA, torch, device)
+* `git.json` (commit SHA, branch)
+* `best.jsonl` or equivalent candidate trace
+* certificates / verifier output where available
+
+### 5.3 Multi-fidelity ladder (preferred)
+
+Use a staged evaluation strategy:
+
+* F0 (cheap proxy), F1 (mid), F2 (expensive oracle)
+  Promotion policy must be explicit and recorded.
+
+If ladder tooling exists (e.g., `electrodrive/verify/ladder.py`), use it or follow its pattern.
+
+### 5.4 Verification requirements for any claimed win
+
+A candidate may be called “promising” only if it:
+
+* passes core verification checks (reciprocity/symmetry if applicable, far-field sanity, boundary checks where relevant),
+* demonstrates stable accuracy on holdout points (not only training points),
+* shows reproducibility (seeded rerun yields similar results).
 
 ---
 
-## 10) Final rule: protect the repo
+## 6) The_Vault protocol (mandatory for potentially novel discoveries)
 
-Operation Black Hammer succeeds only if:
+### 6.1 The_Vault purpose
 
-* the repo remains healthy,
-* changes are surgical and test-backed,
-* GPU-first doctrine is enforced,
-* and discovered Green’s function candidates are numerically and scientifically defensible.
+**The_Vault** is for storing and documenting any image system, program template, or analytic formula that appears **potentially novel relative to this repo** and could be productized as an exclusive service (e.g., major speedups for firms doing FEA/BEM).
 
-If uncertain: **stop, revert, and contain changes to new experimental code only.**
+**Important:** “novel” here means *not obviously present in this repo’s existing baselines and templates*.
+Codex must not claim global novelty without external validation.
 
+### 6.2 Storage location
+
+At repo root:
+
+* `The_Vault/`
+* `The_Vault/Vault_Report.md` (index + setup narrative)
+
+Create `The_Vault/` if missing.
+
+### 6.3 When to vault
+
+Vault a discovery if all are true:
+
+* accuracy: meets a strict threshold vs oracle on holdout (define threshold in the vault entry; typical target: relerr ≤ 1e-3 or better),
+* speed: demonstrates material speedup vs oracle (define benchmark method; typical target: ≥ 10× on GPU),
+* stability: result persists across at least 2 seeds or 2 nearby configurations,
+* interpretability: program/template is compact enough to explain and potentially distill.
+
+### 6.4 Vault entry structure
+
+For each vault-worthy discovery, create:
+
+* `The_Vault/<YYYYMMDD_HHMMSS>_<short_tag>/`
+
+Inside it, include at minimum:
+
+* `README.md` — one-page human summary:
+
+  * what problem it solves (physics + geometry + BCs),
+  * what is new relative to repo baselines,
+  * measured accuracy + speed,
+  * how to reproduce in ≤ 10 minutes.
+* `Vault_Entry.json` — machine-readable metadata:
+
+  * git SHA, branch,
+  * seeds,
+  * config parameters,
+  * program canonical hash/bytes reference,
+  * metrics, verification summary,
+  * oracle fidelity used.
+* `Reproduce.sh` — exact reproduction commands (venv activation included).
+* `Program/` — canonical program representation:
+
+  * canonical JSON/bytes,
+  * motif description,
+  * any derived analytic simplification notes.
+* `Benchmarks/` — benchmark scripts + output:
+
+  * timing CSV,
+  * hardware + dtype info.
+* `Verification/` — verification results:
+
+  * gate outputs / certificates,
+  * summary JSON and/or logs.
+* `Distillation/` — if distillation is attempted:
+
+  * clustered templates,
+  * exported datasets (CSV/NPZ),
+  * notes about inferred closed forms.
+
+**Do not** put huge checkpoints in The_Vault. Prefer pointers to `runs/` artifacts and store only compact essentials.
+
+### 6.5 Vault_Report.md requirements
+
+`The_Vault/Vault_Report.md` must:
+
+* list all vault entries (timestamp + tag),
+* summarize each (problem, accuracy, speed, status),
+* include a **“Discovery Setup Narrative”**:
+
+  * exactly what scripts/configs were run,
+  * how GPU-first constraints were ensured,
+  * what verification gates were used,
+  * what made the discovery emerge (search space, reward shaping, priors).
+
+---
+
+## 7) Distillation + analytic extraction (required for “analytical win”)
+
+If a run produces a stable template:
+
+1. Cluster/aggregate candidates by structural fingerprint.
+2. Fit parameter laws across a family of source locations/configs.
+3. Export datasets for symbolic regression.
+4. Record the entire pipeline in the vault entry.
+
+If a distillation tool exists (example):
+
+```bash
+python scripts/black_hammer/distill_templates.py <RUN_DIR> <OUT_DIR>
 ```
-::contentReference[oaicite:0]{index=0}
-```
+
+Then place `<OUT_DIR>` (or a curated subset) under the vault entry.
+
+---
+
+## 8) Codex must NOT do
+
+* Do not disable tests to “fix” failures.
+* Do not introduce CPU fallbacks in hot paths for convenience.
+* Do not claim global novelty; only “appears novel relative to repo.”
+* Do not thrash protected code after emergency stop.
+* Do not store massive artifacts in The_Vault.
+
+---
+
+## 9) Go/No-Go before expensive discovery runs
+
+Go only if:
+
+* GPU sanity passes,
+* targeted suites pass,
+* **canonical full pytest** has passed at least once on the current branch after recent changes,
+* run directory structure + env/git logging is in place.
+
+No-Go if:
+
+* layered oracle returns empty batches unexpectedly for your intended target,
+* device mismatches appear (CUDA sigma on CPU backend, etc.),
+* verification is not being recorded.
+
+---
+
+## 10) Quick-win default experiment recipe (use unless instructed otherwise)
+
+1. Choose a target scenario already supported by existing oracles.
+2. Run a **small “smoke discovery”**:
+
+   * tiny budgets, shallow templates, cheap fidelity
+3. Promote only if it passes gates and beats baseline.
+4. Distill templates immediately.
+5. If vault criteria are met → create vault entry + update Vault_Report.md.
+
+````
+
+---
+
+### Optional: a single Codex “do the experiment” prompt you can paste
+(If you want Codex to immediately run a quick-win attempt and vault anything promising, paste this to Codex after you install the AGENTS.md above.)
+
+```text
+CODEX EXPERIMENT EXECUTION — Quick Analytical Win + The_Vault
+
+Follow AGENTS.md strictly.
+
+1) Preflight
+- source .venv/bin/activate
+- git status --porcelain must be clean or STOP.
+- python scripts/print_cuda_env.py
+- pytest -q tests/test_cuda_smoke.py -vv -rs --maxfail=1
+- pytest -q electrodrive/gfdsl/tests -vv -rs --maxfail=1
+- pytest -q electrodrive/images/optim/tests/test_group_prox.py -vv -rs --maxfail=1
+- pytest -q electrodrive/images/tests/test_imagesystem_batched_potential.py -vv -rs --maxfail=1
+- pytest -q electrodrive/verify/tests/test_green_checks.py -vv -rs --maxfail=1
+
+2) Identify the best “quick win” target already supported by the repo
+- Search for existing discovery entrypoints/configs:
+  rg -n "discovery|gfn|gflow|run.*discovery|oracle" experiments scripts electrodrive | head
+  ls runs | head
+- Choose ONE target scenario with:
+  - strong oracle support
+  - repeated-query value
+  - likely compact image template
+- Write a short plan into: .blackhammer/experiment_plan.md (target, oracle, metrics, thresholds)
+
+3) Run a small smoke discovery run (GPU-first)
+- Create run dir: runs/black_hammer/<timestamp>_quickwin_<tag>/
+- Ensure env/git info written (torch/cuda device, git SHA)
+- Run a short discovery budget (few generations, small candidate pool)
+- Record command lines verbatim in the run dir.
+
+4) Verify + benchmark top candidate(s)
+- Use verifier/gates/certification tools already in repo where available.
+- Measure speed vs oracle on GPU using consistent timing protocol.
+- Summarize results in runs/black_hammer/.../summary.md
+
+5) Distill templates
+- If available:
+  python scripts/black_hammer/distill_templates.py <RUN_DIR> <RUN_DIR>/distilled
+- Otherwise implement a minimal deterministic distillation script only if needed.
+
+6) Vaulting
+If a candidate meets vault criteria (accuracy threshold + speedup + stability + interpretability):
+- Create The_Vault/ if missing.
+- Create The_Vault/<YYYYMMDD_HHMMSS>_<tag>/
+- Populate:
+  README.md, Vault_Entry.json, Reproduce.sh, Program/, Benchmarks/, Verification/, Distillation/
+- Update The_Vault/Vault_Report.md:
+  - add an entry in the index
+  - include “Discovery Setup Narrative”: commands, configs, GPU settings, verification gates, why it worked
+- Do NOT store huge checkpoints; store compact artifacts + pointers to runs/.
+
+7) Final safety
+- If any repo health regression occurs and you cannot localize it, EMERGENCY STOP per AGENTS.md.
+- Leave working tree clean.

@@ -29,3 +29,10 @@
 - reproduce:
   - `pytest -q electrodrive/images/optim/tests/test_group_prox.py -k "group_prox" -vv -rs --maxfail=1`
 - validate: group prox tests pass on CPU and CUDA.
+
+## Prompt 2 updates
+- change: batched ImageSystem point-charge evaluation; removed explicit .cpu() scalar transfer in global_search hot loop.
+- change: added green_checks verification utilities and GreenDecomposition helper; added gated boundary/PDE penalty hooks in outer solve config.
+- change: added multi-fidelity ladder module and distillation CLI for template clustering.
+- reproduce (distill): `python scripts/black_hammer/distill_templates.py <input_dir> <output_dir>`
+- reproduce (verification checks): `pytest -q electrodrive/verify/tests/test_green_checks.py -vv -rs --maxfail=1`

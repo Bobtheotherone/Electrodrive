@@ -69,6 +69,10 @@ class OuterSolveConfig:
     constraint_mode: str = "none"
     admm_cfg: Optional[ADMMConfig] = None
     dtype_policy: Optional[DTypePolicy] = None
+    enable_boundary_penalty: bool = False
+    boundary_penalty_weight: float = 0.0
+    enable_pde_penalty: bool = False
+    pde_penalty_weight: float = 0.0
 
 
 @dataclass
@@ -98,6 +102,15 @@ def _default_rng(seed: Optional[int], device: torch.device) -> torch.Generator:
     if seed is not None:
         gen.manual_seed(int(seed))
     return gen
+
+
+def _apply_operator(
+    A: torch.Tensor | BasisOperator, w: torch.Tensor, X: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if isinstance(A, BasisOperator):
+        pts = X if X is not None else getattr(A, "points", None)
+        return A.matvec(w, pts)
+    return A.matmul(w)
 
 
 def _gather_theta(theta: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -358,19 +371,48 @@ def evaluate_bilevel_objective(
         if extra:
             terms.extend(list(extra))
 
+    extra_penalty = torch.tensor(0.0, device=base_loss.device, dtype=base_loss.dtype)
+    extra_stats: dict[str, Any] = {}
+    boundary_weight = float(solve_cfg.boundary_penalty_weight)
+    if solve_cfg.enable_boundary_penalty and boundary_weight > 0.0:
+        if is_boundary is not None and bool(is_boundary.any()):
+            resid = _apply_operator(A, w, X) - g
+            bnd_resid = resid[is_boundary]
+            bnd_penalty = bnd_resid.abs().mean()
+            extra_penalty = extra_penalty + bnd_penalty * boundary_weight
+            extra_stats["boundary_penalty"] = float(bnd_penalty.item())
+            extra_stats["boundary_penalty_weight"] = boundary_weight
+
+    pde_weight = float(solve_cfg.pde_penalty_weight)
+    if solve_cfg.enable_pde_penalty and pde_weight > 0.0:
+        pde_fn = None
+        if hasattr(objective, "pde_residual"):
+            pde_fn = getattr(objective, "pde_residual")
+        elif hasattr(objective, "laplacian_residual"):
+            pde_fn = getattr(objective, "laplacian_residual")
+        if pde_fn is not None:
+            pde_resid = pde_fn(theta, w, metadata)
+            pde_penalty = pde_resid.abs().mean()
+            extra_penalty = extra_penalty + pde_penalty * pde_weight
+            extra_stats["pde_penalty"] = float(pde_penalty.item())
+            extra_stats["pde_penalty_weight"] = pde_weight
+        else:
+            extra_stats["pde_penalty_supported"] = False
+
     penalty, c_stats = _evaluate_constraint_terms(
         terms,
         device=base_loss.device,
         dtype=base_loss.dtype,
         al_state=al_state,
     )
-    total = base_loss + penalty
+    total = base_loss + penalty + extra_penalty
 
     stats: dict[str, Any] = {
         "loss": float(base_loss.detach().cpu()),
         "penalty": float(penalty.detach().cpu()),
     }
     stats.update(c_stats)
+    stats.update(extra_stats)
     stats["inner"] = inner_stats
     if solve_timer is not None:
         stats["solve_ms"] = float(solve_timer.elapsed_ms)

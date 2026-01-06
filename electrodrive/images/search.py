@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import hashlib
 import os
@@ -289,6 +290,8 @@ class ImageSystem:
         self.elements = elements
         self.weights = weights
         self.metadata: Dict[str, Any] = metadata or {}
+        self._v2 = None
+        self._v2_cache_key = None
         if weights.numel() > 0:
             self.device = weights.device
             self.dtype = weights.dtype
@@ -303,6 +306,9 @@ class ImageSystem:
         device-mismatch surprises, then convert back to the original
         layout on return.
         """
+        flag = os.getenv("EDE_IMAGE_SYSTEM_V2", "").strip().lower()
+        if flag in {"1", "true", "yes", "on"}:
+            return self._potential_v2(targets)
         orig_device = targets.device
         orig_dtype = targets.dtype
 
@@ -320,6 +326,21 @@ class ImageSystem:
 
         # Preserve the caller's expectations about device/dtype.
         return V_sys.to(device=orig_device, dtype=orig_dtype)
+
+    def _potential_v2(self, targets: torch.Tensor) -> torch.Tensor:
+        key = (
+            id(self.weights),
+            tuple(self.weights.shape),
+            self.weights.device,
+            self.weights.dtype,
+            len(self.elements),
+        )
+        if self._v2 is None or self._v2_cache_key != key:
+            from electrodrive.images.image_system_v2 import ImageSystemV2
+
+            self._v2 = ImageSystemV2(self.elements, self.weights, metadata=self.metadata)
+            self._v2_cache_key = key
+        return self._v2.potential(targets)
 
 
 def _make_collocation_rng() -> np.random.Generator:
@@ -471,6 +492,7 @@ def _normalize_generator_mode(mode: Optional[str]) -> str:
         "hybrid_diffusion",
         "gfn",
         "gfn_flow",
+        "gfdsl",
     }
     if not mode:
         return "static_only"
@@ -479,6 +501,8 @@ def _normalize_generator_mode(mode: Optional[str]) -> str:
         m = "gfn"
     if m in {"gflownet_flow", "gfnflow"}:
         m = "gfn_flow"
+    if m in {"gfdsl_programs", "gfdsl_json"}:
+        m = "gfdsl"
     if m not in allowed:
         return "static_only"
     return m
@@ -2460,6 +2484,7 @@ def discover_images(
     constraint_specs: Optional[list[Any]] = None,
     admm_cfg: Optional[Any] = None,
     constraint_mode: str = "none",
+    gfdsl_program_dir: Optional[str] = None,
 ) -> ImageSystem:
     """Top-level entry point for sparse image discovery."""
 
@@ -2552,6 +2577,36 @@ def discover_images(
                 gfn_seed = int(seed_env)
             except Exception:
                 gfn_seed = None
+
+    gfdsl_candidates: List[ImageBasisElement] = []
+    if mode == "gfdsl":
+        gfdsl_dir = gfdsl_program_dir or os.getenv("EDE_GFDSl_PROGRAM_DIR", "").strip()
+        if not gfdsl_dir:
+            raise ValueError("gfdsl mode requires gfdsl_program_dir or EDE_GFDSl_PROGRAM_DIR.")
+        limit_env = os.getenv("EDE_GFDSl_MAX_PROGRAMS", "").strip()
+        limit = None
+        if limit_env:
+            try:
+                limit = int(limit_env)
+            except Exception:
+                limit = None
+        from electrodrive.gfdsl.program_loader import load_gfdsl_programs
+
+        gfdsl_candidates = load_gfdsl_programs(
+            Path(gfdsl_dir),
+            spec=spec,
+            device=device,
+            dtype=dtype,
+            eval_backend="operator",
+            logger=logger,
+            limit=limit,
+        )
+        logger.info(
+            "Using GFDSL program generator.",
+            mode=mode,
+            program_dir=str(gfdsl_dir),
+            n_candidates=len(gfdsl_candidates),
+        )
 
     if mode in {"diffusion", "hybrid_diffusion"} and basis_generator is None:
         try:
@@ -2662,7 +2717,9 @@ def discover_images(
             logger=logger,
         )
 
-    if mode in {"gfn", "gfn_flow"}:
+    if mode == "gfdsl":
+        candidates = gfdsl_candidates
+    elif mode in {"gfn", "gfn_flow"}:
         candidates = gfn_candidates
     elif mode in {"learned_only", "diffusion"}:
         candidates = learned_candidates

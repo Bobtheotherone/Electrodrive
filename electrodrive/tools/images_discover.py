@@ -285,6 +285,7 @@ def run_discover(args: argparse.Namespace) -> int:
         if args.basis_generator in {"gfn", "gfn_flow"}:
             gen_mode = args.basis_generator
 
+        gfdsl_program_dir = getattr(args, "gfdsl_program_dir", None)
         system = discover_images(
             spec=spec,
             basis_types=basis_types,
@@ -303,7 +304,7 @@ def run_discover(args: argparse.Namespace) -> int:
             lambda_group=lambda_group,
             basis_generator=basis_generator,
             basis_generator_mode=gen_mode,
-            gfdsl_program_dir=args.gfdsl_program_dir,
+            gfdsl_program_dir=gfdsl_program_dir,
             geo_encoder=geo_encoder,
             model_checkpoint=args.model_checkpoint,
             gfn_checkpoint=gfn_checkpoint,

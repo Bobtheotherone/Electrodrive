@@ -1,316 +1,143 @@
 ````markdown
-# AGENTS.md — Gate B/C Sprint Guide (Dielectric Interfaces, GPU-First)
+# AGENTS.md — Electrodrive (Codex / Repo Health)
 
-This repo is a GPU-first electrostatics / Green’s-function discovery system. **Our current bottleneck is not Gate A anymore.** Gate A is passing (autograd + fp64 verification points), but **Gate B and Gate C are failing for all generated GFDSL candidates** on the three-layer planar dielectric spec.
+This file defines how coding agents (including Codex) should work in this repository.
 
-This AGENTS.md is specialized for **making Gate B and Gate C pass** as fast as possible, with minimal thrash and maximal reuse of existing working code.
-
----
-
-## 0) Non-Negotiables
-
-### GPU-first, always
-- CUDA is mandatory for any real run.
-- Never add CPU fallbacks for heavy compute.
-- Keep tensors on CUDA; avoid `.cpu()`/`.numpy()` in hot paths.
-
-### Focus: gate passing, not unit tests
-- Do **not** prioritize full test suites right now.
-- Use **gfdsl_verify** and gate artifacts as the primary feedback loop.
-
-### Emergency stop (anti-thrashing)
-If Gate B/C work causes unclear regressions in unrelated systems:
-1) Stop touching unrelated code.
-2) Revert risky edits.
-3) Continue only in isolated modules related to gates or GFDSL evaluation.
+## Primary goals (in order)
+1. **Repo health never declines**: keep the full test suite green (expected skips for optional deps are OK).
+2. **Fix the user-reported regression**: `tests/test_images_diffusion_cli.py::test_diffusion_no_checkpoint_creates_random_generator`.
+3. **Minimize blast radius**: smallest correct change, no new hard dependencies, no behavior changes outside the intended fix.
 
 ---
 
-## 1) Current Known State (Do Not Re-Debug)
-
-### Target Spec (primary)
-`specs/planar_three_layer_eps2_80_sym_h04_region1.json`
-
-Key facts (from verifier config output):
-- BCs: `dielectric_interfaces`
-- Dielectrics:
-  - region1: eps=1.0, z ∈ [0, 10]
-  - slab: eps=80.0, z ∈ [-0.4, 0]
-  - region3: eps=1.0, z ∈ [-10, -0.4]
-- Source: point charge at z=0.2 in region1
-- Symmetry: `rot_z`
-- Domain bbox: [-1.2,1.2]^3
-
-### Gate results (as observed)
-For ~200 GFDSL programs in `runs/hard_discovery_01/program_bank/`:
-- Gate A: **PASS** for all (after fixes)
-- Gate B: **FAIL** for all
-- Gate C: **FAIL** for all
-- ABC passers: **0**
-
-This means:
-- We have harmonic (PDE) building blocks,
-- but we do **not** satisfy **dielectric interface conditions** (Gate B) or **near+far 1/r behavior** (Gate C).
+## Non-negotiables
+- **Do not “fix” by weakening tests**: no `xfail`, no blanket skips, no removing assertions.
+- **No new required dependencies** (stdlib + existing deps only). Optional extras are fine only if already present in repo conventions.
+- **Prefer defensive, explicit error handling** over broad `except:` that hides root causes.
+- **Keep interfaces stable**: don’t break public APIs/CLIs; avoid renaming CLI flags.
+- **Leave the tree clean** (no stray debug files, no temporary scripts committed).
 
 ---
 
-## 2) What Gates B and C Actually Require
-
-### Gate B (Boundary Conditions / Interface Continuity)
-Located at: `electrodrive/verify/gates/gateB_bc.py`
-
-For `BCs=dielectric_interfaces`, Gate B typically checks:
-- **Potential continuity across each interface** (e.g., z=0, z=-0.4)
-- **Normal displacement continuity**: eps * dV/dn continuous (no free surface charge)
-- May also compute `dirichlet_max_err` (even if conductors list is empty; confirm logic in gateB code)
-
-Outputs to watch (in certificate metrics):
-- `interface_max_v_jump`
-- `interface_max_d_jump`
-- `dirichlet_max_err`
-- sample counts
-
-**Implication:** candidate evaluation must be **region-aware and physically consistent across interfaces**, not just harmonic in a single region.
-
-### Gate C (Asymptotics / Spurious Behavior)
-Located at: `electrodrive/verify/gates/gateC_asymptotics.py`
-
-Gate C checks:
-- Slope near radius (default ~0.5) and far radius (~10) should be close to **-1** (1/r potential)
-- It may reject spurious growth / non-decaying behavior
-
-Outputs to watch:
-- `near_slope`, `far_slope`
-- `spurious_fraction`
-- `near_radius`, `far_radius`
-
-**Implication:** candidate must have a correct **monopole** behavior near and far. In practice this often requires:
-- including a correct “direct/reference” term (fixed term) OR
-- enforcing a net-charge constraint / moment constraint on the learned correction terms.
-
----
-
-## 3) Fast Repro Commands (Use These Instead of Tests)
-
-Always run inside venv and GPU knobs:
+## Quick reproduction (the current failure)
+Run this first and keep iterating until it passes:
 
 ```bash
-source .venv/bin/activate
-export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256
-export EDE_IMAGE_SYSTEM_V2=1
+python3 -m pytest -q -vv -s tests/test_images_diffusion_cli.py::test_diffusion_no_checkpoint_creates_random_generator
 ````
 
-### A-only sanity (should pass quickly)
+Then confirm both diffusion CLI tests:
 
 ```bash
-python -m electrodrive.tools.gfdsl_verify \
-  --spec specs/planar_three_layer_eps2_80_sym_h04_region1.json \
-  --program runs/hard_discovery_01/control/conjpair.json \
-  --out runs/_debug/conjpair_A \
-  --dtype fp32 \
-  --gates A \
-  --n-points 256
+python3 -m pytest -q -vv -s tests/test_images_diffusion_cli.py
 ```
 
-### Gate B debug (small)
+Finally, confirm the repo-level pytest run used by the maintainer (matches local workflow):
 
 ```bash
-python -m electrodrive.tools.gfdsl_verify \
-  --spec specs/planar_three_layer_eps2_80_sym_h04_region1.json \
-  --program runs/hard_discovery_01/program_bank/dcim_full_000.json \
-  --out runs/_debug/dcim_full_000_B \
-  --dtype fp32 \
-  --gates B \
-  --n-points 128
-```
-
-### Gate C debug (small)
-
-```bash
-python -m electrodrive.tools.gfdsl_verify \
-  --spec specs/planar_three_layer_eps2_80_sym_h04_region1.json \
-  --program runs/hard_discovery_01/program_bank/dcim_full_000.json \
-  --out runs/_debug/dcim_full_000_C \
-  --dtype fp32 \
-  --gates C \
-  --n-points 128
+pytest --ignore=staging \
+       --ignore=temp_AI_upgrade \
+       --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py \
+       -q -vv -rs --maxfail=1
 ```
 
 ---
 
-## 4) Artifact-Driven Debugging (Don’t Guess)
+## Debugging workflow for this failure
 
-Every run writes:
+The failing assertion is that `cli.run_discover(args)` should return **0** when:
 
-* `<out>/verification_certificate.json`
-* Gate artifacts under:
+* `basis_generator="diffusion"`
+* `basis_generator_mode="diffusion"`
+* `model_checkpoint=None`
 
-  * `<out>/gates/B/...`
-  * `<out>/gates/C/...`
+### Where to look
 
-Use these to diagnose what is failing:
+* CLI entrypoint: `electrodrive/tools/images_discover.py` (`run_discover`)
+* Diffusion generator: `electrodrive/images/diffusion_generator.py` (`DiffusionBasisGenerator`)
+* Image search pipeline: `electrodrive/images/search.py` (`discover_images`, `ImageSystem`)
+* Logger output: `out_dir/events.jsonl` (written by `JsonlLogger`)
 
-* Which interface is worst (z=0 vs z=-0.4)?
-* Is the failure dominated by potential jump or displacement jump?
-* Are C slopes wrong near, far, or both?
+### How to get the real exception
 
-Recommended quick inspection:
+If `run_discover` returns `1`, it should have logged an `ERROR` record.
+Open the run directory produced by the test (a tmp path) and inspect:
 
-```bash
-python - <<'PY'
-import json
-from pathlib import Path
-p = Path("runs/_debug/dcim_full_000_B/verification_certificate.json")
-d = json.loads(p.read_text())
-print("B:", (d.get("gates", {}) or {}).get("B", {}))
-PY
+* `<out_dir>/events.jsonl`
+* Look for `"level":"ERROR"` and the `"trace"` field (logger supports `exc_info=True`)
+
+Use the trace to identify the exact failing line and fix the underlying cause.
+
+---
+
+## Behavioral contract (what “correct” means)
+
+### Diffusion generator behavior
+
+* If `--basis-generator diffusion` (or `hybrid_diffusion`) is requested **without** a checkpoint:
+
+  * **Create a fresh `DiffusionBasisGenerator`** with a reasonable default config.
+  * **Proceed normally** and return `0` if downstream steps succeed.
+  * Emit a **warning-level log** that weights are random / exploratory.
+
+* If a checkpoint is provided but does **not** contain diffusion weights:
+
+  * Treat as a **hard error** and return `1` (the existing test expects this).
+
+### Exit codes
+
+* `0` = successful run (including no-checkpoint diffusion generator initialization)
+* `1` = expected user/config error or runtime failure (with a logged error message)
+* Never call `sys.exit()` inside library functions; return codes are required for testability.
+
+### Artifact writes
+
+`run_discover` should remain safe and deterministic about output:
+
+* It may create the output directory.
+* It may write manifests/logs (`events.jsonl`, `discovery_manifest.json`, etc.).
+* Tests may monkeypatch `save_image_system`; do not assume serialization always happens.
+
+---
+
+## Implementation guidelines (to prevent repo health regression)
+
+* Make the smallest change that restores the contract above.
+* Prefer **localized fixes** in the CLI (`run_discover`) rather than sweeping changes across the solver stack.
+* If the failure is due to a missing attribute on a returned object, fix it **at the source** (preferred), or add a **backwards-compatible fallback** (acceptable) without breaking type expectations.
+* Add/adjust tests only when:
+
+  * The desired behavior is not already covered, or
+  * You’re preventing a future regression with a clear, minimal test.
+
+---
+
+## Testing policy
+
+* For this task, always run:
+
+  * the single failing test (fast loop),
+  * the whole `tests/test_images_diffusion_cli.py`,
+  * then the maintainer’s full pytest invocation shown above.
+* Skips are acceptable only for optional dependencies (e.g., `pykeops`, `xitorch`) and must remain clean (no errors).
+
+---
+
+## Style / maintainability
+
+* Keep changes readable and well-commented where logic is non-obvious (especially around CLI exit codes).
+* Avoid adding global state or environment-variable side effects unless strictly necessary.
+* If you touch logging, keep it JSON-serializable and stable (no huge tensors dumped).
+
+---
+
+## Definition of done
+
+* ✅ `tests/test_images_diffusion_cli.py::test_diffusion_no_checkpoint_creates_random_generator` passes.
+* ✅ Maintainer pytest command passes (same ignores).
+* ✅ No new failing tests, no new required dependencies, no weakened assertions.
+* ✅ Logs and manifests (if written) remain valid JSON and informative.
+
 ```
-
----
-
-## 5) Repo Map (Where To Look First)
-
-### Gate implementations
-
-* `electrodrive/verify/gates/gateB_bc.py`  ← interface checks
-* `electrodrive/verify/gates/gateC_asymptotics.py` ← slope checks
-* `electrodrive/verify/verifier.py` ← wiring + default configs
-
-### GFDSL pipeline
-
-* `electrodrive/tools/gfdsl_verify.py` ← the runnable pipeline (spec → compile → solve → verify)
-* `electrodrive/gfdsl/ast/nodes.py` ← lowering of layered nodes / DCIM blocks
-* `electrodrive/gfdsl/eval/layered.py` ← current layered evaluators (likely too naive for B/C)
-* `electrodrive/gfdsl/eval/kernels_complex.py` ← complex conjugate pair kernel (A is fixed here)
-
-### “Known-good” layered/image implementations (use as baseline)
-
-These already exist in the repo and should contain physics that passes interface checks:
-
-* `electrodrive/images/basis.py`
-* `electrodrive/images/basis_dcim.py`
-* `electrodrive/images/dcim_types.py`
-* Reference stratified solver:
-
-  * `electrodrive/core/planar_stratified_reference.py`
-
-If Codex is stuck, the fastest path is:
-**copy the physics from the known-good basis implementations into GFDSL lowering**, rather than inventing new pole/branchcut math from scratch.
-
----
-
-## 6) The Likely Root Causes of B/C Failure (Prioritized)
-
-### (1) Candidate is missing an explicit “direct/reference” term
-
-Gate C near-slope will fail if the representation does not correctly reproduce the local 1/r singular behavior (even away from the exclusion radius).
-Even if A passes (harmonic away from charges), C can fail if near behavior is wrong.
-
-**Fix pattern:** include a fixed-term baseline (reference Green’s function) and solve only for a correction:
-
-* `V_total = V_ref + V_correction`
-* V_ref should be simple and stable, e.g. homogeneous Coulomb in eps1 with correct K_E scaling.
-* The correction terms enforce interface BCs.
-
-Implement/refine this in:
-
-* `electrodrive/tools/gfdsl_verify.py` (fixed_term composition)
-* and/or layered node lowering.
-
-### (2) Layered evaluators are not region-aware / not enforcing dielectric reflection/transmission physics
-
-A harmonic function is not enough. For layered media, the representation must match:
-
-* continuity of V
-* continuity of eps*dV/dn
-
-Your current `InterfacePoleNode` / `BranchCutApproxNode` lowering in GFDSL is likely a generic linear basis, not tied to eps1/eps2/eps3 or interface locations properly.
-
-**Fix pattern:** implement physically correct planar stratified Green’s representation:
-
-* for each observation region (region1, slab, region3), the representation differs
-* coefficients depend on eps ratios and slab thickness h
-* existing DCIM/three-layer basis code in `electrodrive/images/` likely already embodies this
-
-Implement/refine in:
-
-* `electrodrive/gfdsl/eval/layered.py`
-* `electrodrive/gfdsl/ast/nodes.py` lowering
-
-### (3) Gate B may be applying a dirichlet check unexpectedly (even with no conductors)
-
-If `dirichlet_max_err` dominates while conductors are empty, confirm Gate B logic:
-
-* Is it checking a plane boundary as “dirichlet” by default?
-* Is it interpreting “interfaces” incorrectly?
-
-Fix in `gateB_bc.py` only if the current behavior is demonstrably wrong for `dielectric_interfaces`.
-
----
-
-## 7) Fast Strategy for Codex: “Make One Candidate Pass B + C”
-
-### Step 1: Establish a baseline that should pass B/C
-
-Codex should build or reuse a known-good candidate evaluator:
-
-* e.g., run the existing stratified reference backend and measure B/C on it.
-* If the baseline fails, the gate logic or thresholds may be wrong for this spec.
-
-### Step 2: Introduce a reference + correction decomposition
-
-* Add `V_ref` fixed term (direct Coulomb in eps1, with K_E scaling consistent with collocation/oracles).
-* Solve correction coefficients with GFDSL images/poles/branchcut.
-* This should immediately improve:
-
-  * Gate C near slope (by giving correct local 1/r behavior)
-  * numerical stability / coefficient magnitudes, which helps B as well.
-
-### Step 3: Make layered correction terms physically parameterized
-
-* Use eps ratios and interface z positions (0 and -0.4) directly from spec.
-* Prefer implementing a GFDSL node that wraps known-good three-layer basis rather than “free” residues.
-
-**Pragmatic path:** add a GFDSL node like `ThreeLayerDCIMNode` that lowers to an evaluator built from existing DCIM basis code.
-
----
-
-## 8) Performance / Iteration Guidance (So It Doesn’t Take Forever Again)
-
-* Debug B and C **separately** first with `--gates B` or `--gates C`
-* Use `--n-points 64–256` until metrics move meaningfully
-* Only then run `--gates A,B,C` (A should remain pass)
-* For final confirmation use higher points (512–2048)
-
----
-
-## 9) Working Definition of “Done” for This Sprint
-
-For the target spec:
-
-* A: pass (already achieved)
-* B: pass (interface continuity within thresholds)
-* C: pass (near and far slope near -1 within tolerance)
-* Once ABC passes exist, we can resume D/E and “novel discovery” selection.
-
----
-
-## 10) Immediate Next Action for Codex (When You Start a Session)
-
-1. Read gate code:
-
-   * `electrodrive/verify/gates/gateB_bc.py`
-   * `electrodrive/verify/gates/gateC_asymptotics.py`
-
-2. Read known-good layered basis code:
-
-   * `electrodrive/images/basis_dcim.py`
-   * `electrodrive/core/planar_stratified_reference.py`
-
-3. Modify ONLY the minimal path needed to create one ABC-passing candidate:
-
-   * add reference fixed term (V_ref) in `gfdsl_verify.py`
-   * implement region-aware correction terms in GFDSL layered lowering
-   * iterate using `--gates B` and `--gates C` with small `--n-points`
-
-4. Keep everything CUDA-first.
+::contentReference[oaicite:0]{index=0}
+```

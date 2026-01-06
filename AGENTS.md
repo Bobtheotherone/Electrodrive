@@ -1,142 +1,415 @@
 ````markdown
-# AGENTS.md — Electrodrive (Codex / Repo Health)
+# AGENTS.md — Operation Black Hammer (Codex Surgical Playbook)
 
-This file defines how coding agents (including Codex) should work in this repository.
+This repository is an active research/codebase for **Operation Black Hammer**: intensively repair, upgrade, and dramatically increase the scientific precision of the repo while enabling experiments whose core directive is:
 
-## Primary goals (in order)
-1. **Repo health never declines**: keep the full test suite green (expected skips for optional deps are OK).
-2. **Fix the user-reported regression**: `tests/test_images_diffusion_cli.py::test_diffusion_no_checkpoint_creates_random_generator`.
-3. **Minimize blast radius**: smallest correct change, no new hard dependencies, no behavior changes outside the intended fix.
+> **Discover a completely new analytical Green’s Function using a method-of-images–based AI implementation.**
 
----
-
-## Non-negotiables
-- **Do not “fix” by weakening tests**: no `xfail`, no blanket skips, no removing assertions.
-- **No new required dependencies** (stdlib + existing deps only). Optional extras are fine only if already present in repo conventions.
-- **Prefer defensive, explicit error handling** over broad `except:` that hides root causes.
-- **Keep interfaces stable**: don’t break public APIs/CLIs; avoid renaming CLI flags.
-- **Leave the tree clean** (no stray debug files, no temporary scripts committed).
+Codex must **prioritize GPU-first execution** and **must not allow repo health to decline**. If repo health declines and Codex cannot confidently identify/fix the cause, Codex must **EMERGENCY STOP** to prevent thrashing and damage to existing code.
 
 ---
 
-## Quick reproduction (the current failure)
-Run this first and keep iterating until it passes:
+## 0) Hardware + performance doctrine (non-negotiable)
 
+Target machine:
+
+- Laptop: **ROG Zephyrus G16 GU605CX_GU605CX**
+- CPU: **Intel(R) Core(TM) Ultra 9 285H (2.90 GHz)**
+- GPU: **NVIDIA Blackwell RTX 5090, 24 GB VRAM**
+- RAM: **32 GB**
+
+Doctrine:
+
+1. **GPU is the primary compute device.** Prefer GPU even if it requires more engineering (e.g., custom CUDA/Triton kernels).
+2. **CPU is only allowed** when:
+   - the operation is not supported on GPU, or
+   - the CPU is certainly more efficient (rare), or
+   - it is strictly non-hot-path (I/O, orchestration, logging).
+3. Any **implicit CPU fallback** in hot paths is a **bug**. Examples: `.cpu()` in inner loops, `.numpy()` conversions, host-device ping-pong, Python loops over large tensors.
+4. Mixed precision policy:
+   - Proposal / generative models may use **BF16/FP16**.
+   - Solver / verification uses **FP32**.
+   - Certification / final numerical validation uses **FP64** when necessary.
+
+---
+
+## 1) Environment: ALWAYS run inside venv
+
+**Every command must start with:**
 ```bash
-python3 -m pytest -q -vv -s tests/test_images_diffusion_cli.py::test_diffusion_no_checkpoint_creates_random_generator
+source .venv/bin/activate
 ````
 
-Then confirm both diffusion CLI tests:
+Sanity checks (run early, and whenever GPU issues arise):
 
 ```bash
-python3 -m pytest -q -vv -s tests/test_images_diffusion_cli.py
+python -c "import torch; print('torch', torch.__version__); print('cuda?', torch.cuda.is_available()); print('dev', torch.cuda.get_device_name(0) if torch.cuda.is_available() else None); print('cap', torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)"
 ```
 
-Finally, confirm the repo-level pytest run used by the maintainer (matches local workflow):
+If building CUDA extensions:
+
+* Prefer setting:
+
+  * `TORCH_CUDA_ARCH_LIST="12.0+PTX"` (Blackwell target) when appropriate in your environment.
+* Keep builds reproducible; never hardcode machine-local absolute paths.
+
+---
+
+## 2) Repo health definition + gatekeeping
+
+### 2.1 Repo health = “no regressions”
+
+Repo health includes:
+
+* Tests: existing test suite must not gain new failures.
+* Behavior: no silent changes to numerical meaning without explicit versioning and docs.
+* Performance: no new CPU/GPU transfer regressions in hot loops.
+* Structure: no breaking imports, packaging, or CLI entrypoints unless explicitly upgraded with migration notes.
+
+### 2.2 Full test command (canonical)
+
+When instructed to run full pytest (or before merging major changes), use **exactly**:
 
 ```bash
-pytest --ignore=staging \
-       --ignore=temp_AI_upgrade \
-       --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py \
-       -q -vv -rs --maxfail=1
+source .venv/bin/activate
+pytest --ignore=staging --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py --ignore=temp_AI_upgrade -vv -rs -q --maxfail=1
+```
+
+### 2.3 “Baseline first” protocol (MANDATORY)
+
+At the start of any run:
+
+1. Ensure a clean working tree:
+
+   ```bash
+   git status --porcelain
+   ```
+2. Record baseline:
+
+   * Save the current commit hash: `git rev-parse HEAD`
+   * Run the full test command once and save output to a file:
+
+     * `.blackhammer/baseline_pytest.txt`
+3. Record “protected file set”:
+
+   ```bash
+   mkdir -p .blackhammer
+   git ls-files > .blackhammer/protected_files_at_start.txt
+   ```
+
+---
+
+## 3) Emergency stop (anti-thrashing safety system)
+
+### 3.1 When to trigger EMERGENCY STOP
+
+Trigger an EMERGENCY STOP if **any** occurs and you cannot confidently fix within the next minimal edit:
+
+* New test failures appear that:
+
+  * are outside the intended change scope, or
+  * are widespread / non-localized, or
+  * imply you may have broken core infrastructure (imports, packaging, device placement, numerics).
+* Performance collapses due to accidental CPU fallback and the cause isn’t obvious.
+* You detect repetitive edit-test-fail cycles without clear progress.
+
+### 3.2 What EMERGENCY STOP means
+
+When EMERGENCY STOP triggers:
+
+1. **Immediately revert** changes to existing (“protected”) code:
+
+   ```bash
+   git reset --hard HEAD
+   git clean -fd
+   ```
+2. **Freeze modifications** to any file that existed at the start of the run:
+
+   * Those are listed in `.blackhammer/protected_files_at_start.txt`.
+3. You may continue working **only** on:
+
+   * New files created during this run, and/or
+   * Files explicitly created under a new experimental namespace (recommended):
+
+     * `staging/black_hammer_experiments/` (or similar)
+4. Add a short incident report in:
+
+   * `.blackhammer/emergency_stop_report.md`
+     including:
+   * what you changed,
+   * what broke (copy errors),
+   * hypotheses,
+   * what you reverted.
+
+**Do not resume editing protected code** unless a future instruction explicitly expands scope or you have a surgical, test-backed fix.
+
+---
+
+## 4) Surgical workflow (how Codex must operate)
+
+### 4.1 Change discipline
+
+* Make **small, atomic commits**.
+* After each commit:
+
+  * run the narrowest relevant tests (if available),
+  * then periodically run the full test command.
+* Avoid “refactor everything” edits.
+* Never mass-format unrelated files.
+* Never change public APIs without a migration note and tests.
+
+### 4.2 GPU-first implementation discipline
+
+When touching performance-critical code:
+
+* Add a device assertion in hot paths when appropriate:
+
+  * e.g., `assert x.is_cuda` (or explicit `device` plumbing).
+* Avoid Python loops over tensor groups; prefer fused kernels or vectorized ops.
+* Avoid host synchronization (`.item()`, implicit prints, frequent timing calls) inside loops.
+* Minimize kernel launch overhead by batching operations.
+
+### 4.3 Numerical rigor discipline
+
+* Prefer **relative error metrics** and report them.
+* Add explicit tests for:
+
+  * symmetry/reciprocity (where physically required),
+  * boundary condition satisfaction,
+  * near-singularity behavior (x≈y),
+  * far-field asymptotics (sanity scaling).
+
+---
+
+## 5) Operation Black Hammer phases (0 → 5) — Implementation playbook
+
+Codex must be able to execute tasks from any phase below. Each task must include:
+
+* code changes,
+* tests,
+* documentation updates (brief),
+* and a rollback path.
+
+### Phase 0 — Toolchain lock-in for Blackwell
+
+**Goal:** guarantee the stack runs natively on the GPU and builds kernels for Blackwell.
+
+Tasks may include:
+
+* Add a script `scripts/print_cuda_env.py` that prints:
+
+  * torch version, cuda availability, device name, capability, dtype support.
+* Ensure any custom extension build config targets Blackwell (`sm_120`/`12.0`) and includes PTX fallback where appropriate.
+* Add a minimal GPU smoke test in `tests/` that:
+
+  * allocates tensors on CUDA,
+  * runs a representative kernel,
+  * verifies output deterministically.
+
+Acceptance:
+
+* GPU smoke test passes.
+* No CPU fallback in core hot paths.
+
+---
+
+### Phase 1 — Repo hardening (packaging, imports, determinism)
+
+**Goal:** everything is importable, tested, deterministic.
+
+Key targets (search and repair):
+
+* Broken imports / dead modules.
+* Test collection failures.
+* Non-deterministic seeds in experiment loops.
+
+Typical surgical tasks:
+
+* If a module exists but is not importable (packaging/layout mismatch), fix package structure:
+
+  * create/repair `__init__.py`,
+  * update import paths,
+  * update `pyproject.toml` / `setup.cfg` if needed,
+  * add tests that enforce importability.
+
+Acceptance:
+
+* Full test command passes.
+* `python -c "import <top-level-package>"` passes reliably.
+
+---
+
+### Phase 2 — GPU-first performance refactor
+
+**Goal:** remove structural CPU bottlenecks.
+
+High-priority patterns to locate with ripgrep:
+
+```bash
+rg -n "\.cpu\(|\.numpy\(|torch\.unique\(|for .* in range\(|\.item\(" electrodrive
+```
+
+Typical upgrades:
+
+* Remove forced `.cpu()` in matvec/solver paths.
+* Replace Python loops over groups with vectorized scatter/segment operations.
+* Batch basis evaluation and fuse operations (Triton/CUDA if needed).
+* Optional: CUDA graphs / `torch.compile` once shapes are stabilized.
+
+Acceptance:
+
+* No new CPU↔GPU transfers introduced.
+* Performance microbench improves or remains stable.
+* Numerics remain within verified tolerance.
+
+---
+
+### Phase 3 — Scientific precision + verification
+
+**Goal:** make “discovered Green’s functions” defensible.
+
+Add/upgrade verification utilities:
+
+* multi-region checks (near-singular / boundary / far-field),
+* reciprocity / symmetry tests,
+* FP64 certification mode for final candidates.
+
+Acceptance:
+
+* Verification tests exist and run on CI (or local full pytest command).
+* Failures are informative and localized.
+
+---
+
+### Phase 4 — Integrate best academic patterns without losing interpretability
+
+**Goal:** adopt SOTA ideas (operator learning, integral constraints, singular handling) while preserving “program/images” interpretability.
+
+Implementation patterns:
+
+* Support decomposition: `G = G_singular + G_smooth`.
+* Support constraint-based training objectives (boundary-integral residuals, PDE residuals).
+* Keep outputs interpretable by recording program templates, motif usage, and learned parameters.
+
+Acceptance:
+
+* New capabilities gated behind flags/configs.
+* Backwards compatibility maintained (unless explicitly versioned).
+
+---
+
+### Phase 5 — Discovery campaign pipeline (new analytic Green’s function)
+
+**Goal:** scale search and distill stable analytic structure.
+
+Expected deliverables:
+
+* A multi-fidelity evaluation ladder (cheap → expensive oracle).
+* Reward shaping that favors:
+
+  * low complexity,
+  * stable motifs,
+  * symmetry compliance,
+  * low error.
+* A distillation tool that:
+
+  * clusters solutions by structural fingerprints,
+  * fits parameter laws across families of source conditions,
+  * exports datasets for symbolic regression.
+
+Acceptance:
+
+* A reproducible experiment entrypoint exists (script/CLI).
+* Outputs are saved with:
+
+  * program templates,
+  * parameters,
+  * solver stats,
+  * verification stats,
+  * git commit hash.
+
+---
+
+## 6) Logging + artifacts (required for credible science)
+
+Every experimental run must record:
+
+* git commit hash,
+* command invocation,
+* seeds,
+* device details,
+* dtype policy,
+* config,
+* summary metrics (error, latency, complexity, novelty),
+* verification outcomes.
+
+Recommended directory:
+
+* `runs/black_hammer/<timestamp>_<short_hash>/`
+
+---
+
+## 7) Documentation rule
+
+If you change behavior, add a short note in:
+
+* `docs/black_hammer_changes.md` (create if missing)
+  including:
+* what changed,
+* why it changed,
+* how to reproduce,
+* how to validate.
+
+---
+
+## 8) What Codex must NEVER do
+
+* Never “fix” failing tests by disabling them unless explicitly instructed and justified.
+* Never introduce CPU fallbacks in hot paths as a convenience.
+* Never mass-reformat or rename unrelated files.
+* Never repeatedly thrash protected code after EMERGENCY STOP.
+* Never remove numerical checks/certification in the name of speed.
+
+---
+
+## 9) Quick command reference
+
+Activate venv:
+
+```bash
+source .venv/bin/activate
+```
+
+Full test suite (canonical):
+
+```bash
+pytest --ignore=staging --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py --ignore=temp_AI_upgrade -vv -rs -q --maxfail=1
+```
+
+Search for CPU fallbacks / performance smells:
+
+```bash
+rg -n "\.cpu\(|\.numpy\(|\.item\(|torch\.unique\(" electrodrive
+```
+
+GPU capability sanity:
+
+```bash
+python -c "import torch; print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))"
 ```
 
 ---
 
-## Debugging workflow for this failure
+## 10) Final rule: protect the repo
 
-The failing assertion is that `cli.run_discover(args)` should return **0** when:
+Operation Black Hammer succeeds only if:
 
-* `basis_generator="diffusion"`
-* `basis_generator_mode="diffusion"`
-* `model_checkpoint=None`
+* the repo remains healthy,
+* changes are surgical and test-backed,
+* GPU-first doctrine is enforced,
+* and discovered Green’s function candidates are numerically and scientifically defensible.
 
-### Where to look
-
-* CLI entrypoint: `electrodrive/tools/images_discover.py` (`run_discover`)
-* Diffusion generator: `electrodrive/images/diffusion_generator.py` (`DiffusionBasisGenerator`)
-* Image search pipeline: `electrodrive/images/search.py` (`discover_images`, `ImageSystem`)
-* Logger output: `out_dir/events.jsonl` (written by `JsonlLogger`)
-
-### How to get the real exception
-
-If `run_discover` returns `1`, it should have logged an `ERROR` record.
-Open the run directory produced by the test (a tmp path) and inspect:
-
-* `<out_dir>/events.jsonl`
-* Look for `"level":"ERROR"` and the `"trace"` field (logger supports `exc_info=True`)
-
-Use the trace to identify the exact failing line and fix the underlying cause.
-
----
-
-## Behavioral contract (what “correct” means)
-
-### Diffusion generator behavior
-
-* If `--basis-generator diffusion` (or `hybrid_diffusion`) is requested **without** a checkpoint:
-
-  * **Create a fresh `DiffusionBasisGenerator`** with a reasonable default config.
-  * **Proceed normally** and return `0` if downstream steps succeed.
-  * Emit a **warning-level log** that weights are random / exploratory.
-
-* If a checkpoint is provided but does **not** contain diffusion weights:
-
-  * Treat as a **hard error** and return `1` (the existing test expects this).
-
-### Exit codes
-
-* `0` = successful run (including no-checkpoint diffusion generator initialization)
-* `1` = expected user/config error or runtime failure (with a logged error message)
-* Never call `sys.exit()` inside library functions; return codes are required for testability.
-
-### Artifact writes
-
-`run_discover` should remain safe and deterministic about output:
-
-* It may create the output directory.
-* It may write manifests/logs (`events.jsonl`, `discovery_manifest.json`, etc.).
-* Tests may monkeypatch `save_image_system`; do not assume serialization always happens.
-
----
-
-## Implementation guidelines (to prevent repo health regression)
-
-* Make the smallest change that restores the contract above.
-* Prefer **localized fixes** in the CLI (`run_discover`) rather than sweeping changes across the solver stack.
-* If the failure is due to a missing attribute on a returned object, fix it **at the source** (preferred), or add a **backwards-compatible fallback** (acceptable) without breaking type expectations.
-* Add/adjust tests only when:
-
-  * The desired behavior is not already covered, or
-  * You’re preventing a future regression with a clear, minimal test.
-
----
-
-## Testing policy
-
-* For this task, always run:
-
-  * the single failing test (fast loop),
-  * the whole `tests/test_images_diffusion_cli.py`,
-  * then the maintainer’s full pytest invocation shown above.
-* Skips are acceptable only for optional dependencies (e.g., `pykeops`, `xitorch`) and must remain clean (no errors).
-
----
-
-## Style / maintainability
-
-* Keep changes readable and well-commented where logic is non-obvious (especially around CLI exit codes).
-* Avoid adding global state or environment-variable side effects unless strictly necessary.
-* If you touch logging, keep it JSON-serializable and stable (no huge tensors dumped).
-
----
-
-## Definition of done
-
-* ✅ `tests/test_images_diffusion_cli.py::test_diffusion_no_checkpoint_creates_random_generator` passes.
-* ✅ Maintainer pytest command passes (same ignores).
-* ✅ No new failing tests, no new required dependencies, no weakened assertions.
-* ✅ Logs and manifests (if written) remain valid JSON and informative.
+If uncertain: **stop, revert, and contain changes to new experimental code only.**
 
 ```
 ::contentReference[oaicite:0]{index=0}

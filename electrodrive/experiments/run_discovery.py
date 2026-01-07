@@ -51,7 +51,7 @@ from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, Oracle
 from electrodrive.verify.utils import normalize_dtype
 from electrodrive.verify.utils import sha256_json, utc_now_iso
 from electrodrive.verify.verifier import VerificationPlan, Verifier
-from electrodrive.verify.gate_proxies import proxy_gateB, proxy_gateC, proxy_gateD
+from electrodrive.verify.gate_proxies import proxy_gateA, proxy_gateB, proxy_gateC, proxy_gateD
 from electrodrive.experiments.layered_sampling import (
     parse_layered_interfaces,
     sample_layered_interior,
@@ -421,6 +421,17 @@ def _proxy_fail_count(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> 
     if not metrics:
         return 0
     fail = 0
+    lap_tol = float(thresholds.get("laplacian_linf", 5e-3))
+    status = metrics.get("proxy_gateA_status")
+    if status == "fail":
+        fail += 1
+    elif status is None:
+        linf = metrics.get("proxy_gateA_linf")
+        l2 = metrics.get("proxy_gateA_l2")
+        if linf is not None and float(linf) > lap_tol:
+            fail += 1
+        elif l2 is not None and float(l2) > lap_tol:
+            fail += 1
     bc_tol = float(thresholds.get("bc_continuity", 5e-3))
     if float(metrics.get("proxy_gateB_max_v_jump", 0.0)) > bc_tol or float(
         metrics.get("proxy_gateB_max_d_jump", 0.0)
@@ -444,6 +455,7 @@ def _proxy_fail_count(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> 
 def _proxy_score(metrics: Dict[str, Any]) -> float:
     if not metrics:
         return float("inf")
+    a = float(metrics.get("proxy_gateA_worst_ratio", 1e9))
     b = max(
         float(metrics.get("proxy_gateB_max_v_jump", 0.0)),
         float(metrics.get("proxy_gateB_max_d_jump", 0.0)),
@@ -453,7 +465,26 @@ def _proxy_score(metrics: Dict[str, Any]) -> float:
     spurious = float(metrics.get("proxy_gateC_spurious_fraction", 0.0))
     c = abs(far_slope + 1.0) + abs(near_slope + 1.0) + spurious * 10.0
     d = float(metrics.get("proxy_gateD_rel_change", 0.0))
-    return b + c + d
+    return a * 10.0 + b + c + d
+
+
+def build_proxy_stability_points(
+    bc_hold: torch.Tensor,
+    interior_hold: torch.Tensor,
+    n_points: int,
+) -> torch.Tensor:
+    n = max(1, int(n_points))
+    if bc_hold.numel() == 0:
+        return interior_hold[:n]
+    if interior_hold.numel() == 0:
+        return bc_hold[:n]
+    n_bc = min(bc_hold.shape[0], n // 2)
+    n_in = min(interior_hold.shape[0], n - n_bc)
+    if n_bc == 0:
+        return interior_hold[:n_in]
+    if n_in == 0:
+        return bc_hold[:n_bc]
+    return torch.cat([bc_hold[:n_bc], interior_hold[:n_in]], dim=0)
 
 
 def _fast_weights(
@@ -1009,6 +1040,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     ramp_min_rel_improve = float(run_cfg.get("ramp_min_rel_improvement", 0.10))
     use_reference_potential = bool(run_cfg.get("use_reference_potential", False))
     use_gate_proxies = bool(run_cfg.get("use_gate_proxies", False))
+    use_gateA_proxy = bool(run_cfg.get("use_gateA_proxy", use_gate_proxies))
     layered_sampling = bool(run_cfg.get("layered_sampling", True))
     layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
     layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
@@ -1670,7 +1702,17 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     proxy_n_xy = int(verify_plan.samples.get("B_boundary", 96))
                     proxy_n_dir = int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96)))
                     proxy_n_dir = max(16, proxy_n_dir)
-                    proxy_pts = interior_hold[: max(1, int(verify_plan.samples.get("D_points", 128)))]
+                    proxy_n_interior = int(verify_plan.samples.get("A_interior", 128))
+                    lap_linf_tol = float(verify_plan.thresholds.get("laplacian_linf", 5e-3))
+                    lap_fd_h = float(verify_plan.thresholds.get("laplacian_fd_h", 2e-2))
+                    lap_exclusion_radius = float(verify_plan.thresholds.get("laplacian_exclusion_radius", 5e-2))
+                    lap_prefer_autograd = bool(verify_plan.thresholds.get("laplacian_prefer_autograd", 1.0))
+                    lap_interface_band = float(verify_plan.thresholds.get("laplacian_interface_band", 0.0))
+                    proxy_pts = build_proxy_stability_points(
+                        bc_hold,
+                        interior_hold,
+                        int(verify_plan.samples.get("D_points", 128)),
+                    )
                     for idx in list(top_fast_idx):
                         program = programs[idx]
                         if payload is not None:
@@ -1710,6 +1752,22 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             return out
 
                         proxy_metrics: Dict[str, Any] = {}
+                        if use_gateA_proxy:
+                            proxy_metrics.update(
+                                proxy_gateA(
+                                    spec,
+                                    _proxy_eval,
+                                    n_interior=proxy_n_interior,
+                                    exclusion_radius=lap_exclusion_radius,
+                                    fd_h=lap_fd_h,
+                                    prefer_autograd=lap_prefer_autograd,
+                                    interface_band=lap_interface_band,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    seed=seed_gen + 1,
+                                    linf_tol=lap_linf_tol,
+                                )
+                            )
                         proxy_metrics.update(
                             proxy_gateB(
                                 spec,
@@ -1898,8 +1956,34 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "candidate_name": "dcim_block_baseline",
                             }
                             if use_gate_proxies and is_layered:
-                                proxy_pts = interior_hold[: max(1, int(verify_plan.samples.get("D_points", 128)))]
+                                proxy_pts = build_proxy_stability_points(
+                                    bc_hold,
+                                    interior_hold,
+                                    int(verify_plan.samples.get("D_points", 128)),
+                                )
                                 proxy_metrics = {}
+                                if use_gateA_proxy:
+                                    proxy_metrics.update(
+                                        proxy_gateA(
+                                            spec,
+                                            _eval_fn,
+                                            n_interior=int(verify_plan.samples.get("A_interior", 128)),
+                                            exclusion_radius=float(
+                                                verify_plan.thresholds.get("laplacian_exclusion_radius", 5e-2)
+                                            ),
+                                            fd_h=float(verify_plan.thresholds.get("laplacian_fd_h", 2e-2)),
+                                            prefer_autograd=bool(
+                                                verify_plan.thresholds.get("laplacian_prefer_autograd", 1.0)
+                                            ),
+                                            interface_band=float(
+                                                verify_plan.thresholds.get("laplacian_interface_band", 0.0)
+                                            ),
+                                            device=device,
+                                            dtype=torch.float32,
+                                            seed=seed_gen + 1,
+                                            linf_tol=float(verify_plan.thresholds.get("laplacian_linf", 5e-3)),
+                                        )
+                                    )
                                 proxy_metrics.update(
                                     proxy_gateB(
                                         spec,

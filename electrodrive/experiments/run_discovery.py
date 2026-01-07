@@ -50,6 +50,7 @@ from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, Oracle
 from electrodrive.verify.utils import normalize_dtype
 from electrodrive.verify.utils import sha256_json, utc_now_iso
 from electrodrive.verify.verifier import VerificationPlan, Verifier
+from electrodrive.verify.gate_proxies import proxy_gateB, proxy_gateC, proxy_gateD
 from electrodrive.experiments.layered_sampling import (
     parse_layered_interfaces,
     sample_layered_interior,
@@ -409,6 +410,45 @@ def _add_reference(pred: torch.Tensor, ref: Optional[torch.Tensor]) -> torch.Ten
     if ref is None:
         return pred
     return pred + ref
+
+
+def _proxy_fail_count(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> int:
+    if not metrics:
+        return 0
+    fail = 0
+    bc_tol = float(thresholds.get("bc_continuity", 5e-3))
+    if float(metrics.get("proxy_gateB_max_v_jump", 0.0)) > bc_tol or float(
+        metrics.get("proxy_gateB_max_d_jump", 0.0)
+    ) > bc_tol:
+        fail += 1
+    slope_tol = float(thresholds.get("slope_tol", 0.15))
+    far_slope = metrics.get("proxy_gateC_far_slope")
+    near_slope = metrics.get("proxy_gateC_near_slope")
+    if far_slope is not None and abs(float(far_slope) + 1.0) > slope_tol:
+        fail += 1
+    if near_slope is not None and abs(float(near_slope) + 1.0) > slope_tol:
+        fail += 1
+    if float(metrics.get("proxy_gateC_spurious_fraction", 0.0)) > 0.05:
+        fail += 1
+    stability_tol = float(thresholds.get("stability", 5e-2))
+    if float(metrics.get("proxy_gateD_rel_change", 0.0)) > stability_tol:
+        fail += 1
+    return fail
+
+
+def _proxy_score(metrics: Dict[str, Any]) -> float:
+    if not metrics:
+        return float("inf")
+    b = max(
+        float(metrics.get("proxy_gateB_max_v_jump", 0.0)),
+        float(metrics.get("proxy_gateB_max_d_jump", 0.0)),
+    )
+    far_slope = float(metrics.get("proxy_gateC_far_slope", 0.0))
+    near_slope = float(metrics.get("proxy_gateC_near_slope", 0.0))
+    spurious = float(metrics.get("proxy_gateC_spurious_fraction", 0.0))
+    c = abs(far_slope + 1.0) + abs(near_slope + 1.0) + spurious * 10.0
+    d = float(metrics.get("proxy_gateD_rel_change", 0.0))
+    return b + c + d
 
 
 def _fast_weights(A: torch.Tensor, b: torch.Tensor, reg: float) -> torch.Tensor:
@@ -924,6 +964,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     ramp_patience = int(run_cfg.get("ramp_patience_gens", 3))
     ramp_min_rel_improve = float(run_cfg.get("ramp_min_rel_improvement", 0.10))
     use_reference_potential = bool(run_cfg.get("use_reference_potential", False))
+    use_gate_proxies = bool(run_cfg.get("use_gate_proxies", False))
     layered_sampling = bool(run_cfg.get("layered_sampling", True))
     layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
     layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
@@ -1274,6 +1315,95 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             raise RuntimeError(msg)
 
                 top_fast_idx = _select_topk(fast_scores, topK_fast)
+                proxy_metrics_by_idx: Dict[int, Dict[str, Any]] = {}
+                if use_gate_proxies and is_layered and top_fast_idx:
+                    proxy_n_xy = int(verify_plan.samples.get("B_boundary", 96))
+                    proxy_n_dir = int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96)))
+                    proxy_n_dir = max(16, proxy_n_dir)
+                    proxy_pts = interior_hold[: max(1, int(verify_plan.samples.get("D_points", 128)))]
+                    for idx in list(top_fast_idx):
+                        program = programs[idx]
+                        if payload is not None:
+                            per_payload = payload.for_program(idx)
+                            elements, _, _ = compile_program_to_basis(
+                                program,
+                                spec,
+                                device,
+                                param_payload=per_payload,
+                                strict=True,
+                            )
+                        else:
+                            elements, _, _ = compile_program_to_basis(
+                                program,
+                                spec,
+                                device,
+                                strict=False,
+                            )
+                        if not elements:
+                            continue
+                        A_train = assemble_basis_matrix(elements, X_train)
+                        assert_cuda_tensor(A_train, "A_train_proxy")
+                        weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
+                        if weights.numel() == 0:
+                            continue
+                        system = ImageSystem(elements, weights)
+
+                        def _proxy_eval(pts: torch.Tensor) -> torch.Tensor:
+                            out = system.potential(pts)
+                            if use_ref:
+                                out = out + compute_layered_reference_potential(
+                                    spec,
+                                    pts,
+                                    device=pts.device,
+                                    dtype=pts.dtype,
+                                )
+                            return out
+
+                        proxy_metrics: Dict[str, Any] = {}
+                        proxy_metrics.update(
+                            proxy_gateB(
+                                spec,
+                                _proxy_eval,
+                                n_xy=proxy_n_xy,
+                                delta=layered_interface_delta,
+                                device=device,
+                                dtype=torch.float32,
+                                seed=seed_gen + 3,
+                            )
+                        )
+                        proxy_metrics.update(
+                            proxy_gateC(
+                                _proxy_eval,
+                                near_radii=(0.125, 0.5),
+                                far_radii=(10.0, 20.0),
+                                n_dir=proxy_n_dir,
+                                device=device,
+                                dtype=torch.float32,
+                                seed=seed_gen + 5,
+                            )
+                        )
+                        proxy_metrics.update(
+                            proxy_gateD(
+                                _proxy_eval,
+                                proxy_pts,
+                                delta=float(verify_plan.thresholds.get("stability", 5e-2)),
+                                seed=seed_gen + 7,
+                            )
+                        )
+                        proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
+                        proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                        proxy_metrics_by_idx[idx] = proxy_metrics
+                        if idx < len(fast_metrics):
+                            fast_metrics[idx].update(proxy_metrics)
+
+                    top_fast_idx = sorted(
+                        top_fast_idx,
+                        key=lambda i: (
+                            _proxy_fail_count(proxy_metrics_by_idx.get(i, {}), verify_plan.thresholds),
+                            _proxy_score(proxy_metrics_by_idx.get(i, {})),
+                            fast_scores[i],
+                        ),
+                    )[: max(1, min(topK_fast, len(top_fast_idx)))]
                 if cache_hold_matrices and hold_cache:
                     keep = set(top_fast_idx)
                     hold_cache = {idx: mat for idx, mat in hold_cache.items() if idx in keep}
@@ -1416,6 +1546,42 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "dcim_block_weight": float(dcim_block_weight),
                                 "candidate_name": "dcim_block_baseline",
                             }
+                            if use_gate_proxies and is_layered:
+                                proxy_pts = interior_hold[: max(1, int(verify_plan.samples.get("D_points", 128)))]
+                                proxy_metrics = {}
+                                proxy_metrics.update(
+                                    proxy_gateB(
+                                        spec,
+                                        _eval_fn,
+                                        n_xy=int(verify_plan.samples.get("B_boundary", 96)),
+                                        delta=layered_interface_delta,
+                                        device=device,
+                                        dtype=torch.float32,
+                                        seed=seed_gen + 3,
+                                    )
+                                )
+                                proxy_metrics.update(
+                                    proxy_gateC(
+                                        _eval_fn,
+                                        near_radii=(0.125, 0.5),
+                                        far_radii=(10.0, 20.0),
+                                        n_dir=int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96))),
+                                        device=device,
+                                        dtype=torch.float32,
+                                        seed=seed_gen + 5,
+                                    )
+                                )
+                                proxy_metrics.update(
+                                    proxy_gateD(
+                                        _eval_fn,
+                                        proxy_pts,
+                                        delta=float(verify_plan.thresholds.get("stability", 5e-2)),
+                                        seed=seed_gen + 7,
+                                    )
+                                )
+                                proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
+                                proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                                metrics.update(proxy_metrics)
                             score_mid = (
                                 w_bc * rel_bc
                                 + w_pde * rel_lap
@@ -1578,6 +1744,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         "n_terms": comp["n_terms"],
                         "complex_count": int(complex_count),
                     }
+                    if use_gate_proxies and is_layered:
+                        proxy_metrics = proxy_metrics_by_idx.get(idx)
+                        if proxy_metrics:
+                            metrics.update(proxy_metrics)
                     score_mid = (
                         w_bc * rel_bc
                         + w_pde * rel_lap
@@ -1595,7 +1765,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         }
                     )
 
-                fitted_candidates.sort(key=lambda x: x["score"])
+                if use_gate_proxies and is_layered:
+                    fitted_candidates.sort(
+                        key=lambda x: (
+                            _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
+                            _proxy_score(x.get("metrics", {})),
+                            x["score"],
+                        )
+                    )
+                else:
+                    fitted_candidates.sort(key=lambda x: x["score"])
                 top_mid = fitted_candidates[: max(1, min(topk_mid, len(fitted_candidates)))]
 
                 top_final = top_mid
@@ -1624,6 +1803,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     ]
                 else:
                     top_final = top_mid[: max(1, min(topk_final, len(top_mid)))]
+
+                if use_gate_proxies and is_layered and top_final:
+                    top_final = sorted(
+                        top_final,
+                        key=lambda x: (
+                            _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
+                            _proxy_score(x.get("metrics", {})),
+                            x.get("score_hi", x["score"]),
+                        ),
+                    )
 
                 if refine_enabled and is_layered and top_final:
                     if refine_targets == "holdout":

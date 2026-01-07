@@ -1,6 +1,6 @@
 import torch
 
-from electrodrive.verify.gate_proxies import proxy_gateB, proxy_gateC, proxy_gateD
+from electrodrive.verify.gate_proxies import proxy_gateA, proxy_gateB, proxy_gateC, proxy_gateD
 from electrodrive.orchestration.parser import CanonicalSpec
 
 
@@ -88,3 +88,33 @@ def test_proxy_gateD_does_not_mutate_rng() -> None:
 
     assert a == a2
     assert b == b2
+
+
+def test_proxy_gateA_cpu_harmonic() -> None:
+    spec = _layered_spec()
+    device = torch.device("cpu")
+    dtype = torch.float64
+
+    def constant(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 0] * 0.0
+
+    def linear(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 2]
+
+    for fn in (constant, linear):
+        metrics = proxy_gateA(
+            spec,
+            fn,
+            n_interior=64,
+            exclusion_radius=0.05,
+            fd_h=0.02,
+            prefer_autograd=False,
+            interface_band=0.01,
+            device=device,
+            dtype=dtype,
+            linf_tol=5e-3,
+        )
+        assert metrics["proxy_gateA_status"] == "pass"
+        assert torch.isfinite(torch.tensor(metrics["proxy_gateA_linf"]))
+        assert metrics["proxy_gateA_linf"] < 1e-6
+        assert metrics["proxy_gateA_worst_ratio"] < 1e-3

@@ -36,3 +36,9 @@
 - change: added multi-fidelity ladder module and distillation CLI for template clustering.
 - reproduce (distill): `python scripts/black_hammer/distill_templates.py <input_dir> <output_dir>`
 - reproduce (verification checks): `pytest -q electrodrive/verify/tests/test_green_checks.py -vv -rs --maxfail=1`
+
+## Phase 3: Discovery preflight + gate-ready template
+- change: added discovery preflight counters/report (`preflight.json`) to explain candidate throughput and drop reasons.
+- change: added `configs/discovery_black_hammer_gate_ready.yaml` as verifier-aligned template for large runs.
+- reproduce: run discovery with `run.preflight_enabled: true` and inspect `<RUN_DIR>/preflight.json`.
+- validate: report includes counters (compiled_ok, solved_ok, fast_scored, verified_written) and run metadata.

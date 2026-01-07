@@ -712,7 +712,10 @@ def _seed_layered_templates(
     *,
     max_steps: int,
     count: int = 8,
+    allow_real_primitives: bool = True,
 ) -> List[Program]:
+    if not allow_real_primitives:
+        return []
     if getattr(spec, "BCs", "") != "dielectric_interfaces":
         return []
     layers = getattr(spec, "dielectrics", None) or []
@@ -969,6 +972,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
     layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
     layered_interface_band = float(run_cfg.get("layered_interface_band", layered_interface_delta))
+    layered_prefer_dcim = bool(run_cfg.get("layered_prefer_dcim", True))
+    layered_allow_real_primitives = bool(run_cfg.get("layered_allow_real_primitives", False))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
     refine_steps = int(run_cfg.get("refine_steps", 12))
     refine_lr = float(run_cfg.get("refine_lr", 5e-2))
@@ -1020,28 +1025,32 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     ramp_abort = False
 
     fixed_spec_obj: Optional[CanonicalSpec] = None
-    fixed_spec_meta: Optional[Dict[str, Any]] = None
     if fixed_spec:
         for _ in range(fixed_spec_index + 1):
             fixed_spec_obj = sampler.sample()
         if fixed_spec_obj is None:
             raise RuntimeError("fixed_spec enabled but no spec could be sampled")
-        fixed_spec_meta = _spec_metadata_from_spec(fixed_spec_obj)
 
     for gen in range(generations):
         start_gen = time.perf_counter()
         if fixed_spec and fixed_spec_obj is not None:
             spec = fixed_spec_obj
-            spec_meta = fixed_spec_meta or _spec_metadata_from_spec(spec)
         else:
             spec = sampler.sample()
-            spec_meta = _spec_metadata_from_spec(spec)
         spec_hash = sha256_json(spec.to_json())
         spec_hashes.append(spec_hash)
         domain_scale = float(spec_cfg.get("domain_scale", 1.0))
         seed_gen = seed + gen * 13
         is_layered = getattr(spec, "BCs", "") == "dielectric_interfaces"
         use_ref = bool(use_reference_potential and is_layered)
+        prefer_dcim = bool(layered_prefer_dcim and is_layered)
+        allow_real_primitives = bool(layered_allow_real_primitives or not prefer_dcim)
+        if prefer_dcim and not use_param_sampler and not layered_allow_real_primitives:
+            allow_real_primitives = True
+        spec_meta = _spec_metadata_from_spec(
+            spec,
+            extra_overrides={"allow_real_primitives": allow_real_primitives},
+        )
 
         torch.cuda.synchronize()
         retry = True
@@ -1180,7 +1189,12 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 programs = [state.program for state in rollout.final_states or ()]
                 if sanity_force_baseline and not use_param_sampler:
                     programs.extend(_baseline_programs_for_spec(spec))
-                seeded = _seed_layered_templates(spec, max_steps=max_steps, count=8)
+                seeded = _seed_layered_templates(
+                    spec,
+                    max_steps=max_steps,
+                    count=8,
+                    allow_real_primitives=allow_real_primitives,
+                )
                 if seeded:
                     programs.extend(seeded)
 

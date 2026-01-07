@@ -57,6 +57,7 @@ from electrodrive.experiments.layered_sampling import (
     sample_layered_interior,
     sample_layered_interface_pairs,
 )
+from electrodrive.experiments.preflight import RunCounters, summarize_to_stdout, write_preflight_report
 
 
 class _NullLogger:
@@ -803,6 +804,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
     run_cfg = cfg.get("run", {}) if isinstance(cfg.get("run", {}), dict) else {}
     tag = str(run_cfg.get("tag", "discovery_v0")).strip() or "discovery_v0"
+    preflight_enabled = bool(run_cfg.get("preflight_enabled", False))
+    preflight_out = str(run_cfg.get("preflight_out", "preflight.json")).strip() or "preflight.json"
     run_dir = _make_run_dir(tag)
     dcim_cache_path = run_dir / "artifacts" / "dcim_cache.jsonl"
 
@@ -1023,6 +1026,17 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     verify_plan.oracle_budget = dict(verify_plan.oracle_budget)
     verify_plan.oracle_budget["allow_cpu_fallback"] = False
     ramp_abort = False
+    config_hash = sha256_json(cfg)
+    preflight_counters = RunCounters() if preflight_enabled else None
+    per_gen_preflight: List[Dict[str, Any]] = []
+    gen_counters: Optional[RunCounters] = None
+
+    def _count_preflight(key: str, n: int = 1) -> None:
+        if preflight_counters is None:
+            return
+        preflight_counters.add(key, n)
+        if gen_counters is not None:
+            gen_counters.add(key, n)
 
     fixed_spec_obj: Optional[CanonicalSpec] = None
     if fixed_spec:
@@ -1033,6 +1047,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
     for gen in range(generations):
         start_gen = time.perf_counter()
+        if preflight_enabled:
+            gen_counters = RunCounters()
+        else:
+            gen_counters = None
         if fixed_spec and fixed_spec_obj is not None:
             spec = fixed_spec_obj
         else:
@@ -1246,6 +1264,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 if seeded:
                     programs.extend(seeded)
 
+                _count_preflight("sampled_programs_total", len(programs))
                 if not programs:
                     raise RuntimeError("No programs sampled; aborting generation.")
                 program_lengths = [len(getattr(p, "nodes", []) or []) for p in programs]
@@ -1280,33 +1299,40 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     end = min(len(programs), start + score_microbatch)
                     for idx in range(start, end):
                         program = programs[idx]
-                        if payload is not None:
-                            per_payload = payload.for_program(idx)
-                            elements, _, meta = compile_program_to_basis(
-                                program,
-                                spec,
-                                device,
-                                param_payload=per_payload,
-                                strict=True,
-                            )
-                        else:
-                            elements, _, meta = compile_program_to_basis(
-                                program,
-                                spec,
-                                device,
-                                strict=False,
-                            )
+                        try:
+                            if payload is not None:
+                                per_payload = payload.for_program(idx)
+                                elements, _, meta = compile_program_to_basis(
+                                    program,
+                                    spec,
+                                    device,
+                                    param_payload=per_payload,
+                                    strict=True,
+                                )
+                            else:
+                                elements, _, meta = compile_program_to_basis(
+                                    program,
+                                    spec,
+                                    device,
+                                    strict=False,
+                                )
+                        except Exception:
+                            _count_preflight("compiled_failed")
+                            raise
                         if not elements:
+                            _count_preflight("compiled_empty_basis")
                             fast_scores.append(float("inf"))
                             fast_metrics.append({"empty": True, "complex_count": 0, "frac_complex": 0.0})
                             n_terms_list.append(0)
                             complex_counts.append(0)
                             continue
+                        _count_preflight("compiled_ok")
                         complex_count = _count_complex_terms(elements, device=device)
                         n_terms = int(len(elements))
                         frac_complex = float(complex_count) / max(1, n_terms)
                         complex_counts.append(complex_count)
                         if is_layered and not (complex_count >= 2 or frac_complex >= 0.25):
+                            _count_preflight("complex_guard_failed")
                             fast_scores.append(float("inf"))
                             fast_metrics.append(
                                 {
@@ -1317,20 +1343,37 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
-                        A_train = assemble_basis_matrix(elements, X_train)
-                        A_hold = assemble_basis_matrix(elements, X_hold)
+                        try:
+                            A_train = assemble_basis_matrix(elements, X_train)
+                            A_hold = assemble_basis_matrix(elements, X_hold)
+                        except Exception:
+                            _count_preflight("assembled_failed")
+                            raise
+                        _count_preflight("assembled_ok")
                         assert_cuda_tensor(A_train, "A_train_fast")
                         assert_cuda_tensor(A_hold, "A_hold_fast")
                         if cache_hold_matrices:
                             hold_cache[idx] = A_hold
                         weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
+                        if preflight_counters is not None:
+                            if weights.numel() == 0 or not torch.isfinite(weights).all():
+                                _count_preflight("solved_failed")
+                                if weights.numel() == 0:
+                                    _count_preflight("weights_empty")
+                            else:
+                                _count_preflight("solved_ok")
                         pred_hold_corr = A_hold.matmul(weights)
                         pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
+                        if preflight_counters is not None:
+                            nonfinite = torch.count_nonzero(~torch.isfinite(pred_hold))
+                            _count_preflight("nonfinite_pred_count", int(nonfinite.item()))
+                            _count_preflight("nonfinite_pred_total", int(pred_hold.numel()))
                         bc_err = torch.mean(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])).item()
                         in_err = torch.mean(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])).item()
                         comp = _complexity(program, elements)
                         score = w_bc * bc_err + w_pde * in_err + w_complexity * comp["n_terms"]
                         fast_scores.append(float(score))
+                        _count_preflight("fast_scored")
                         n_terms_list.append(int(comp["n_terms"]))
                         fast_metrics.append(
                             {
@@ -1454,6 +1497,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         )
                         proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
                         proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                        _count_preflight("proxy_computed_count")
                         proxy_metrics_by_idx[idx] = proxy_metrics
                         if idx < len(fast_metrics):
                             fast_metrics[idx].update(proxy_metrics)
@@ -1643,6 +1687,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 )
                                 proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
                                 proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                                _count_preflight("proxy_computed_count")
                                 metrics.update(proxy_metrics)
                             score_mid = (
                                 w_bc * rel_bc
@@ -1663,6 +1708,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 best_dcim_score is None or float(score_mid) < best_dcim_score
                             ):
                                 best_dcim_score = float(score_mid)
+                            _count_preflight("mid_scored")
                             fitted_candidates.append(
                                 {
                                     "program": dcim_program,
@@ -1817,6 +1863,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         + w_latency * (metrics["eval_time_us"] / 1e6)
                         + w_stability * stability_ratio
                     )
+                    _count_preflight("mid_scored")
                     fitted_candidates.append(
                         {
                             "program": program,
@@ -2303,6 +2350,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     cert_dir = run_dir / "artifacts" / "certificates" / f"gen{gen:03d}_rank{rank}_verifier"
                     cert_status = "error"
                     cert_error = None
+                    _count_preflight("verified_attempted")
                     try:
                         certificate = verifier.run(
                             {"eval_fn": _verify_eval},
@@ -2335,6 +2383,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     }
                     cert_path = run_dir / "artifacts" / "certificates" / f"gen{gen:03d}_rank{rank}_summary.json"
                     write_json(cert_path, cert_payload)
+                    _count_preflight("verified_written")
 
                 gen_rel_bc = float("inf")
                 gen_rel_in = float("inf")
@@ -2358,6 +2407,18 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 per_gen_rel_bc.append(gen_rel_bc)
                 per_gen_rel_in.append(gen_rel_in)
                 per_gen_rel_lap.append(gen_rel_lap)
+                if preflight_enabled and gen_counters is not None:
+                    per_gen_preflight.append(
+                        {"gen": int(gen), "counters": gen_counters.as_dict()}
+                    )
+                    print(
+                        "PREFLIGHT "
+                        f"gen={gen} "
+                        f"compiled_ok={gen_counters.compiled_ok} "
+                        f"solved_ok={gen_counters.solved_ok} "
+                        f"fast_scored={gen_counters.fast_scored} "
+                        f"verified_written={gen_counters.verified_written}"
+                    )
 
                 if ramp_check:
                     improved = False
@@ -2609,6 +2670,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 else float("nan")
             )
             print(f"REFINE BEST REL: rel_bc={ref_bc:.3e} rel_lap={ref_lap:.3e}")
+
+    if preflight_counters is not None:
+        device_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
+        device_cap = (
+            ".".join(str(v) for v in torch.cuda.get_device_capability(device))
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        nonfinite_total = max(1, preflight_counters.nonfinite_pred_total)
+        extra = {
+            "timestamp": utc_now_iso(),
+            "tag": tag,
+            "config_hash": config_hash,
+            "git_sha": git_sha(),
+            "device_name": device_name,
+            "device_capability": device_cap,
+            "preflight_out": preflight_out,
+            "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
+            "per_gen": per_gen_preflight,
+        }
+        write_preflight_report(run_dir, preflight_counters, extra)
+        summarize_to_stdout(preflight_counters)
 
     if should_early_exit(allow_not_ready, ramp_abort):
         return 3

@@ -42,3 +42,8 @@
 - change: added `configs/discovery_black_hammer_gate_ready.yaml` as verifier-aligned template for large runs.
 - reproduce: run discovery with `run.preflight_enabled: true` and inspect `<RUN_DIR>/preflight.json`.
 - validate: report includes counters (compiled_ok, solved_ok, fast_scored, verified_written) and run metadata.
+
+## Phase 3.1: Preflight modes + push template
+- change: added `run.preflight_mode` ("off" | "lite" | "full") to control preflight overhead.
+- change: added `configs/discovery_black_hammer_push.yaml` with `preflight_mode: lite` for large runs.
+- guidance: use gate-ready (full) for pilots/debug; use push (lite) for scale.

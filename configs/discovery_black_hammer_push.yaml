@@ -1,14 +1,11 @@
-# Gate-ready discovery template:
-# - Aligns layered sampling with verifier A/B/C/D (interfaces + exclusion band).
-# - Uses reference decomposition + gate proxies to target verifier metrics.
-# - Scale knobs for large runs: run.population_B, run.generations, points.*.
-# - Good preflight: compiled_ok/sample > 0.5, solved_ok > 0,
-#   fast_scored > 0 each generation, verified_written > 0 at least once.
+# Push-ready discovery template (low-overhead preflight):
+# - Use gate_ready template for debugging (preflight_mode: full).
+# - This template uses preflight_mode: lite to keep overhead low at scale.
 
 seed: 0
 
 run:
-  tag: "black_hammer_gate_ready"
+  tag: "black_hammer_push"
   generations: 20
   population_B: 2048
   topK_fast: 64
@@ -30,7 +27,7 @@ run:
   refine_opt: "adam"
   refine_max_terms: 32
   refine_targets: "holdout"
-  preflight_mode: "full"
+  preflight_mode: "lite"
   layered_sampling: true
   use_reference_potential: true
   use_gate_proxies: true

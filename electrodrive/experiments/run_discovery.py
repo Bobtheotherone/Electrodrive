@@ -833,7 +833,17 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
     run_cfg = cfg.get("run", {}) if isinstance(cfg.get("run", {}), dict) else {}
     tag = str(run_cfg.get("tag", "discovery_v0")).strip() or "discovery_v0"
-    preflight_enabled = bool(run_cfg.get("preflight_enabled", False))
+    preflight_mode_raw = str(run_cfg.get("preflight_mode", "")).strip().lower()
+    if not preflight_mode_raw:
+        preflight_enabled = bool(run_cfg.get("preflight_enabled", False))
+        preflight_mode = "full" if preflight_enabled else "off"
+    else:
+        if preflight_mode_raw not in {"off", "lite", "full"}:
+            raise ValueError(f"Unknown preflight_mode: {preflight_mode_raw}")
+        preflight_mode = preflight_mode_raw
+    preflight_enabled = preflight_mode != "off"
+    preflight_full = preflight_mode == "full"
+    preflight_lite = preflight_mode == "lite"
     preflight_out = str(run_cfg.get("preflight_out", "preflight.json")).strip() or "preflight.json"
     run_dir = _make_run_dir(tag)
     dcim_cache_path = run_dir / "artifacts" / "dcim_cache.jsonl"
@@ -1454,7 +1464,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             hold_cache[idx] = A_hold
                         a_train_nonfinite = 0
                         a_hold_nonfinite = 0
-                        if preflight_counters is not None:
+                        if preflight_full:
                             a_train_nonfinite = _nonfinite_count(A_train)
                             a_hold_nonfinite = _nonfinite_count(A_hold)
                             _count_preflight("a_train_nonfinite_count", a_train_nonfinite)
@@ -1463,26 +1473,33 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             _count_preflight("a_hold_total", int(A_hold.numel()))
                             _count_preflight("v_train_nonfinite_count", v_train_nonfinite_val)
                             _count_preflight("v_train_total", v_train_total_val)
+                        elif preflight_enabled:
+                            _count_preflight("v_train_nonfinite_count", v_train_nonfinite_val)
+                            _count_preflight("v_train_total", v_train_total_val)
                         else:
                             if not torch.isfinite(A_train).all().item():
                                 a_train_nonfinite = 1
                             if not torch.isfinite(A_hold).all().item():
                                 a_hold_nonfinite = 1
-                        if a_train_nonfinite > 0 or a_hold_nonfinite > 0 or v_train_has_nonfinite:
+                        if (preflight_full and (a_train_nonfinite > 0 or a_hold_nonfinite > 0)) or v_train_has_nonfinite:
                             _count_preflight("solved_failed")
-                            reason = "a_train_nonfinite" if a_train_nonfinite > 0 else "a_hold_nonfinite"
-                            if a_train_nonfinite > 0 or a_hold_nonfinite > 0:
-                                _maybe_write_first_offender(
-                                    gen_idx=gen,
-                                    program_idx=idx,
-                                    program=program,
-                                    elements=elements,
-                                    A_train=A_train,
-                                    V_train=V_train,
-                                    weights=None,
-                                    pred_hold=None,
-                                    reason=reason,
-                                )
+                            if v_train_has_nonfinite:
+                                reason = "v_train_nonfinite"
+                            elif a_train_nonfinite > 0:
+                                reason = "a_train_nonfinite"
+                            else:
+                                reason = "a_hold_nonfinite"
+                            _maybe_write_first_offender(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=None,
+                                pred_hold=None,
+                                reason=reason,
+                            )
                             fast_scores.append(float("inf"))
                             fast_metrics.append(
                                 {
@@ -2914,6 +2931,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             "git_sha": git_sha(),
             "device_name": device_name,
             "device_capability": device_cap,
+            "preflight_mode": preflight_mode,
             "preflight_out": preflight_out,
             "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
             "per_gen": per_gen_preflight,

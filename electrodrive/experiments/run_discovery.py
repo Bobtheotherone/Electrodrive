@@ -44,6 +44,7 @@ from electrodrive.images.learned_generator import SimpleGeoEncoder
 from electrodrive.images.search import ImageSystem, assemble_basis_matrix, solve_sparse
 from electrodrive.orchestration.parser import CanonicalSpec
 from electrodrive.learn.collocation import compute_layered_reference_potential
+from electrodrive.experiments.reference_math import add_reference, stable_subtract_reference
 from electrodrive.verify.oracle_backends.f0 import F0AnalyticOracleBackend
 from electrodrive.verify.oracle_backends.f1_sommerfeld import F1SommerfeldOracleBackend
 from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, OracleQuery, OracleQuantity
@@ -407,9 +408,7 @@ def _laplacian_fd(eval_fn: Any, pts: torch.Tensor, h: float) -> torch.Tensor:
 
 
 def _add_reference(pred: torch.Tensor, ref: Optional[torch.Tensor]) -> torch.Tensor:
-    if ref is None:
-        return pred
-    return pred + ref
+    return add_reference(pred, ref)
 
 
 def _proxy_fail_count(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> int:
@@ -1142,18 +1141,66 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 V_bc_hold_mid_corr = V_bc_hold_mid
                 V_in_hold_mid_corr = V_in_hold_mid
                 if use_ref:
-                    V_ref_bc_train = compute_layered_reference_potential(spec, bc_train, device=device, dtype=bc_train.dtype)
-                    V_ref_in_train = compute_layered_reference_potential(spec, interior_train, device=device, dtype=interior_train.dtype)
-                    V_ref_bc_hold = compute_layered_reference_potential(spec, bc_hold, device=device, dtype=bc_hold.dtype)
-                    V_ref_in_hold = compute_layered_reference_potential(spec, interior_hold, device=device, dtype=interior_hold.dtype)
+                    V_ref_bc_train64 = compute_layered_reference_potential(
+                        spec,
+                        bc_train.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_in_train64 = compute_layered_reference_potential(
+                        spec,
+                        interior_train.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_bc_hold64 = compute_layered_reference_potential(
+                        spec,
+                        bc_hold.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_in_hold64 = compute_layered_reference_potential(
+                        spec,
+                        interior_hold.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_bc_train = V_ref_bc_train64.to(dtype=bc_train.dtype)
+                    V_ref_in_train = V_ref_in_train64.to(dtype=interior_train.dtype)
+                    V_ref_bc_hold = V_ref_bc_hold64.to(dtype=bc_hold.dtype)
+                    V_ref_in_hold = V_ref_in_hold64.to(dtype=interior_hold.dtype)
                     V_ref_train = torch.cat([V_ref_bc_train, V_ref_in_train], dim=0)
                     V_ref_hold = torch.cat([V_ref_bc_hold, V_ref_in_hold], dim=0)
-                    V_bc_train_corr = V_bc_train - V_ref_bc_train
-                    V_in_train_corr = V_in_train - V_ref_in_train
-                    V_bc_hold_corr = V_bc_hold - V_ref_bc_hold
-                    V_in_hold_corr = V_in_hold - V_ref_in_hold
-                    V_bc_hold_mid_corr = V_bc_hold_mid - V_ref_bc_hold
-                    V_in_hold_mid_corr = V_in_hold_mid - V_ref_in_hold
+                    V_bc_train_corr = stable_subtract_reference(
+                        V_bc_train,
+                        V_ref_bc_train64,
+                        out_dtype=bc_train.dtype,
+                    )
+                    V_in_train_corr = stable_subtract_reference(
+                        V_in_train,
+                        V_ref_in_train64,
+                        out_dtype=interior_train.dtype,
+                    )
+                    V_bc_hold_corr = stable_subtract_reference(
+                        V_bc_hold,
+                        V_ref_bc_hold64,
+                        out_dtype=bc_hold.dtype,
+                    )
+                    V_in_hold_corr = stable_subtract_reference(
+                        V_in_hold,
+                        V_ref_in_hold64,
+                        out_dtype=interior_hold.dtype,
+                    )
+                    V_bc_hold_mid_corr = stable_subtract_reference(
+                        V_bc_hold_mid,
+                        V_ref_bc_hold64,
+                        out_dtype=bc_hold.dtype,
+                    )
+                    V_in_hold_mid_corr = stable_subtract_reference(
+                        V_in_hold_mid,
+                        V_ref_in_hold64,
+                        out_dtype=interior_hold.dtype,
+                    )
 
                 X_train = torch.cat([bc_train, interior_train], dim=0)
                 V_train = torch.cat([V_bc_train_corr, V_in_train_corr], dim=0)

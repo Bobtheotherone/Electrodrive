@@ -45,6 +45,9 @@ class VerificationPlan:
     thresholds: Dict[str, float] = field(
         default_factory=lambda: {
             "laplacian_linf": 5e-3,
+            "laplacian_exclusion_radius": 5e-2,
+            "laplacian_fd_h": 2e-2,
+            "laplacian_prefer_autograd": 1.0,
             "bc_dirichlet": 1e-3,
             "bc_continuity": 5e-3,
             "slope_tol": 0.15,
@@ -450,17 +453,19 @@ class Verifier:
             if suffix:
                 art_dir = art_dir / suffix
             if gate == "A":
+                exclusion_radius = float(plan.thresholds.get("laplacian_exclusion_radius", 5e-2))
                 gate_results["A"] = gateA_pde.run_gate(
                     query,
                     result,
                     config={
                         "seed": plan.seeds.get("A", 0),
                         "n_interior": plan.samples.get("A_interior", 128),
-                        "exclusion_radius": 5e-2,
+                        "exclusion_radius": exclusion_radius,
                         "linf_tol": plan.thresholds.get("laplacian_linf", 5e-3),
                         "l2_tol": plan.thresholds.get("laplacian_linf", 5e-3),
                         "p95_tol": plan.thresholds.get("laplacian_linf", 5e-3),
-                        "prefer_autograd": True,
+                        "fd_h": plan.thresholds.get("laplacian_fd_h", 2e-2),
+                        "prefer_autograd": bool(plan.thresholds.get("laplacian_prefer_autograd", 1.0)),
                         "autograd_max_samples": plan.samples.get("A_interior", 128),
                         "spec": spec,
                         "candidate_eval": candidate_eval,

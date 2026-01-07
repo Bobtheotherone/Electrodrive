@@ -47,3 +47,14 @@
 - change: added `run.preflight_mode` ("off" | "lite" | "full") to control preflight overhead.
 - change: added `configs/discovery_black_hammer_push.yaml` with `preflight_mode: lite` for large runs.
 - guidance: use gate-ready (full) for pilots/debug; use push (lite) for scale.
+
+## Phase 3.2: Gate A proxy prioritization + stability mix
+- change: added `proxy_gateA` (Laplacian residual proxy) aligned to Gate A sampling/thresholds; integrated into discovery proxy ranking.
+- change: added `run.use_gateA_proxy` (default on when proxies enabled) and mixed stability proxy points across boundary + interior.
+- change: added `build_proxy_stability_points` helper and tests for proxy mixing and Gate A proxy behavior.
+- why: surface harmonicity failures earlier and avoid spending verifier budget on A-hopeless candidates; reduce stability proxy bias.
+- reproduce:
+  - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_discovery_proxy_points.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_fast_weights_stability.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_reference_decomposition.py -vv -rs --maxfail=1`

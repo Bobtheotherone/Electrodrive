@@ -123,6 +123,10 @@ def _set_perf_flags(cfg: Dict[str, Any]) -> None:
         torch.set_float32_matmul_precision("high")
 
 
+def should_early_exit(allow_not_ready: bool, ramp_abort: bool) -> bool:
+    return bool(ramp_abort) and not bool(allow_not_ready)
+
+
 def _make_run_dir(tag: str) -> Path:
     stamp = utc_timestamp()
     run_dir = Path("runs") / f"{stamp}_{tag}"
@@ -839,6 +843,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         dcim_block_max = 0
     dcim_block_weight = float(run_cfg.get("dcim_block_weight", 1.0))
     ramp_check = bool(run_cfg.get("ramp_check", False))
+    allow_not_ready = bool(run_cfg.get("allow_not_ready", False))
     ramp_patience = int(run_cfg.get("ramp_patience_gens", 3))
     ramp_min_rel_improve = float(run_cfg.get("ramp_min_rel_improvement", 0.10))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
@@ -1953,12 +1958,14 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     if improved:
                         last_improve_gen = gen
                     if (
-                        (ramp_best_rel_bc is not None or ramp_best_rel_lap is not None)
+                        not ramp_abort
+                        and (ramp_best_rel_bc is not None or ramp_best_rel_lap is not None)
                         and gen - last_improve_gen >= ramp_patience
                     ):
                         print("RAMP ABORT: not improving")
                         ramp_abort = True
-                        break
+                        if should_early_exit(allow_not_ready, ramp_abort):
+                            break
 
                 empty_count = sum(1 for m in fast_metrics if m.get("empty"))
                 empty_frac = empty_count / max(1, len(fast_metrics))
@@ -2004,9 +2011,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         raise
                 else:
                     raise
-            if ramp_abort:
+            if should_early_exit(allow_not_ready, ramp_abort):
                 break
-        if ramp_abort:
+        if should_early_exit(allow_not_ready, ramp_abort):
             break
 
     best_bc_rel = float("nan")
@@ -2179,7 +2186,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             )
             print(f"REFINE BEST REL: rel_bc={ref_bc:.3e} rel_lap={ref_lap:.3e}")
 
-    if ramp_abort:
+    if should_early_exit(allow_not_ready, ramp_abort):
         return 3
 
     if sanity_threshold is not None:

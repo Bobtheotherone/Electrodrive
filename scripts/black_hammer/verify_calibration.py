@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 
 from electrodrive.orchestration.parser import CanonicalSpec
+from electrodrive.verify.gates.gateA_pde import _sample_interior
 from electrodrive.verify.oracle_backends import F1SommerfeldOracleBackend
 from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, OracleQuantity, OracleQuery
 from electrodrive.verify.utils import normalize_dtype
@@ -107,6 +108,20 @@ def _summarize_certificate(cert: Any) -> None:
         if thresholds:
             line += f" thresholds={thresholds}"
         print(line)
+        method_label = None
+        if "method" in metrics:
+            try:
+                method_label = "autograd" if float(metrics["method"]) == 0.0 else "finite_diff"
+            except (TypeError, ValueError):
+                method_label = None
+        if method_label is None:
+            for note in gate.get("notes", []) or []:
+                note_str = str(note)
+                if "laplacian_method=" in note_str:
+                    method_label = note_str.split("laplacian_method=", 1)[-1]
+                    break
+        if method_label is not None:
+            print(f"  laplacian_method={method_label}")
 
 
 def _plan_thresholds_payload(plan: VerificationPlan) -> str:
@@ -124,10 +139,15 @@ def _write_outputs(run_dir: Path, plan: VerificationPlan, spec_dict: Dict[str, A
     (run_dir / "result.json").write_text(json.dumps(cert_json, indent=2), encoding="utf-8")
 
 
-def _laplacian_configs() -> Iterable[Tuple[float, float, int]]:
-    for exclusion_radius in (0.05, 0.1, 0.2, 0.4):
+def _laplacian_configs(extra_exclusion: Optional[Iterable[float]] = None) -> Iterable[Tuple[float, float, int]]:
+    exclusions = [0.05, 0.1, 0.2, 0.4]
+    if extra_exclusion:
+        exclusions.extend(extra_exclusion)
+    exclusions = sorted({float(x) for x in exclusions})
+    for exclusion_radius in exclusions:
         for fd_h in (0.02, 0.01, 0.005):
-            yield exclusion_radius, fd_h, 1
+            for prefer_autograd in (0, 1):
+                yield exclusion_radius, fd_h, prefer_autograd
 
 
 def _build_plan(
@@ -193,6 +213,39 @@ def _gate_worst_ratio(cert: Any, gate_name: str) -> Optional[float]:
     return ratio
 
 
+def _probe_nonfinite(
+    candidate_eval: Any,
+    spec_dict: Dict[str, Any],
+    *,
+    n_interior: int,
+    exclusion_radius: float,
+    out_root: Path,
+) -> Dict[str, Any]:
+    device = torch.device("cuda")
+    dtype = torch.float32
+    eval_fn = candidate_eval.get("eval_fn") if isinstance(candidate_eval, dict) else None
+    if not callable(eval_fn):
+        return {}
+    pts = _sample_interior(spec_dict, device, dtype, n_interior, seed=0, exclusion_radius=exclusion_radius)
+    with torch.no_grad():
+        vals = eval_fn(pts).flatten()
+    finite_mask = torch.isfinite(vals)
+    n_nonfinite = int((~finite_mask).sum().item())
+    finite_vals = vals[finite_mask] if torch.any(finite_mask) else None
+    payload = {
+        "n_points": int(vals.shape[0]),
+        "n_nonfinite": n_nonfinite,
+        "exclusion_radius": float(exclusion_radius),
+    }
+    if finite_vals is not None and finite_vals.numel() > 0:
+        payload["min_finite"] = float(finite_vals.min().item())
+        payload["max_finite"] = float(finite_vals.max().item())
+    print(f"nonfinite_probe: {payload}")
+    if n_nonfinite > 0:
+        (out_root / "nonfinite_probe.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Calibrate verifier Gate A on a layered F1 oracle.")
     parser.add_argument(
@@ -231,13 +284,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.candidate == "f1" and "A" in gate_order:
         (out_root / "env.json").write_text(json.dumps(_env_report(), indent=2), encoding="utf-8")
         (out_root / "git.json").write_text(json.dumps(_git_report(), indent=2), encoding="utf-8")
+        probe = _probe_nonfinite(
+            candidate,
+            spec_dict,
+            n_interior=args.n_interior,
+            exclusion_radius=0.05,
+            out_root=out_root,
+        )
+        extra_exclusion = []
+        if probe.get("n_nonfinite", 0) > 0:
+            extra_exclusion = [0.6, 0.8]
+            print(f"nonfinite detected; extending exclusion_radius sweep: {extra_exclusion}")
         best_ratio = None
         best_config: Optional[Dict[str, Any]] = None
         best_cert: Optional[Any] = None
         passing_cert: Optional[Any] = None
         last_cert: Optional[Any] = None
         found = False
-        for exclusion_radius, fd_h, prefer_autograd in _laplacian_configs():
+        for exclusion_radius, fd_h, prefer_autograd in _laplacian_configs(extra_exclusion):
             plan = _build_plan(
                 gate_order,
                 args.n_interior,
@@ -246,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
                 fd_h,
                 prefer_autograd,
             )
-            run_dir = out_root / f"sweep_ex{exclusion_radius}_h{fd_h}".replace(".", "p")
+            run_dir = out_root / f"sweep_ex{exclusion_radius}_h{fd_h}_pa{prefer_autograd}".replace(".", "p")
             print(f"plan.thresholds: {_plan_thresholds_payload(plan)}")
             print(f"sweep_config: exclusion_radius={exclusion_radius} fd_h={fd_h} prefer_autograd={prefer_autograd}")
             cert = verifier.run(candidate, spec_dict, plan, outdir=run_dir)

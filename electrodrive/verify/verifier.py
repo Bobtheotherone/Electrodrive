@@ -48,6 +48,7 @@ class VerificationPlan:
             "laplacian_exclusion_radius": 5e-2,
             "laplacian_fd_h": 2e-2,
             "laplacian_prefer_autograd": 1.0,
+            "laplacian_interface_band": 0.0,
             "bc_dirichlet": 1e-3,
             "bc_continuity": 5e-3,
             "slope_tol": 0.15,
@@ -454,6 +455,7 @@ class Verifier:
                 art_dir = art_dir / suffix
             if gate == "A":
                 exclusion_radius = float(plan.thresholds.get("laplacian_exclusion_radius", 5e-2))
+                interface_band = float(plan.thresholds.get("laplacian_interface_band", 0.0))
                 gate_results["A"] = gateA_pde.run_gate(
                     query,
                     result,
@@ -466,6 +468,7 @@ class Verifier:
                         "p95_tol": plan.thresholds.get("laplacian_linf", 5e-3),
                         "fd_h": plan.thresholds.get("laplacian_fd_h", 2e-2),
                         "prefer_autograd": bool(plan.thresholds.get("laplacian_prefer_autograd", 1.0)),
+                        "interface_band": interface_band,
                         "autograd_max_samples": plan.samples.get("A_interior", 128),
                         "spec": spec,
                         "candidate_eval": candidate_eval,

@@ -157,6 +157,7 @@ def _build_plan(
     exclusion_radius: float,
     fd_h: float,
     prefer_autograd: int,
+    interface_band: float,
 ) -> VerificationPlan:
     plan = VerificationPlan()
     plan.gate_order = list(gate_order)
@@ -166,6 +167,7 @@ def _build_plan(
     plan.thresholds["laplacian_exclusion_radius"] = float(exclusion_radius)
     plan.thresholds["laplacian_fd_h"] = float(fd_h)
     plan.thresholds["laplacian_prefer_autograd"] = float(prefer_autograd)
+    plan.thresholds["laplacian_interface_band"] = float(interface_band)
     return plan
 
 
@@ -263,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--laplacian-exclusion-radius", type=float, default=0.1, help="Gate A exclusion radius.")
     parser.add_argument("--laplacian-fd-h", type=float, default=2e-2, help="Gate A finite-diff step.")
     parser.add_argument("--laplacian-prefer-autograd", type=int, default=1, help="Gate A prefer autograd (1/0).")
+    parser.add_argument("--laplacian-interface-band", type=float, default=0.0, help="Gate A interface exclusion band.")
     args = parser.parse_args(argv)
 
     if not torch.cuda.is_available():
@@ -309,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                 exclusion_radius,
                 fd_h,
                 prefer_autograd,
+                args.laplacian_interface_band,
             )
             run_dir = out_root / f"sweep_ex{exclusion_radius}_h{fd_h}_pa{prefer_autograd}".replace(".", "p")
             print(f"plan.thresholds: {_plan_thresholds_payload(plan)}")
@@ -359,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             args.laplacian_exclusion_radius,
             args.laplacian_fd_h,
             args.laplacian_prefer_autograd,
+            args.laplacian_interface_band,
         )
         plan.run_name = out_root.name
         print(f"plan.thresholds: {_plan_thresholds_payload(plan)}")

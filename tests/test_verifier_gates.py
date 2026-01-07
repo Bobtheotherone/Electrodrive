@@ -79,6 +79,48 @@ def test_gate_a_pde_harmonic_pass(tmp_path: Path) -> None:
     assert out.metrics["linf"] < 1e-1
 
 
+def test_gate_a_pde_interface_band_linear_pass(tmp_path: Path) -> None:
+    _skip_if_no_cuda()
+    pts = torch.randn(64, 3, device="cuda", dtype=torch.float32)
+    _, result = _dummy_result(pts)
+    layered_spec = {
+        "dielectrics": [
+            {"name": "region1", "epsilon": 1.0, "z_min": 0.0, "z_max": 5.0},
+            {"name": "slab", "epsilon": 4.0, "z_min": -0.3, "z_max": 0.0},
+            {"name": "region3", "epsilon": 1.0, "z_min": -5.0, "z_max": -0.3},
+        ],
+        "charges": [{"type": "point", "q": 1.0, "pos": [0.0, 0.0, 0.2]}],
+    }
+    query = OracleQuery(
+        spec=layered_spec,
+        points=pts,
+        quantity=OracleQuantity.POTENTIAL,
+        requested_fidelity=OracleFidelity.F0,
+        device=str(pts.device),
+        dtype=str(pts.dtype).replace("torch.", ""),
+    )
+
+    def linear(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 2]
+
+    out = gateA_pde.run_gate(
+        query,
+        result,
+        config={
+            "candidate_eval": linear,
+            "artifact_dir": tmp_path / "gateA_interface",
+            "spec": layered_spec,
+            "n_interior": 64,
+            "linf_tol": 1e-2,
+            "fd_h": 2e-2,
+            "interface_band": 0.05,
+            "prefer_autograd": False,
+        },
+    )
+    assert out.status in ("pass", "borderline")
+    assert out.metrics["linf"] < 1e-1
+
+
 def test_gate_b_boundary_plane_pass(tmp_path: Path) -> None:
     _skip_if_no_cuda()
     pts = torch.randn(64, 3, device="cuda", dtype=torch.float32)

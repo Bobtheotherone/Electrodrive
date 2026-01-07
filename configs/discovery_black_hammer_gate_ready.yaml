@@ -73,6 +73,7 @@ solver:
   max_iters: 24
   tol: 1e-6
   reg_l1: 1e-3
+  fast_column_normalize: true
 
 oracle:
   fast: { name: "f1", dtype: "fp32" }

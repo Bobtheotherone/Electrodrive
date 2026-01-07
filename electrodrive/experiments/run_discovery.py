@@ -473,6 +473,8 @@ def _fast_weights(
     else:
         A_scaled = A
         col_norms = torch.ones((k,), device=A.device, dtype=A.dtype)
+    if not torch.isfinite(A_scaled).all() or not torch.isfinite(b).all():
+        return torch.zeros((0,), device=A.device, dtype=A.dtype)
     ata = A_scaled.transpose(0, 1).matmul(A_scaled)
     ata = ata + reg * torch.eye(k, device=A.device, dtype=A.dtype)
     atb = A_scaled.transpose(0, 1).matmul(b)

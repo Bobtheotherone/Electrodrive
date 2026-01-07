@@ -19,3 +19,12 @@ def test_fast_weights_stability_with_scaling() -> None:
     assert w_est.numel() == k
     assert torch.isfinite(w_est).all()
     assert torch.allclose(w_est, w_true, rtol=1e-2, atol=1e-2)
+
+    scale_no_norm = 1e3
+    A_scaled = A * scale_no_norm
+    b_scaled = b * scale_no_norm
+    w_est = _fast_weights(A_scaled, b_scaled, reg=1e-6, normalize=False)
+    assert w_est.numel() == k
+    assert torch.isfinite(w_est).all()
+    recon = A_scaled @ w_est
+    assert torch.allclose(recon, b_scaled, rtol=1e-3, atol=1e-3)

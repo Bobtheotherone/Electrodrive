@@ -61,5 +61,6 @@ def test_layered_dcim_defaults_enforce_complex_depth() -> None:
     assert isinstance(elems[1], DCIMBranchCutImageBasis)
     for elem in elems:
         z_imag = elem.params.get("z_imag")
-        assert z_imag is not None
-        assert torch.all(torch.abs(z_imag) > 0)
+        assert torch.is_tensor(z_imag)
+        assert torch.isfinite(z_imag).all()
+        assert torch.all(z_imag > 0)

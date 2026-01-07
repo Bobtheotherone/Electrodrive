@@ -971,6 +971,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
     layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
     layered_interface_band = float(run_cfg.get("layered_interface_band", layered_interface_delta))
+    layered_stability_delta = float(run_cfg.get("layered_stability_delta", 1e-2))
     layered_prefer_dcim = bool(run_cfg.get("layered_prefer_dcim", True))
     layered_allow_real_primitives = bool(run_cfg.get("layered_allow_real_primitives", False))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
@@ -1447,7 +1448,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             proxy_gateD(
                                 _proxy_eval,
                                 proxy_pts,
-                                delta=float(verify_plan.thresholds.get("stability", 5e-2)),
+                                delta=layered_stability_delta,
                                 seed=seed_gen + 7,
                             )
                         )
@@ -1636,7 +1637,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     proxy_gateD(
                                         _eval_fn,
                                         proxy_pts,
-                                        delta=float(verify_plan.thresholds.get("stability", 5e-2)),
+                                        delta=layered_stability_delta,
                                         seed=seed_gen + 7,
                                     )
                                 )

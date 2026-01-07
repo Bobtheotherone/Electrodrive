@@ -115,8 +115,10 @@ def proxy_gateD(
     delta: float,
     seed: int = 0,
 ) -> Dict[str, float]:
-    torch.manual_seed(seed)
-    perturb = torch.randn_like(pts) * delta
+    gen = torch.Generator(device=pts.device)
+    gen.manual_seed(int(seed))
+    noise = torch.randn(pts.shape, device=pts.device, dtype=pts.dtype, generator=gen)
+    perturb = noise * delta
     base_val = _eval_tensor(candidate_eval, pts)
     pert_val = _eval_tensor(candidate_eval, pts + perturb)
     diff = base_val - pert_val

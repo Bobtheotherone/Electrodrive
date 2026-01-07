@@ -68,3 +68,23 @@ def test_gate_proxies_cuda() -> None:
     if not torch.cuda.is_available():
         return
     _run_proxy_tests(torch.device("cuda"))
+
+
+def test_proxy_gateD_does_not_mutate_rng() -> None:
+    device = torch.device("cpu")
+    pts = torch.zeros(8, 3, device=device, dtype=torch.float32)
+
+    def constant(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 0] * 0.0
+
+    torch.manual_seed(0)
+    a = torch.randn(1).item()
+    _ = proxy_gateD(constant, pts, delta=0.01, seed=123)
+    b = torch.randn(1).item()
+
+    torch.manual_seed(0)
+    a2 = torch.randn(1).item()
+    b2 = torch.randn(1).item()
+
+    assert a == a2
+    assert b == b2

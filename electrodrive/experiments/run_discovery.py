@@ -43,6 +43,7 @@ from electrodrive.images.geo_encoder import GeoEncoder
 from electrodrive.images.learned_generator import SimpleGeoEncoder
 from electrodrive.images.search import ImageSystem, assemble_basis_matrix, solve_sparse
 from electrodrive.orchestration.parser import CanonicalSpec
+from electrodrive.learn.collocation import compute_layered_reference_potential
 from electrodrive.verify.oracle_backends.f0 import F0AnalyticOracleBackend
 from electrodrive.verify.oracle_backends.f1_sommerfeld import F1SommerfeldOracleBackend
 from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, OracleQuery, OracleQuantity
@@ -402,6 +403,12 @@ def _laplacian_fd(eval_fn: Any, pts: torch.Tensor, h: float) -> torch.Tensor:
         minus = eval_fn(pts - offset)
         lap = lap + (plus - 2.0 * V0 + minus) / (h * h)
     return lap
+
+
+def _add_reference(pred: torch.Tensor, ref: Optional[torch.Tensor]) -> torch.Tensor:
+    if ref is None:
+        return pred
+    return pred + ref
 
 
 def _fast_weights(A: torch.Tensor, b: torch.Tensor, reg: float) -> torch.Tensor:
@@ -916,6 +923,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     allow_not_ready = bool(run_cfg.get("allow_not_ready", False))
     ramp_patience = int(run_cfg.get("ramp_patience_gens", 3))
     ramp_min_rel_improve = float(run_cfg.get("ramp_min_rel_improvement", 0.10))
+    use_reference_potential = bool(run_cfg.get("use_reference_potential", False))
     layered_sampling = bool(run_cfg.get("layered_sampling", True))
     layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
     layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
@@ -992,6 +1000,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         domain_scale = float(spec_cfg.get("domain_scale", 1.0))
         seed_gen = seed + gen * 13
         is_layered = getattr(spec, "BCs", "") == "dielectric_interfaces"
+        use_ref = bool(use_reference_potential and is_layered)
 
         torch.cuda.synchronize()
         retry = True
@@ -1070,8 +1079,34 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 oracle_in_mean_abs = _mean_abs(V_in_hold_mid) if V_in_hold_mid is not None else _mean_abs(V_in_hold)
                 lap_denom = _laplacian_denom(oracle_in_mean_abs, oracle_bc_mean_abs)
 
+                V_ref_bc_train = None
+                V_ref_in_train = None
+                V_ref_bc_hold = None
+                V_ref_in_hold = None
+                V_ref_train = None
+                V_ref_hold = None
+                V_bc_train_corr = V_bc_train
+                V_in_train_corr = V_in_train
+                V_bc_hold_corr = V_bc_hold
+                V_in_hold_corr = V_in_hold
+                V_bc_hold_mid_corr = V_bc_hold_mid
+                V_in_hold_mid_corr = V_in_hold_mid
+                if use_ref:
+                    V_ref_bc_train = compute_layered_reference_potential(spec, bc_train, device=device, dtype=bc_train.dtype)
+                    V_ref_in_train = compute_layered_reference_potential(spec, interior_train, device=device, dtype=interior_train.dtype)
+                    V_ref_bc_hold = compute_layered_reference_potential(spec, bc_hold, device=device, dtype=bc_hold.dtype)
+                    V_ref_in_hold = compute_layered_reference_potential(spec, interior_hold, device=device, dtype=interior_hold.dtype)
+                    V_ref_train = torch.cat([V_ref_bc_train, V_ref_in_train], dim=0)
+                    V_ref_hold = torch.cat([V_ref_bc_hold, V_ref_in_hold], dim=0)
+                    V_bc_train_corr = V_bc_train - V_ref_bc_train
+                    V_in_train_corr = V_in_train - V_ref_in_train
+                    V_bc_hold_corr = V_bc_hold - V_ref_bc_hold
+                    V_in_hold_corr = V_in_hold - V_ref_in_hold
+                    V_bc_hold_mid_corr = V_bc_hold_mid - V_ref_bc_hold
+                    V_in_hold_mid_corr = V_in_hold_mid - V_ref_in_hold
+
                 X_train = torch.cat([bc_train, interior_train], dim=0)
-                V_train = torch.cat([V_bc_train, V_in_train], dim=0)
+                V_train = torch.cat([V_bc_train_corr, V_in_train_corr], dim=0)
                 is_boundary = torch.cat(
                     [torch.ones(bc_train.shape[0], device=device, dtype=torch.bool),
                      torch.zeros(interior_train.shape[0], device=device, dtype=torch.bool)],
@@ -1080,6 +1115,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 X_hold = torch.cat([bc_hold, interior_hold], dim=0)
                 V_hold = torch.cat([V_bc_hold, V_in_hold], dim=0)
                 V_hold_mid = torch.cat([V_bc_hold_mid, V_in_hold_mid], dim=0)
+                V_hold_corr = torch.cat([V_bc_hold_corr, V_in_hold_corr], dim=0)
+                V_hold_mid_corr = torch.cat([V_bc_hold_mid_corr, V_in_hold_mid_corr], dim=0)
                 is_boundary_hold = torch.cat(
                     [torch.ones(bc_hold.shape[0], device=device, dtype=torch.bool),
                      torch.zeros(interior_hold.shape[0], device=device, dtype=torch.bool)],
@@ -1184,7 +1221,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         if cache_hold_matrices:
                             hold_cache[idx] = A_hold
                         weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
-                        pred_hold = A_hold.matmul(weights)
+                        pred_hold_corr = A_hold.matmul(weights)
+                        pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                         bc_err = torch.mean(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])).item()
                         in_err = torch.mean(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])).item()
                         comp = _complexity(program, elements)
@@ -1299,7 +1337,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                             A_hold_dcim = assemble_basis_matrix(dcim_elements, X_hold)
                             assert_cuda_tensor(A_hold_dcim, "A_hold_dcim")
-                            pred_hold = A_hold_dcim.matmul(weights)
+                            pred_hold_corr = A_hold_dcim.matmul(weights)
+                            pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                             bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                             in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
                             mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
@@ -1317,6 +1356,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             def _eval_fn(pts: torch.Tensor) -> torch.Tensor:
                                 assert_cuda_tensor(pts, "candidate_eval_points")
                                 out = system.potential(pts)
+                                if use_ref:
+                                    out = out + compute_layered_reference_potential(
+                                        spec,
+                                        pts,
+                                        device=pts.device,
+                                        dtype=pts.dtype,
+                                    )
                                 assert_cuda_tensor(out, "candidate_eval_out")
                                 return out
 
@@ -1333,7 +1379,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             if perturbed is not None:
                                 A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
                                 assert_cuda_tensor(A_hold_pert, "A_hold_dcim_pert")
-                                pert_pred = A_hold_pert.matmul(weights)
+                                pert_pred_corr = A_hold_pert.matmul(weights)
+                                pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
                                 base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                                 pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                                 pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
@@ -1457,7 +1504,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     else:
                         A_hold = assemble_basis_matrix(elements, X_hold)
                     assert_cuda_tensor(A_hold, "A_hold_fit")
-                    pred_hold = A_hold.matmul(weights)
+                    pred_hold_corr = A_hold.matmul(weights)
+                    pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                     bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                     in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
                     mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
@@ -1475,6 +1523,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     def _eval_fn(pts: torch.Tensor) -> torch.Tensor:
                         assert_cuda_tensor(pts, "candidate_eval_points")
                         out = system.potential(pts)
+                        if use_ref:
+                            out = out + compute_layered_reference_potential(
+                                spec,
+                                pts,
+                                device=pts.device,
+                                dtype=pts.dtype,
+                            )
                         assert_cuda_tensor(out, "candidate_eval_out")
                         return out
 
@@ -1491,7 +1546,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     if perturbed is not None:
                         A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
                         assert_cuda_tensor(A_hold_pert, "A_hold_pert")
-                        pert_pred = A_hold_pert.matmul(weights)
+                        pert_pred_corr = A_hold_pert.matmul(weights)
+                        pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
                         base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                         pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                         pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
@@ -1556,7 +1612,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     for cand in top_mid:
                         A_hold_hi = assemble_basis_matrix(cand["elements"], X_hold)
                         assert_cuda_tensor(A_hold_hi, "A_hold_hi")
-                        pred_hi = A_hold_hi.matmul(cand["weights"])
+                        pred_hi_corr = A_hold_hi.matmul(cand["weights"])
+                        pred_hi = _add_reference(pred_hi_corr, V_ref_hold)
                         bc_err_hi = torch.mean(torch.abs(pred_hi[is_boundary_hold] - V_hold_hi[is_boundary_hold])).item()
                         in_err_hi = torch.mean(torch.abs(pred_hi[~is_boundary_hold] - V_hold_hi[~is_boundary_hold])).item()
                         cand["score_hi"] = float(w_bc * bc_err_hi + w_pde * in_err_hi)
@@ -1572,14 +1629,14 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     if refine_targets == "holdout":
                         refine_bc = bc_hold
                         refine_interior = interior_hold
-                        refine_bc_target = V_bc_hold_mid if V_bc_hold_mid is not None else V_bc_hold
+                        refine_bc_target = V_bc_hold_mid_corr if V_bc_hold_mid_corr is not None else V_bc_hold_corr
                         refine_X = X_hold
-                        refine_V = V_hold_mid
+                        refine_V = V_hold_mid_corr
                         refine_is_boundary = is_boundary_hold
                     else:
                         refine_bc = bc_train
                         refine_interior = interior_train
-                        refine_bc_target = V_bc_train
+                        refine_bc_target = V_bc_train_corr
                         refine_X = X_train
                         refine_V = V_train
                         refine_is_boundary = is_boundary
@@ -1824,13 +1881,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             assert_cuda_tensor(pts, "refined_eval_points")
                             with torch.no_grad():
                                 out = system_refined.potential(pts)
+                                if use_ref:
+                                    out = out + compute_layered_reference_potential(
+                                        spec,
+                                        pts,
+                                        device=pts.device,
+                                        dtype=pts.dtype,
+                                    )
                             assert_cuda_tensor(out, "refined_eval_out")
                             return out
 
                         with torch.no_grad():
                             A_hold = assemble_basis_matrix(refine_elements, X_hold)
                             assert_cuda_tensor(A_hold, "A_hold_refined")
-                            pred_hold = A_hold.matmul(refined_weights)
+                            pred_hold_corr = A_hold.matmul(refined_weights)
+                            pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                             bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                             in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
                             mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
@@ -1861,7 +1926,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         if perturbed is not None:
                             A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
                             assert_cuda_tensor(A_hold_pert, "A_hold_refined_pert")
-                            pert_pred = A_hold_pert.matmul(refined_weights)
+                            pert_pred_corr = A_hold_pert.matmul(refined_weights)
+                            pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
                             base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                             pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                             pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
@@ -1946,6 +2012,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     def _verify_eval(pts: torch.Tensor) -> torch.Tensor:
                         assert_cuda_tensor(pts, "verifier_points")
                         out = system.potential(pts)
+                        if use_ref:
+                            out = out + compute_layered_reference_potential(
+                                spec,
+                                pts,
+                                device=pts.device,
+                                dtype=pts.dtype,
+                            )
                         assert_cuda_tensor(out, "verifier_out")
                         return out
 

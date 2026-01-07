@@ -1212,6 +1212,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 V_in_hold_mid, _ = _oracle_eval(oracle_mid, spec, interior_hold, dtype=mid_dtype)
                 V_bc_hold_mid = V_bc_hold_mid.to(dtype=bc_hold.dtype)
                 V_in_hold_mid = V_in_hold_mid.to(dtype=interior_hold.dtype)
+                bc_train_mask = torch.isfinite(V_bc_train)
+                in_train_mask = torch.isfinite(V_in_train)
+                if not torch.all(bc_train_mask):
+                    bc_train = bc_train[bc_train_mask]
+                    V_bc_train = V_bc_train[bc_train_mask]
+                if not torch.all(in_train_mask):
+                    interior_train = interior_train[in_train_mask]
+                    V_in_train = V_in_train[in_train_mask]
+                bc_hold_mask = torch.isfinite(V_bc_hold) & torch.isfinite(V_bc_hold_mid)
+                in_hold_mask = torch.isfinite(V_in_hold) & torch.isfinite(V_in_hold_mid)
+                if not torch.all(bc_hold_mask):
+                    bc_hold = bc_hold[bc_hold_mask]
+                    V_bc_hold = V_bc_hold[bc_hold_mask]
+                    V_bc_hold_mid = V_bc_hold_mid[bc_hold_mask]
+                if not torch.all(in_hold_mask):
+                    interior_hold = interior_hold[in_hold_mask]
+                    V_in_hold = V_in_hold[in_hold_mask]
+                    V_in_hold_mid = V_in_hold_mid[in_hold_mask]
+                if bc_train.shape[0] + interior_train.shape[0] == 0:
+                    raise RuntimeError("No finite training targets after filtering.")
+                if bc_hold.shape[0] + interior_hold.shape[0] == 0:
+                    raise RuntimeError("No finite holdout targets after filtering.")
                 oracle_bc_mean_abs = _mean_abs(V_bc_hold_mid) if V_bc_hold_mid is not None else _mean_abs(V_bc_hold)
                 oracle_in_mean_abs = _mean_abs(V_in_hold_mid) if V_in_hold_mid is not None else _mean_abs(V_in_hold)
                 lap_denom = _laplacian_denom(oracle_in_mean_abs, oracle_bc_mean_abs)

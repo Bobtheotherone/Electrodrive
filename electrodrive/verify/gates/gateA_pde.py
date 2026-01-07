@@ -212,8 +212,9 @@ def run_gate(
     else:
         abs_lap = lap.abs()
         linf = float(torch.max(abs_lap).item())
-        l2 = float(torch.sqrt(torch.mean(abs_lap * abs_lap)).item())
-        p95 = float(torch.quantile(abs_lap, 0.95).item())
+        abs_lap_f64 = abs_lap.double()
+        l2 = float(torch.sqrt(torch.mean(abs_lap_f64 * abs_lap_f64)).item())
+        p95 = float(torch.quantile(abs_lap_f64, 0.95).item())
         metrics = {"linf": linf, "l2": l2, "p95": p95, "n": float(pts.shape[0]), "method": 0.0}
         status = "pass"
 

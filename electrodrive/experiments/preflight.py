@@ -25,6 +25,14 @@ class RunCounters:
     proxy_computed_count: int = 0
     complex_guard_failed: int = 0
     weights_empty: int = 0
+    a_train_nonfinite_count: int = 0
+    a_train_total: int = 0
+    a_hold_nonfinite_count: int = 0
+    a_hold_total: int = 0
+    v_train_nonfinite_count: int = 0
+    v_train_total: int = 0
+    weights_nonfinite_count: int = 0
+    weights_total: int = 0
 
     def add(self, key: str, n: int = 1) -> None:
         if not hasattr(self, key):
@@ -47,6 +55,15 @@ def write_preflight_report(out_dir: Path, counters: RunCounters, extra: Dict[str
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def write_first_offender(out_dir: Path, payload: Dict[str, Any]) -> bool:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "preflight_first_offender.json"
+    if out_path.exists():
+        return False
+    out_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return True
+
+
 def summarize_to_stdout(counters: RunCounters) -> None:
     c = counters
     print(
@@ -61,4 +78,9 @@ def summarize_to_stdout(counters: RunCounters) -> None:
     )
 
 
-__all__ = ["RunCounters", "summarize_to_stdout", "write_preflight_report"]
+__all__ = [
+    "RunCounters",
+    "summarize_to_stdout",
+    "write_first_offender",
+    "write_preflight_report",
+]

@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from electrodrive.experiments.preflight import RunCounters, write_preflight_report
+from electrodrive.experiments.preflight import RunCounters, write_first_offender, write_preflight_report
 
 
 def test_preflight_report_writer(tmp_path: Path) -> None:
@@ -21,3 +21,12 @@ def test_preflight_report_writer(tmp_path: Path) -> None:
     assert payload["extra"]["tag"] == "test_run"
     assert payload["counters"]["sampled_programs_total"] == 10
     assert payload["counters"]["compiled_ok"] == 7
+
+
+def test_preflight_first_offender_once(tmp_path: Path) -> None:
+    payload = {"reason": "first", "gen": 0}
+    assert write_first_offender(tmp_path, payload)
+    first = (tmp_path / "preflight_first_offender.json").read_text(encoding="utf-8")
+    assert not write_first_offender(tmp_path, {"reason": "second"})
+    second = (tmp_path / "preflight_first_offender.json").read_text(encoding="utf-8")
+    assert first == second

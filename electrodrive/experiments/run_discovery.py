@@ -57,7 +57,12 @@ from electrodrive.experiments.layered_sampling import (
     sample_layered_interior,
     sample_layered_interface_pairs,
 )
-from electrodrive.experiments.preflight import RunCounters, summarize_to_stdout, write_preflight_report
+from electrodrive.experiments.preflight import (
+    RunCounters,
+    summarize_to_stdout,
+    write_first_offender,
+    write_preflight_report,
+)
 
 
 class _NullLogger:
@@ -451,13 +456,23 @@ def _proxy_score(metrics: Dict[str, Any]) -> float:
     return b + c + d
 
 
-def _fast_weights(A: torch.Tensor, b: torch.Tensor, reg: float) -> torch.Tensor:
+def _fast_weights(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    reg: float,
+    *,
+    normalize: bool = True,
+) -> torch.Tensor:
     if A.numel() == 0:
         return torch.zeros((0,), device=A.device, dtype=A.dtype)
     k = A.shape[1]
     if k == 0:
         return torch.zeros((0,), device=A.device, dtype=A.dtype)
-    A_scaled, col_norms = _scale_columns(A)
+    if normalize:
+        A_scaled, col_norms = _scale_columns(A)
+    else:
+        A_scaled = A
+        col_norms = torch.ones((k,), device=A.device, dtype=A.dtype)
     ata = A_scaled.transpose(0, 1).matmul(A_scaled)
     ata = ata + reg * torch.eye(k, device=A.device, dtype=A.dtype)
     atb = A_scaled.transpose(0, 1).matmul(b)
@@ -476,6 +491,20 @@ def _scale_columns(A: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, to
         return A, torch.ones((A.shape[1],), device=A.device, dtype=A.dtype)
     col_norms = torch.linalg.norm(A, dim=0).clamp_min(eps)
     return A / col_norms, col_norms
+
+
+def _nonfinite_count(t: torch.Tensor) -> int:
+    return int(torch.count_nonzero(~torch.isfinite(t)).item())
+
+
+def _tensor_absmax(t: Optional[torch.Tensor]) -> float:
+    if t is None or t.numel() == 0:
+        return float("nan")
+    finite = torch.isfinite(t)
+    if not torch.any(finite):
+        return float("nan")
+    vals = torch.abs(t[finite])
+    return float(torch.max(vals).item())
 
 
 def _mean_abs(x: torch.Tensor) -> float:
@@ -1030,6 +1059,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     preflight_counters = RunCounters() if preflight_enabled else None
     per_gen_preflight: List[Dict[str, Any]] = []
     gen_counters: Optional[RunCounters] = None
+    first_offender_written = False
 
     def _count_preflight(key: str, n: int = 1) -> None:
         if preflight_counters is None:
@@ -1037,6 +1067,43 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         preflight_counters.add(key, n)
         if gen_counters is not None:
             gen_counters.add(key, n)
+
+    def _maybe_write_first_offender(
+        *,
+        gen_idx: int,
+        program_idx: int,
+        program: Any,
+        elements: Sequence[ImageBasisElement],
+        A_train: Optional[torch.Tensor],
+        V_train: Optional[torch.Tensor],
+        weights: Optional[torch.Tensor],
+        pred_hold: Optional[torch.Tensor],
+        reason: str,
+    ) -> None:
+        nonlocal first_offender_written
+        if preflight_counters is None or first_offender_written:
+            return
+        payload = {
+            "gen": int(gen_idx),
+            "program_idx": int(program_idx),
+            "reason": str(reason),
+            "program_repr": repr(program),
+            "program": _program_to_json(program),
+            "element_types": _element_type_hist(elements),
+            "flags": {
+                "use_reference_potential": bool(use_ref),
+                "use_gate_proxies": bool(use_gate_proxies),
+                "layered_prefer_dcim": bool(layered_prefer_dcim),
+            },
+            "stats": {
+                "A_train_absmax": _tensor_absmax(A_train),
+                "V_train_absmax": _tensor_absmax(V_train),
+                "weights_absmax": _tensor_absmax(weights),
+                "pred_hold_absmax": _tensor_absmax(pred_hold),
+            },
+        }
+        if write_first_offender(run_dir, payload):
+            first_offender_written = True
 
     fixed_spec_obj: Optional[CanonicalSpec] = None
     if fixed_spec:
@@ -1238,6 +1305,15 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                      torch.zeros(interior_hold.shape[0], device=device, dtype=torch.bool)],
                     dim=0,
                 )
+                v_train_nonfinite_val = 0
+                v_train_total_val = 0
+                v_train_has_nonfinite = False
+                if preflight_counters is not None:
+                    v_train_nonfinite_val = _nonfinite_count(V_train)
+                    v_train_total_val = int(V_train.numel())
+                    v_train_has_nonfinite = v_train_nonfinite_val > 0
+                else:
+                    v_train_has_nonfinite = not torch.isfinite(V_train).all().item()
 
                 spec_embedding, _, _ = geo_encoder.encode(spec, device=device, dtype=torch.float32)
                 spec_embedding = spec_embedding.to(device=device, dtype=torch.float32)
@@ -1354,20 +1430,150 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         assert_cuda_tensor(A_hold, "A_hold_fast")
                         if cache_hold_matrices:
                             hold_cache[idx] = A_hold
-                        weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
+                        a_train_nonfinite = 0
+                        a_hold_nonfinite = 0
                         if preflight_counters is not None:
-                            if weights.numel() == 0 or not torch.isfinite(weights).all():
+                            a_train_nonfinite = _nonfinite_count(A_train)
+                            a_hold_nonfinite = _nonfinite_count(A_hold)
+                            _count_preflight("a_train_nonfinite_count", a_train_nonfinite)
+                            _count_preflight("a_train_total", int(A_train.numel()))
+                            _count_preflight("a_hold_nonfinite_count", a_hold_nonfinite)
+                            _count_preflight("a_hold_total", int(A_hold.numel()))
+                            _count_preflight("v_train_nonfinite_count", v_train_nonfinite_val)
+                            _count_preflight("v_train_total", v_train_total_val)
+                        else:
+                            if not torch.isfinite(A_train).all().item():
+                                a_train_nonfinite = 1
+                            if not torch.isfinite(A_hold).all().item():
+                                a_hold_nonfinite = 1
+                        if a_train_nonfinite > 0 or a_hold_nonfinite > 0 or v_train_has_nonfinite:
+                            _count_preflight("solved_failed")
+                            reason = "a_train_nonfinite" if a_train_nonfinite > 0 else "a_hold_nonfinite"
+                            if a_train_nonfinite > 0 or a_hold_nonfinite > 0:
+                                _maybe_write_first_offender(
+                                    gen_idx=gen,
+                                    program_idx=idx,
+                                    program=program,
+                                    elements=elements,
+                                    A_train=A_train,
+                                    V_train=V_train,
+                                    weights=None,
+                                    pred_hold=None,
+                                    reason=reason,
+                                )
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "nonfinite_matrix": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
+
+                        weights = _fast_weights(
+                            A_train,
+                            V_train,
+                            reg=float(solver_cfg.get("reg_l1", 1e-3)),
+                            normalize=bool(solver_cfg.get("fast_column_normalize", True)),
+                        )
+                        weights_nonfinite = 0
+                        if preflight_counters is not None:
+                            _count_preflight("weights_total", int(weights.numel()))
+                            if weights.numel() > 0:
+                                weights_nonfinite = _nonfinite_count(weights)
+                                _count_preflight("weights_nonfinite_count", weights_nonfinite)
+                        if preflight_counters is not None:
+                            if weights.numel() == 0 or weights_nonfinite > 0:
                                 _count_preflight("solved_failed")
                                 if weights.numel() == 0:
                                     _count_preflight("weights_empty")
                             else:
                                 _count_preflight("solved_ok")
+                        if weights.numel() == 0:
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "weights_empty": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
+                        if weights_nonfinite > 0 or not torch.isfinite(weights).all().item():
+                            _maybe_write_first_offender(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=weights,
+                                pred_hold=None,
+                                reason="weights_nonfinite",
+                            )
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "weights_nonfinite": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
                         pred_hold_corr = A_hold.matmul(weights)
                         pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                         if preflight_counters is not None:
-                            nonfinite = torch.count_nonzero(~torch.isfinite(pred_hold))
-                            _count_preflight("nonfinite_pred_count", int(nonfinite.item()))
+                            nonfinite = _nonfinite_count(pred_hold)
+                            _count_preflight("nonfinite_pred_count", int(nonfinite))
                             _count_preflight("nonfinite_pred_total", int(pred_hold.numel()))
+                            if nonfinite > 0:
+                                _maybe_write_first_offender(
+                                    gen_idx=gen,
+                                    program_idx=idx,
+                                    program=program,
+                                    elements=elements,
+                                    A_train=A_train,
+                                    V_train=V_train,
+                                    weights=weights,
+                                    pred_hold=pred_hold,
+                                    reason="pred_nonfinite",
+                                )
+                                fast_scores.append(float("inf"))
+                                fast_metrics.append(
+                                    {
+                                        "pred_nonfinite": True,
+                                        "complex_count": int(complex_count),
+                                        "frac_complex": float(frac_complex),
+                                    }
+                                )
+                                n_terms_list.append(n_terms)
+                                continue
+                        elif not torch.isfinite(pred_hold).all().item():
+                            _maybe_write_first_offender(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=weights,
+                                pred_hold=pred_hold,
+                                reason="pred_nonfinite",
+                            )
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "pred_nonfinite": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
                         bc_err = torch.mean(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])).item()
                         in_err = torch.mean(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])).item()
                         comp = _complexity(program, elements)

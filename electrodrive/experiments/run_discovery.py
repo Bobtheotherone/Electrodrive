@@ -49,6 +49,11 @@ from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, Oracle
 from electrodrive.verify.utils import normalize_dtype
 from electrodrive.verify.utils import sha256_json, utc_now_iso
 from electrodrive.verify.verifier import VerificationPlan, Verifier
+from electrodrive.experiments.layered_sampling import (
+    parse_layered_interfaces,
+    sample_layered_interior,
+    sample_layered_interface_pairs,
+)
 
 
 class _NullLogger:
@@ -247,6 +252,71 @@ def _sample_points_gpu(
         gen=gen,
         min_z=min_z,
         exclusion_radius=exclusion_radius,
+    )
+    return bc_points, interior
+
+
+def _sample_points_layered(
+    spec: CanonicalSpec,
+    *,
+    n_boundary: int,
+    n_interior: int,
+    domain_scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+    exclusion_radius: float,
+    interface_band: float,
+    interface_delta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    interfaces = parse_layered_interfaces(spec)
+    if not interfaces:
+        return _sample_points_gpu(
+            spec,
+            n_boundary=n_boundary,
+            n_interior=n_interior,
+            domain_scale=domain_scale,
+            device=device,
+            dtype=dtype,
+            seed=seed,
+            exclusion_radius=exclusion_radius,
+        )
+
+    n_interfaces = max(1, len(interfaces))
+    n_xy = max(1, n_boundary // (2 * n_interfaces))
+    bc_up, bc_dn = sample_layered_interface_pairs(
+        spec,
+        n_xy,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        delta=interface_delta,
+        domain_scale=domain_scale,
+    )
+    bc_points = torch.cat([bc_up, bc_dn], dim=0)
+    if bc_points.shape[0] < n_boundary:
+        extra_pairs = int(math.ceil((n_boundary - bc_points.shape[0]) / 2))
+        extra_up, extra_dn = sample_layered_interface_pairs(
+            spec,
+            extra_pairs,
+            device=device,
+            dtype=dtype,
+            seed=seed + 11,
+            delta=interface_delta,
+            domain_scale=domain_scale,
+        )
+        bc_points = torch.cat([bc_points, extra_up, extra_dn], dim=0)
+    bc_points = bc_points[:n_boundary].contiguous()
+
+    interior = sample_layered_interior(
+        spec,
+        n_interior,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        exclusion_radius=exclusion_radius,
+        interface_band=interface_band,
+        domain_scale=domain_scale,
     )
     return bc_points, interior
 
@@ -846,6 +916,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     allow_not_ready = bool(run_cfg.get("allow_not_ready", False))
     ramp_patience = int(run_cfg.get("ramp_patience_gens", 3))
     ramp_min_rel_improve = float(run_cfg.get("ramp_min_rel_improvement", 0.10))
+    layered_sampling = bool(run_cfg.get("layered_sampling", True))
+    layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
+    layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
+    layered_interface_band = float(run_cfg.get("layered_interface_band", layered_interface_delta))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
     refine_steps = int(run_cfg.get("refine_steps", 12))
     refine_lr = float(run_cfg.get("refine_lr", 5e-2))
@@ -926,24 +1000,50 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             attempt += 1
             retry = False
             try:
-                bc_train, interior_train = _sample_points_gpu(
-                    spec,
-                    n_boundary=backoff.bc_train,
-                    n_interior=backoff.interior_train,
-                    domain_scale=domain_scale,
-                    device=device,
-                    dtype=torch.float32,
-                    seed=seed_gen + 1,
-                )
-                bc_hold, interior_hold = _sample_points_gpu(
-                    spec,
-                    n_boundary=backoff.bc_holdout,
-                    n_interior=backoff.interior_holdout,
-                    domain_scale=domain_scale,
-                    device=device,
-                    dtype=torch.float32,
-                    seed=seed_gen + 7,
-                )
+                if is_layered and layered_sampling:
+                    bc_train, interior_train = _sample_points_layered(
+                        spec,
+                        n_boundary=backoff.bc_train,
+                        n_interior=backoff.interior_train,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 1,
+                        exclusion_radius=layered_exclusion_radius,
+                        interface_band=layered_interface_band,
+                        interface_delta=layered_interface_delta,
+                    )
+                    bc_hold, interior_hold = _sample_points_layered(
+                        spec,
+                        n_boundary=backoff.bc_holdout,
+                        n_interior=backoff.interior_holdout,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 7,
+                        exclusion_radius=layered_exclusion_radius,
+                        interface_band=layered_interface_band,
+                        interface_delta=layered_interface_delta,
+                    )
+                else:
+                    bc_train, interior_train = _sample_points_gpu(
+                        spec,
+                        n_boundary=backoff.bc_train,
+                        n_interior=backoff.interior_train,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 1,
+                    )
+                    bc_hold, interior_hold = _sample_points_gpu(
+                        spec,
+                        n_boundary=backoff.bc_holdout,
+                        n_interior=backoff.interior_holdout,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 7,
+                    )
 
                 assert_cuda_tensor(bc_train, "bc_train")
                 assert_cuda_tensor(interior_train, "interior_train")

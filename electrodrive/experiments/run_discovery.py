@@ -452,10 +452,50 @@ def _proxy_fail_count(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> 
     return fail
 
 
-def _proxy_score(metrics: Dict[str, Any]) -> float:
+def _proxy_fail_count_noA(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> int:
+    if not metrics:
+        return 0
+    fail = 0
+    bc_tol = float(thresholds.get("bc_continuity", 5e-3))
+    if float(metrics.get("proxy_gateB_max_v_jump", 0.0)) > bc_tol or float(
+        metrics.get("proxy_gateB_max_d_jump", 0.0)
+    ) > bc_tol:
+        fail += 1
+    slope_tol = float(thresholds.get("slope_tol", 0.15))
+    far_slope = metrics.get("proxy_gateC_far_slope")
+    near_slope = metrics.get("proxy_gateC_near_slope")
+    if far_slope is not None and abs(float(far_slope) + 1.0) > slope_tol:
+        fail += 1
+    if near_slope is not None and abs(float(near_slope) + 1.0) > slope_tol:
+        fail += 1
+    if float(metrics.get("proxy_gateC_spurious_fraction", 0.0)) > 0.05:
+        fail += 1
+    stability_tol = float(thresholds.get("stability", 5e-2))
+    if float(metrics.get("proxy_gateD_rel_change", 0.0)) > stability_tol:
+        fail += 1
+    return fail
+
+
+def _proxyA_effective_ratio(metrics: Dict[str, Any], cap: float, transform: str) -> float:
+    a_raw = float(metrics.get("proxy_gateA_worst_ratio", float("inf")))
+    if not math.isfinite(a_raw):
+        a_raw = cap
+    a_clamped = min(a_raw, cap)
+    if transform == "logcap":
+        return math.log10(1.0 + a_clamped)
+    return a_clamped
+
+
+def _proxy_score(
+    metrics: Dict[str, Any],
+    *,
+    a_weight: float,
+    a_cap: float,
+    a_transform: str,
+) -> float:
     if not metrics:
         return float("inf")
-    a = float(metrics.get("proxy_gateA_worst_ratio", 1e9))
+    a_eff = _proxyA_effective_ratio(metrics, a_cap, a_transform)
     b = max(
         float(metrics.get("proxy_gateB_max_v_jump", 0.0)),
         float(metrics.get("proxy_gateB_max_d_jump", 0.0)),
@@ -465,7 +505,7 @@ def _proxy_score(metrics: Dict[str, Any]) -> float:
     spurious = float(metrics.get("proxy_gateC_spurious_fraction", 0.0))
     c = abs(far_slope + 1.0) + abs(near_slope + 1.0) + spurious * 10.0
     d = float(metrics.get("proxy_gateD_rel_change", 0.0))
-    return a * 10.0 + b + c + d
+    return a_weight * a_eff + b + c + d
 
 
 def build_proxy_stability_points(
@@ -1041,6 +1081,18 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     use_reference_potential = bool(run_cfg.get("use_reference_potential", False))
     use_gate_proxies = bool(run_cfg.get("use_gate_proxies", False))
     use_gateA_proxy = bool(run_cfg.get("use_gateA_proxy", use_gate_proxies))
+    proxyA_transform = str(run_cfg.get("proxyA_transform", "logcap")).strip().lower()
+    if not proxyA_transform:
+        proxyA_transform = "logcap"
+    proxyA_cap = float(run_cfg.get("proxyA_cap", 1e6))
+    if not math.isfinite(proxyA_cap) or proxyA_cap <= 0.0:
+        proxyA_cap = 1e6
+    proxyA_weight = float(run_cfg.get("proxyA_weight", 1.0))
+    if not math.isfinite(proxyA_weight):
+        proxyA_weight = 1.0
+    proxy_ranking_mode = str(run_cfg.get("proxy_ranking_mode", "balanced")).strip().lower()
+    if proxy_ranking_mode not in {"balanced", "a_first"}:
+        proxy_ranking_mode = "balanced"
     layered_sampling = bool(run_cfg.get("layered_sampling", True))
     layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
     layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
@@ -1799,20 +1851,50 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                         )
                         proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
-                        proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                        proxy_metrics["proxy_score"] = _proxy_score(
+                            proxy_metrics,
+                            a_weight=proxyA_weight,
+                            a_cap=proxyA_cap,
+                            a_transform=proxyA_transform,
+                        )
                         _count_preflight("proxy_computed_count")
                         proxy_metrics_by_idx[idx] = proxy_metrics
                         if idx < len(fast_metrics):
                             fast_metrics[idx].update(proxy_metrics)
 
-                    top_fast_idx = sorted(
-                        top_fast_idx,
-                        key=lambda i: (
-                            _proxy_fail_count(proxy_metrics_by_idx.get(i, {}), verify_plan.thresholds),
-                            _proxy_score(proxy_metrics_by_idx.get(i, {})),
-                            fast_scores[i],
-                        ),
-                    )[: max(1, min(topK_fast, len(top_fast_idx)))]
+                    if proxy_ranking_mode == "balanced":
+                        top_fast_idx = sorted(
+                            top_fast_idx,
+                            key=lambda i: (
+                                _proxy_fail_count_noA(proxy_metrics_by_idx.get(i, {}), verify_plan.thresholds),
+                                _proxyA_effective_ratio(
+                                    proxy_metrics_by_idx.get(i, {}),
+                                    proxyA_cap,
+                                    proxyA_transform,
+                                ),
+                                _proxy_score(
+                                    proxy_metrics_by_idx.get(i, {}),
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                ),
+                                fast_scores[i],
+                            ),
+                        )[: max(1, min(topK_fast, len(top_fast_idx)))]
+                    else:
+                        top_fast_idx = sorted(
+                            top_fast_idx,
+                            key=lambda i: (
+                                _proxy_fail_count(proxy_metrics_by_idx.get(i, {}), verify_plan.thresholds),
+                                _proxy_score(
+                                    proxy_metrics_by_idx.get(i, {}),
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                ),
+                                fast_scores[i],
+                            ),
+                        )[: max(1, min(topK_fast, len(top_fast_idx)))]
                 if cache_hold_matrices and hold_cache:
                     keep = set(top_fast_idx)
                     hold_cache = {idx: mat for idx, mat in hold_cache.items() if idx in keep}
@@ -2015,7 +2097,12 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     )
                                 )
                                 proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
-                                proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                                proxy_metrics["proxy_score"] = _proxy_score(
+                                    proxy_metrics,
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                )
                                 _count_preflight("proxy_computed_count")
                                 metrics.update(proxy_metrics)
                             score_mid = (
@@ -2204,13 +2291,37 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     )
 
                 if use_gate_proxies and is_layered:
-                    fitted_candidates.sort(
-                        key=lambda x: (
-                            _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
-                            _proxy_score(x.get("metrics", {})),
-                            x["score"],
+                    if proxy_ranking_mode == "balanced":
+                        fitted_candidates.sort(
+                            key=lambda x: (
+                                _proxy_fail_count_noA(x.get("metrics", {}), verify_plan.thresholds),
+                                _proxyA_effective_ratio(
+                                    x.get("metrics", {}),
+                                    proxyA_cap,
+                                    proxyA_transform,
+                                ),
+                                _proxy_score(
+                                    x.get("metrics", {}),
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                ),
+                                x["score"],
+                            )
                         )
-                    )
+                    else:
+                        fitted_candidates.sort(
+                            key=lambda x: (
+                                _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
+                                _proxy_score(
+                                    x.get("metrics", {}),
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                ),
+                                x["score"],
+                            )
+                        )
                 else:
                     fitted_candidates.sort(key=lambda x: x["score"])
                 top_mid = fitted_candidates[: max(1, min(topk_mid, len(fitted_candidates)))]
@@ -2243,14 +2354,39 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     top_final = top_mid[: max(1, min(topk_final, len(top_mid)))]
 
                 if use_gate_proxies and is_layered and top_final:
-                    top_final = sorted(
-                        top_final,
-                        key=lambda x: (
-                            _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
-                            _proxy_score(x.get("metrics", {})),
-                            x.get("score_hi", x["score"]),
-                        ),
-                    )
+                    if proxy_ranking_mode == "balanced":
+                        top_final = sorted(
+                            top_final,
+                            key=lambda x: (
+                                _proxy_fail_count_noA(x.get("metrics", {}), verify_plan.thresholds),
+                                _proxyA_effective_ratio(
+                                    x.get("metrics", {}),
+                                    proxyA_cap,
+                                    proxyA_transform,
+                                ),
+                                _proxy_score(
+                                    x.get("metrics", {}),
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                ),
+                                x.get("score_hi", x["score"]),
+                            ),
+                        )
+                    else:
+                        top_final = sorted(
+                            top_final,
+                            key=lambda x: (
+                                _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
+                                _proxy_score(
+                                    x.get("metrics", {}),
+                                    a_weight=proxyA_weight,
+                                    a_cap=proxyA_cap,
+                                    a_transform=proxyA_transform,
+                                ),
+                                x.get("score_hi", x["score"]),
+                            ),
+                        )
 
                 if refine_enabled and is_layered and top_final:
                     if refine_targets == "holdout":

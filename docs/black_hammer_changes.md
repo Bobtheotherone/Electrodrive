@@ -58,3 +58,12 @@
   - `pytest -q tests/test_discovery_proxy_points.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_fast_weights_stability.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_reference_decomposition.py -vv -rs --maxfail=1`
+
+## Phase 4: Gate A proxy alignment + balanced ranking
+- change: aligned `proxy_gateA` autograd/FD sampling with verifier Gate A and added method/point-count diagnostics.
+- change: added bounded Gate A proxy transform (`run.proxyA_transform`, `run.proxyA_cap`, `run.proxyA_weight`) and balanced proxy ranking (`run.proxy_ranking_mode`).
+- why: prevent proxy_gateA saturation from dominating ranking and restore B/C/D frontier search before optimizing Gate A.
+- reproduce:
+  - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_proxyA_transform.py -vv -rs --maxfail=1`
+- validate: proxy Gate A diagnostics report method/n_used, transform remains finite for extreme ratios, and balanced mode prefers candidates that pass B/C/D.

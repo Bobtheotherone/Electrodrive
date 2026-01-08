@@ -43,12 +43,26 @@ from electrodrive.images.geo_encoder import GeoEncoder
 from electrodrive.images.learned_generator import SimpleGeoEncoder
 from electrodrive.images.search import ImageSystem, assemble_basis_matrix, solve_sparse
 from electrodrive.orchestration.parser import CanonicalSpec
+from electrodrive.learn.collocation import compute_layered_reference_potential
+from electrodrive.experiments.reference_math import add_reference, stable_subtract_reference
 from electrodrive.verify.oracle_backends.f0 import F0AnalyticOracleBackend
 from electrodrive.verify.oracle_backends.f1_sommerfeld import F1SommerfeldOracleBackend
 from electrodrive.verify.oracle_types import CachePolicy, OracleFidelity, OracleQuery, OracleQuantity
 from electrodrive.verify.utils import normalize_dtype
 from electrodrive.verify.utils import sha256_json, utc_now_iso
 from electrodrive.verify.verifier import VerificationPlan, Verifier
+from electrodrive.verify.gate_proxies import proxy_gateA, proxy_gateB, proxy_gateC, proxy_gateD
+from electrodrive.experiments.layered_sampling import (
+    parse_layered_interfaces,
+    sample_layered_interior,
+    sample_layered_interface_pairs,
+)
+from electrodrive.experiments.preflight import (
+    RunCounters,
+    summarize_to_stdout,
+    write_first_offender,
+    write_preflight_report,
+)
 
 
 class _NullLogger:
@@ -121,6 +135,10 @@ def _set_perf_flags(cfg: Dict[str, Any]) -> None:
     torch.backends.cuda.matmul.allow_tf32 = use_tf32
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
+
+
+def should_early_exit(allow_not_ready: bool, ramp_abort: bool) -> bool:
+    return bool(ramp_abort) and not bool(allow_not_ready)
 
 
 def _make_run_dir(tag: str) -> Path:
@@ -247,6 +265,71 @@ def _sample_points_gpu(
     return bc_points, interior
 
 
+def _sample_points_layered(
+    spec: CanonicalSpec,
+    *,
+    n_boundary: int,
+    n_interior: int,
+    domain_scale: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+    exclusion_radius: float,
+    interface_band: float,
+    interface_delta: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    interfaces = parse_layered_interfaces(spec)
+    if not interfaces:
+        return _sample_points_gpu(
+            spec,
+            n_boundary=n_boundary,
+            n_interior=n_interior,
+            domain_scale=domain_scale,
+            device=device,
+            dtype=dtype,
+            seed=seed,
+            exclusion_radius=exclusion_radius,
+        )
+
+    n_interfaces = max(1, len(interfaces))
+    n_xy = max(1, n_boundary // (2 * n_interfaces))
+    bc_up, bc_dn = sample_layered_interface_pairs(
+        spec,
+        n_xy,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        delta=interface_delta,
+        domain_scale=domain_scale,
+    )
+    bc_points = torch.cat([bc_up, bc_dn], dim=0)
+    if bc_points.shape[0] < n_boundary:
+        extra_pairs = int(math.ceil((n_boundary - bc_points.shape[0]) / 2))
+        extra_up, extra_dn = sample_layered_interface_pairs(
+            spec,
+            extra_pairs,
+            device=device,
+            dtype=dtype,
+            seed=seed + 11,
+            delta=interface_delta,
+            domain_scale=domain_scale,
+        )
+        bc_points = torch.cat([bc_points, extra_up, extra_dn], dim=0)
+    bc_points = bc_points[:n_boundary].contiguous()
+
+    interior = sample_layered_interior(
+        spec,
+        n_interior,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        exclusion_radius=exclusion_radius,
+        interface_band=interface_band,
+        domain_scale=domain_scale,
+    )
+    return bc_points, interior
+
+
 def _sample_interior_points(
     spec: CanonicalSpec,
     *,
@@ -330,13 +413,97 @@ def _laplacian_fd(eval_fn: Any, pts: torch.Tensor, h: float) -> torch.Tensor:
     return lap
 
 
-def _fast_weights(A: torch.Tensor, b: torch.Tensor, reg: float) -> torch.Tensor:
+def _add_reference(pred: torch.Tensor, ref: Optional[torch.Tensor]) -> torch.Tensor:
+    return add_reference(pred, ref)
+
+
+def _proxy_fail_count(metrics: Dict[str, Any], thresholds: Dict[str, float]) -> int:
+    if not metrics:
+        return 0
+    fail = 0
+    lap_tol = float(thresholds.get("laplacian_linf", 5e-3))
+    status = metrics.get("proxy_gateA_status")
+    if status == "fail":
+        fail += 1
+    elif status is None:
+        linf = metrics.get("proxy_gateA_linf")
+        l2 = metrics.get("proxy_gateA_l2")
+        if linf is not None and float(linf) > lap_tol:
+            fail += 1
+        elif l2 is not None and float(l2) > lap_tol:
+            fail += 1
+    bc_tol = float(thresholds.get("bc_continuity", 5e-3))
+    if float(metrics.get("proxy_gateB_max_v_jump", 0.0)) > bc_tol or float(
+        metrics.get("proxy_gateB_max_d_jump", 0.0)
+    ) > bc_tol:
+        fail += 1
+    slope_tol = float(thresholds.get("slope_tol", 0.15))
+    far_slope = metrics.get("proxy_gateC_far_slope")
+    near_slope = metrics.get("proxy_gateC_near_slope")
+    if far_slope is not None and abs(float(far_slope) + 1.0) > slope_tol:
+        fail += 1
+    if near_slope is not None and abs(float(near_slope) + 1.0) > slope_tol:
+        fail += 1
+    if float(metrics.get("proxy_gateC_spurious_fraction", 0.0)) > 0.05:
+        fail += 1
+    stability_tol = float(thresholds.get("stability", 5e-2))
+    if float(metrics.get("proxy_gateD_rel_change", 0.0)) > stability_tol:
+        fail += 1
+    return fail
+
+
+def _proxy_score(metrics: Dict[str, Any]) -> float:
+    if not metrics:
+        return float("inf")
+    a = float(metrics.get("proxy_gateA_worst_ratio", 1e9))
+    b = max(
+        float(metrics.get("proxy_gateB_max_v_jump", 0.0)),
+        float(metrics.get("proxy_gateB_max_d_jump", 0.0)),
+    )
+    far_slope = float(metrics.get("proxy_gateC_far_slope", 0.0))
+    near_slope = float(metrics.get("proxy_gateC_near_slope", 0.0))
+    spurious = float(metrics.get("proxy_gateC_spurious_fraction", 0.0))
+    c = abs(far_slope + 1.0) + abs(near_slope + 1.0) + spurious * 10.0
+    d = float(metrics.get("proxy_gateD_rel_change", 0.0))
+    return a * 10.0 + b + c + d
+
+
+def build_proxy_stability_points(
+    bc_hold: torch.Tensor,
+    interior_hold: torch.Tensor,
+    n_points: int,
+) -> torch.Tensor:
+    n = max(1, int(n_points))
+    if bc_hold.numel() == 0:
+        return interior_hold[:n]
+    if interior_hold.numel() == 0:
+        return bc_hold[:n]
+    n_bc = min(bc_hold.shape[0], n // 2)
+    n_in = min(interior_hold.shape[0], n - n_bc)
+    if n_bc == 0:
+        return interior_hold[:n_in]
+    if n_in == 0:
+        return bc_hold[:n_bc]
+    return torch.cat([bc_hold[:n_bc], interior_hold[:n_in]], dim=0)
+
+
+def _fast_weights(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    reg: float,
+    *,
+    normalize: bool = True,
+) -> torch.Tensor:
     if A.numel() == 0:
         return torch.zeros((0,), device=A.device, dtype=A.dtype)
     k = A.shape[1]
     if k == 0:
         return torch.zeros((0,), device=A.device, dtype=A.dtype)
-    A_scaled, col_norms = _scale_columns(A)
+    if normalize:
+        A_scaled, col_norms = _scale_columns(A)
+    else:
+        A_scaled = A
+        col_norms = torch.ones((k,), device=A.device, dtype=A.dtype)
     ata = A_scaled.transpose(0, 1).matmul(A_scaled)
     ata = ata + reg * torch.eye(k, device=A.device, dtype=A.dtype)
     atb = A_scaled.transpose(0, 1).matmul(b)
@@ -355,6 +522,20 @@ def _scale_columns(A: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, to
         return A, torch.ones((A.shape[1],), device=A.device, dtype=A.dtype)
     col_norms = torch.linalg.norm(A, dim=0).clamp_min(eps)
     return A / col_norms, col_norms
+
+
+def _nonfinite_count(t: torch.Tensor) -> int:
+    return int(torch.count_nonzero(~torch.isfinite(t)).item())
+
+
+def _tensor_absmax(t: Optional[torch.Tensor]) -> float:
+    if t is None or t.numel() == 0:
+        return float("nan")
+    finite = torch.isfinite(t)
+    if not torch.any(finite):
+        return float("nan")
+    vals = torch.abs(t[finite])
+    return float(torch.max(vals).item())
 
 
 def _mean_abs(x: torch.Tensor) -> float:
@@ -591,7 +772,10 @@ def _seed_layered_templates(
     *,
     max_steps: int,
     count: int = 8,
+    allow_real_primitives: bool = True,
 ) -> List[Program]:
+    if not allow_real_primitives:
+        return []
     if getattr(spec, "BCs", "") != "dielectric_interfaces":
         return []
     layers = getattr(spec, "dielectrics", None) or []
@@ -680,6 +864,18 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
     run_cfg = cfg.get("run", {}) if isinstance(cfg.get("run", {}), dict) else {}
     tag = str(run_cfg.get("tag", "discovery_v0")).strip() or "discovery_v0"
+    preflight_mode_raw = str(run_cfg.get("preflight_mode", "")).strip().lower()
+    if not preflight_mode_raw:
+        preflight_enabled = bool(run_cfg.get("preflight_enabled", False))
+        preflight_mode = "full" if preflight_enabled else "off"
+    else:
+        if preflight_mode_raw not in {"off", "lite", "full"}:
+            raise ValueError(f"Unknown preflight_mode: {preflight_mode_raw}")
+        preflight_mode = preflight_mode_raw
+    preflight_enabled = preflight_mode != "off"
+    preflight_full = preflight_mode == "full"
+    preflight_lite = preflight_mode == "lite"
+    preflight_out = str(run_cfg.get("preflight_out", "preflight.json")).strip() or "preflight.json"
     run_dir = _make_run_dir(tag)
     dcim_cache_path = run_dir / "artifacts" / "dcim_cache.jsonl"
 
@@ -839,8 +1035,19 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         dcim_block_max = 0
     dcim_block_weight = float(run_cfg.get("dcim_block_weight", 1.0))
     ramp_check = bool(run_cfg.get("ramp_check", False))
+    allow_not_ready = bool(run_cfg.get("allow_not_ready", False))
     ramp_patience = int(run_cfg.get("ramp_patience_gens", 3))
     ramp_min_rel_improve = float(run_cfg.get("ramp_min_rel_improvement", 0.10))
+    use_reference_potential = bool(run_cfg.get("use_reference_potential", False))
+    use_gate_proxies = bool(run_cfg.get("use_gate_proxies", False))
+    use_gateA_proxy = bool(run_cfg.get("use_gateA_proxy", use_gate_proxies))
+    layered_sampling = bool(run_cfg.get("layered_sampling", True))
+    layered_exclusion_radius = float(run_cfg.get("layered_exclusion_radius", 5e-3))
+    layered_interface_delta = float(run_cfg.get("layered_interface_delta", 5e-3))
+    layered_interface_band = float(run_cfg.get("layered_interface_band", layered_interface_delta))
+    layered_stability_delta = float(run_cfg.get("layered_stability_delta", 1e-2))
+    layered_prefer_dcim = bool(run_cfg.get("layered_prefer_dcim", True))
+    layered_allow_real_primitives = bool(run_cfg.get("layered_allow_real_primitives", False))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
     refine_steps = int(run_cfg.get("refine_steps", 12))
     refine_lr = float(run_cfg.get("refine_lr", 5e-2))
@@ -890,29 +1097,87 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     verify_plan.oracle_budget = dict(verify_plan.oracle_budget)
     verify_plan.oracle_budget["allow_cpu_fallback"] = False
     ramp_abort = False
+    config_hash = sha256_json(cfg)
+    preflight_counters = RunCounters() if preflight_enabled else None
+    per_gen_preflight: List[Dict[str, Any]] = []
+    gen_counters: Optional[RunCounters] = None
+    first_offender_written = False
+
+    def _count_preflight(key: str, n: int = 1) -> None:
+        if preflight_counters is None:
+            return
+        preflight_counters.add(key, n)
+        if gen_counters is not None:
+            gen_counters.add(key, n)
+
+    def _maybe_write_first_offender(
+        *,
+        gen_idx: int,
+        program_idx: int,
+        program: Any,
+        elements: Sequence[ImageBasisElement],
+        A_train: Optional[torch.Tensor],
+        V_train: Optional[torch.Tensor],
+        weights: Optional[torch.Tensor],
+        pred_hold: Optional[torch.Tensor],
+        reason: str,
+    ) -> None:
+        nonlocal first_offender_written
+        if preflight_counters is None or first_offender_written:
+            return
+        payload = {
+            "gen": int(gen_idx),
+            "program_idx": int(program_idx),
+            "reason": str(reason),
+            "program_repr": repr(program),
+            "program": _program_to_json(program),
+            "element_types": _element_type_hist(elements),
+            "flags": {
+                "use_reference_potential": bool(use_ref),
+                "use_gate_proxies": bool(use_gate_proxies),
+                "layered_prefer_dcim": bool(layered_prefer_dcim),
+            },
+            "stats": {
+                "A_train_absmax": _tensor_absmax(A_train),
+                "V_train_absmax": _tensor_absmax(V_train),
+                "weights_absmax": _tensor_absmax(weights),
+                "pred_hold_absmax": _tensor_absmax(pred_hold),
+            },
+        }
+        if write_first_offender(run_dir, payload):
+            first_offender_written = True
 
     fixed_spec_obj: Optional[CanonicalSpec] = None
-    fixed_spec_meta: Optional[Dict[str, Any]] = None
     if fixed_spec:
         for _ in range(fixed_spec_index + 1):
             fixed_spec_obj = sampler.sample()
         if fixed_spec_obj is None:
             raise RuntimeError("fixed_spec enabled but no spec could be sampled")
-        fixed_spec_meta = _spec_metadata_from_spec(fixed_spec_obj)
 
     for gen in range(generations):
         start_gen = time.perf_counter()
+        if preflight_enabled:
+            gen_counters = RunCounters()
+        else:
+            gen_counters = None
         if fixed_spec and fixed_spec_obj is not None:
             spec = fixed_spec_obj
-            spec_meta = fixed_spec_meta or _spec_metadata_from_spec(spec)
         else:
             spec = sampler.sample()
-            spec_meta = _spec_metadata_from_spec(spec)
         spec_hash = sha256_json(spec.to_json())
         spec_hashes.append(spec_hash)
         domain_scale = float(spec_cfg.get("domain_scale", 1.0))
         seed_gen = seed + gen * 13
         is_layered = getattr(spec, "BCs", "") == "dielectric_interfaces"
+        use_ref = bool(use_reference_potential and is_layered)
+        prefer_dcim = bool(layered_prefer_dcim and is_layered)
+        allow_real_primitives = bool(layered_allow_real_primitives or not prefer_dcim)
+        if prefer_dcim and not use_param_sampler and not layered_allow_real_primitives:
+            allow_real_primitives = True
+        spec_meta = _spec_metadata_from_spec(
+            spec,
+            extra_overrides={"allow_real_primitives": allow_real_primitives},
+        )
 
         torch.cuda.synchronize()
         retry = True
@@ -921,24 +1186,50 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             attempt += 1
             retry = False
             try:
-                bc_train, interior_train = _sample_points_gpu(
-                    spec,
-                    n_boundary=backoff.bc_train,
-                    n_interior=backoff.interior_train,
-                    domain_scale=domain_scale,
-                    device=device,
-                    dtype=torch.float32,
-                    seed=seed_gen + 1,
-                )
-                bc_hold, interior_hold = _sample_points_gpu(
-                    spec,
-                    n_boundary=backoff.bc_holdout,
-                    n_interior=backoff.interior_holdout,
-                    domain_scale=domain_scale,
-                    device=device,
-                    dtype=torch.float32,
-                    seed=seed_gen + 7,
-                )
+                if is_layered and layered_sampling:
+                    bc_train, interior_train = _sample_points_layered(
+                        spec,
+                        n_boundary=backoff.bc_train,
+                        n_interior=backoff.interior_train,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 1,
+                        exclusion_radius=layered_exclusion_radius,
+                        interface_band=layered_interface_band,
+                        interface_delta=layered_interface_delta,
+                    )
+                    bc_hold, interior_hold = _sample_points_layered(
+                        spec,
+                        n_boundary=backoff.bc_holdout,
+                        n_interior=backoff.interior_holdout,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 7,
+                        exclusion_radius=layered_exclusion_radius,
+                        interface_band=layered_interface_band,
+                        interface_delta=layered_interface_delta,
+                    )
+                else:
+                    bc_train, interior_train = _sample_points_gpu(
+                        spec,
+                        n_boundary=backoff.bc_train,
+                        n_interior=backoff.interior_train,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 1,
+                    )
+                    bc_hold, interior_hold = _sample_points_gpu(
+                        spec,
+                        n_boundary=backoff.bc_holdout,
+                        n_interior=backoff.interior_holdout,
+                        domain_scale=domain_scale,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 7,
+                    )
 
                 assert_cuda_tensor(bc_train, "bc_train")
                 assert_cuda_tensor(interior_train, "interior_train")
@@ -961,12 +1252,108 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 V_in_hold_mid, _ = _oracle_eval(oracle_mid, spec, interior_hold, dtype=mid_dtype)
                 V_bc_hold_mid = V_bc_hold_mid.to(dtype=bc_hold.dtype)
                 V_in_hold_mid = V_in_hold_mid.to(dtype=interior_hold.dtype)
+                bc_train_mask = torch.isfinite(V_bc_train)
+                in_train_mask = torch.isfinite(V_in_train)
+                if not torch.all(bc_train_mask):
+                    bc_train = bc_train[bc_train_mask]
+                    V_bc_train = V_bc_train[bc_train_mask]
+                if not torch.all(in_train_mask):
+                    interior_train = interior_train[in_train_mask]
+                    V_in_train = V_in_train[in_train_mask]
+                bc_hold_mask = torch.isfinite(V_bc_hold) & torch.isfinite(V_bc_hold_mid)
+                in_hold_mask = torch.isfinite(V_in_hold) & torch.isfinite(V_in_hold_mid)
+                if not torch.all(bc_hold_mask):
+                    bc_hold = bc_hold[bc_hold_mask]
+                    V_bc_hold = V_bc_hold[bc_hold_mask]
+                    V_bc_hold_mid = V_bc_hold_mid[bc_hold_mask]
+                if not torch.all(in_hold_mask):
+                    interior_hold = interior_hold[in_hold_mask]
+                    V_in_hold = V_in_hold[in_hold_mask]
+                    V_in_hold_mid = V_in_hold_mid[in_hold_mask]
+                if bc_train.shape[0] + interior_train.shape[0] == 0:
+                    raise RuntimeError("No finite training targets after filtering.")
+                if bc_hold.shape[0] + interior_hold.shape[0] == 0:
+                    raise RuntimeError("No finite holdout targets after filtering.")
                 oracle_bc_mean_abs = _mean_abs(V_bc_hold_mid) if V_bc_hold_mid is not None else _mean_abs(V_bc_hold)
                 oracle_in_mean_abs = _mean_abs(V_in_hold_mid) if V_in_hold_mid is not None else _mean_abs(V_in_hold)
                 lap_denom = _laplacian_denom(oracle_in_mean_abs, oracle_bc_mean_abs)
 
+                V_ref_bc_train = None
+                V_ref_in_train = None
+                V_ref_bc_hold = None
+                V_ref_in_hold = None
+                V_ref_train = None
+                V_ref_hold = None
+                V_bc_train_corr = V_bc_train
+                V_in_train_corr = V_in_train
+                V_bc_hold_corr = V_bc_hold
+                V_in_hold_corr = V_in_hold
+                V_bc_hold_mid_corr = V_bc_hold_mid
+                V_in_hold_mid_corr = V_in_hold_mid
+                if use_ref:
+                    V_ref_bc_train64 = compute_layered_reference_potential(
+                        spec,
+                        bc_train.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_in_train64 = compute_layered_reference_potential(
+                        spec,
+                        interior_train.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_bc_hold64 = compute_layered_reference_potential(
+                        spec,
+                        bc_hold.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_in_hold64 = compute_layered_reference_potential(
+                        spec,
+                        interior_hold.to(dtype=torch.float64),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                    V_ref_bc_train = V_ref_bc_train64.to(dtype=bc_train.dtype)
+                    V_ref_in_train = V_ref_in_train64.to(dtype=interior_train.dtype)
+                    V_ref_bc_hold = V_ref_bc_hold64.to(dtype=bc_hold.dtype)
+                    V_ref_in_hold = V_ref_in_hold64.to(dtype=interior_hold.dtype)
+                    V_ref_train = torch.cat([V_ref_bc_train, V_ref_in_train], dim=0)
+                    V_ref_hold = torch.cat([V_ref_bc_hold, V_ref_in_hold], dim=0)
+                    V_bc_train_corr = stable_subtract_reference(
+                        V_bc_train,
+                        V_ref_bc_train64,
+                        out_dtype=bc_train.dtype,
+                    )
+                    V_in_train_corr = stable_subtract_reference(
+                        V_in_train,
+                        V_ref_in_train64,
+                        out_dtype=interior_train.dtype,
+                    )
+                    V_bc_hold_corr = stable_subtract_reference(
+                        V_bc_hold,
+                        V_ref_bc_hold64,
+                        out_dtype=bc_hold.dtype,
+                    )
+                    V_in_hold_corr = stable_subtract_reference(
+                        V_in_hold,
+                        V_ref_in_hold64,
+                        out_dtype=interior_hold.dtype,
+                    )
+                    V_bc_hold_mid_corr = stable_subtract_reference(
+                        V_bc_hold_mid,
+                        V_ref_bc_hold64,
+                        out_dtype=bc_hold.dtype,
+                    )
+                    V_in_hold_mid_corr = stable_subtract_reference(
+                        V_in_hold_mid,
+                        V_ref_in_hold64,
+                        out_dtype=interior_hold.dtype,
+                    )
+
                 X_train = torch.cat([bc_train, interior_train], dim=0)
-                V_train = torch.cat([V_bc_train, V_in_train], dim=0)
+                V_train = torch.cat([V_bc_train_corr, V_in_train_corr], dim=0)
                 is_boundary = torch.cat(
                     [torch.ones(bc_train.shape[0], device=device, dtype=torch.bool),
                      torch.zeros(interior_train.shape[0], device=device, dtype=torch.bool)],
@@ -975,11 +1362,22 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 X_hold = torch.cat([bc_hold, interior_hold], dim=0)
                 V_hold = torch.cat([V_bc_hold, V_in_hold], dim=0)
                 V_hold_mid = torch.cat([V_bc_hold_mid, V_in_hold_mid], dim=0)
+                V_hold_corr = torch.cat([V_bc_hold_corr, V_in_hold_corr], dim=0)
+                V_hold_mid_corr = torch.cat([V_bc_hold_mid_corr, V_in_hold_mid_corr], dim=0)
                 is_boundary_hold = torch.cat(
                     [torch.ones(bc_hold.shape[0], device=device, dtype=torch.bool),
                      torch.zeros(interior_hold.shape[0], device=device, dtype=torch.bool)],
                     dim=0,
                 )
+                v_train_nonfinite_val = 0
+                v_train_total_val = 0
+                v_train_has_nonfinite = False
+                if preflight_counters is not None:
+                    v_train_nonfinite_val = _nonfinite_count(V_train)
+                    v_train_total_val = int(V_train.numel())
+                    v_train_has_nonfinite = v_train_nonfinite_val > 0
+                else:
+                    v_train_has_nonfinite = not torch.isfinite(V_train).all().item()
 
                 spec_embedding, _, _ = geo_encoder.encode(spec, device=device, dtype=torch.float32)
                 spec_embedding = spec_embedding.to(device=device, dtype=torch.float32)
@@ -997,10 +1395,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 programs = [state.program for state in rollout.final_states or ()]
                 if sanity_force_baseline and not use_param_sampler:
                     programs.extend(_baseline_programs_for_spec(spec))
-                seeded = _seed_layered_templates(spec, max_steps=max_steps, count=8)
+                seeded = _seed_layered_templates(
+                    spec,
+                    max_steps=max_steps,
+                    count=8,
+                    allow_real_primitives=allow_real_primitives,
+                )
                 if seeded:
                     programs.extend(seeded)
 
+                _count_preflight("sampled_programs_total", len(programs))
                 if not programs:
                     raise RuntimeError("No programs sampled; aborting generation.")
                 program_lengths = [len(getattr(p, "nodes", []) or []) for p in programs]
@@ -1035,33 +1439,40 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     end = min(len(programs), start + score_microbatch)
                     for idx in range(start, end):
                         program = programs[idx]
-                        if payload is not None:
-                            per_payload = payload.for_program(idx)
-                            elements, _, meta = compile_program_to_basis(
-                                program,
-                                spec,
-                                device,
-                                param_payload=per_payload,
-                                strict=True,
-                            )
-                        else:
-                            elements, _, meta = compile_program_to_basis(
-                                program,
-                                spec,
-                                device,
-                                strict=False,
-                            )
+                        try:
+                            if payload is not None:
+                                per_payload = payload.for_program(idx)
+                                elements, _, meta = compile_program_to_basis(
+                                    program,
+                                    spec,
+                                    device,
+                                    param_payload=per_payload,
+                                    strict=True,
+                                )
+                            else:
+                                elements, _, meta = compile_program_to_basis(
+                                    program,
+                                    spec,
+                                    device,
+                                    strict=False,
+                                )
+                        except Exception:
+                            _count_preflight("compiled_failed")
+                            raise
                         if not elements:
+                            _count_preflight("compiled_empty_basis")
                             fast_scores.append(float("inf"))
                             fast_metrics.append({"empty": True, "complex_count": 0, "frac_complex": 0.0})
                             n_terms_list.append(0)
                             complex_counts.append(0)
                             continue
+                        _count_preflight("compiled_ok")
                         complex_count = _count_complex_terms(elements, device=device)
                         n_terms = int(len(elements))
                         frac_complex = float(complex_count) / max(1, n_terms)
                         complex_counts.append(complex_count)
                         if is_layered and not (complex_count >= 2 or frac_complex >= 0.25):
+                            _count_preflight("complex_guard_failed")
                             fast_scores.append(float("inf"))
                             fast_metrics.append(
                                 {
@@ -1072,19 +1483,174 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
-                        A_train = assemble_basis_matrix(elements, X_train)
-                        A_hold = assemble_basis_matrix(elements, X_hold)
+                        try:
+                            A_train = assemble_basis_matrix(elements, X_train)
+                            A_hold = assemble_basis_matrix(elements, X_hold)
+                        except Exception:
+                            _count_preflight("assembled_failed")
+                            raise
+                        _count_preflight("assembled_ok")
                         assert_cuda_tensor(A_train, "A_train_fast")
                         assert_cuda_tensor(A_hold, "A_hold_fast")
                         if cache_hold_matrices:
                             hold_cache[idx] = A_hold
-                        weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
-                        pred_hold = A_hold.matmul(weights)
+                        a_train_nonfinite = 0
+                        a_hold_nonfinite = 0
+                        if preflight_full:
+                            a_train_nonfinite = _nonfinite_count(A_train)
+                            a_hold_nonfinite = _nonfinite_count(A_hold)
+                            _count_preflight("a_train_nonfinite_count", a_train_nonfinite)
+                            _count_preflight("a_train_total", int(A_train.numel()))
+                            _count_preflight("a_hold_nonfinite_count", a_hold_nonfinite)
+                            _count_preflight("a_hold_total", int(A_hold.numel()))
+                            _count_preflight("v_train_nonfinite_count", v_train_nonfinite_val)
+                            _count_preflight("v_train_total", v_train_total_val)
+                        elif preflight_enabled:
+                            _count_preflight("v_train_nonfinite_count", v_train_nonfinite_val)
+                            _count_preflight("v_train_total", v_train_total_val)
+                        else:
+                            if not torch.isfinite(A_train).all().item():
+                                a_train_nonfinite = 1
+                            if not torch.isfinite(A_hold).all().item():
+                                a_hold_nonfinite = 1
+                        if (preflight_full and (a_train_nonfinite > 0 or a_hold_nonfinite > 0)) or v_train_has_nonfinite:
+                            _count_preflight("solved_failed")
+                            if v_train_has_nonfinite:
+                                reason = "v_train_nonfinite"
+                            elif a_train_nonfinite > 0:
+                                reason = "a_train_nonfinite"
+                            else:
+                                reason = "a_hold_nonfinite"
+                            _maybe_write_first_offender(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=None,
+                                pred_hold=None,
+                                reason=reason,
+                            )
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "nonfinite_matrix": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
+
+                        weights = _fast_weights(
+                            A_train,
+                            V_train,
+                            reg=float(solver_cfg.get("reg_l1", 1e-3)),
+                            normalize=bool(solver_cfg.get("fast_column_normalize", True)),
+                        )
+                        weights_nonfinite = 0
+                        if preflight_counters is not None:
+                            _count_preflight("weights_total", int(weights.numel()))
+                            if weights.numel() > 0:
+                                weights_nonfinite = _nonfinite_count(weights)
+                                _count_preflight("weights_nonfinite_count", weights_nonfinite)
+                        if preflight_counters is not None:
+                            if weights.numel() == 0 or weights_nonfinite > 0:
+                                _count_preflight("solved_failed")
+                                if weights.numel() == 0:
+                                    _count_preflight("weights_empty")
+                            else:
+                                _count_preflight("solved_ok")
+                        if weights.numel() == 0:
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "weights_empty": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
+                        if weights_nonfinite > 0 or not torch.isfinite(weights).all().item():
+                            _maybe_write_first_offender(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=weights,
+                                pred_hold=None,
+                                reason="weights_nonfinite",
+                            )
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "weights_nonfinite": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
+                        pred_hold_corr = A_hold.matmul(weights)
+                        pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
+                        if preflight_counters is not None:
+                            nonfinite = _nonfinite_count(pred_hold)
+                            _count_preflight("nonfinite_pred_count", int(nonfinite))
+                            _count_preflight("nonfinite_pred_total", int(pred_hold.numel()))
+                            if nonfinite > 0:
+                                _maybe_write_first_offender(
+                                    gen_idx=gen,
+                                    program_idx=idx,
+                                    program=program,
+                                    elements=elements,
+                                    A_train=A_train,
+                                    V_train=V_train,
+                                    weights=weights,
+                                    pred_hold=pred_hold,
+                                    reason="pred_nonfinite",
+                                )
+                                fast_scores.append(float("inf"))
+                                fast_metrics.append(
+                                    {
+                                        "pred_nonfinite": True,
+                                        "complex_count": int(complex_count),
+                                        "frac_complex": float(frac_complex),
+                                    }
+                                )
+                                n_terms_list.append(n_terms)
+                                continue
+                        elif not torch.isfinite(pred_hold).all().item():
+                            _maybe_write_first_offender(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=weights,
+                                pred_hold=pred_hold,
+                                reason="pred_nonfinite",
+                            )
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "pred_nonfinite": True,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
                         bc_err = torch.mean(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])).item()
                         in_err = torch.mean(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])).item()
                         comp = _complexity(program, elements)
                         score = w_bc * bc_err + w_pde * in_err + w_complexity * comp["n_terms"]
                         fast_scores.append(float(score))
+                        _count_preflight("fast_scored")
                         n_terms_list.append(int(comp["n_terms"]))
                         fast_metrics.append(
                             {
@@ -1131,6 +1697,122 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             raise RuntimeError(msg)
 
                 top_fast_idx = _select_topk(fast_scores, topK_fast)
+                proxy_metrics_by_idx: Dict[int, Dict[str, Any]] = {}
+                if use_gate_proxies and is_layered and top_fast_idx:
+                    proxy_n_xy = int(verify_plan.samples.get("B_boundary", 96))
+                    proxy_n_dir = int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96)))
+                    proxy_n_dir = max(16, proxy_n_dir)
+                    proxy_n_interior = int(verify_plan.samples.get("A_interior", 128))
+                    lap_linf_tol = float(verify_plan.thresholds.get("laplacian_linf", 5e-3))
+                    lap_fd_h = float(verify_plan.thresholds.get("laplacian_fd_h", 2e-2))
+                    lap_exclusion_radius = float(verify_plan.thresholds.get("laplacian_exclusion_radius", 5e-2))
+                    lap_prefer_autograd = bool(verify_plan.thresholds.get("laplacian_prefer_autograd", 1.0))
+                    lap_interface_band = float(verify_plan.thresholds.get("laplacian_interface_band", 0.0))
+                    proxy_pts = build_proxy_stability_points(
+                        bc_hold,
+                        interior_hold,
+                        int(verify_plan.samples.get("D_points", 128)),
+                    )
+                    for idx in list(top_fast_idx):
+                        program = programs[idx]
+                        if payload is not None:
+                            per_payload = payload.for_program(idx)
+                            elements, _, _ = compile_program_to_basis(
+                                program,
+                                spec,
+                                device,
+                                param_payload=per_payload,
+                                strict=True,
+                            )
+                        else:
+                            elements, _, _ = compile_program_to_basis(
+                                program,
+                                spec,
+                                device,
+                                strict=False,
+                            )
+                        if not elements:
+                            continue
+                        A_train = assemble_basis_matrix(elements, X_train)
+                        assert_cuda_tensor(A_train, "A_train_proxy")
+                        weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
+                        if weights.numel() == 0:
+                            continue
+                        system = ImageSystem(elements, weights)
+
+                        def _proxy_eval(pts: torch.Tensor) -> torch.Tensor:
+                            out = system.potential(pts)
+                            if use_ref:
+                                out = out + compute_layered_reference_potential(
+                                    spec,
+                                    pts,
+                                    device=pts.device,
+                                    dtype=pts.dtype,
+                                )
+                            return out
+
+                        proxy_metrics: Dict[str, Any] = {}
+                        if use_gateA_proxy:
+                            proxy_metrics.update(
+                                proxy_gateA(
+                                    spec,
+                                    _proxy_eval,
+                                    n_interior=proxy_n_interior,
+                                    exclusion_radius=lap_exclusion_radius,
+                                    fd_h=lap_fd_h,
+                                    prefer_autograd=lap_prefer_autograd,
+                                    interface_band=lap_interface_band,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    seed=seed_gen + 1,
+                                    linf_tol=lap_linf_tol,
+                                )
+                            )
+                        proxy_metrics.update(
+                            proxy_gateB(
+                                spec,
+                                _proxy_eval,
+                                n_xy=proxy_n_xy,
+                                delta=layered_interface_delta,
+                                device=device,
+                                dtype=torch.float32,
+                                seed=seed_gen + 3,
+                            )
+                        )
+                        proxy_metrics.update(
+                            proxy_gateC(
+                                _proxy_eval,
+                                near_radii=(0.125, 0.5),
+                                far_radii=(10.0, 20.0),
+                                n_dir=proxy_n_dir,
+                                device=device,
+                                dtype=torch.float32,
+                                seed=seed_gen + 5,
+                            )
+                        )
+                        proxy_metrics.update(
+                            proxy_gateD(
+                                _proxy_eval,
+                                proxy_pts,
+                                delta=layered_stability_delta,
+                                seed=seed_gen + 7,
+                            )
+                        )
+                        proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
+                        proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                        _count_preflight("proxy_computed_count")
+                        proxy_metrics_by_idx[idx] = proxy_metrics
+                        if idx < len(fast_metrics):
+                            fast_metrics[idx].update(proxy_metrics)
+
+                    top_fast_idx = sorted(
+                        top_fast_idx,
+                        key=lambda i: (
+                            _proxy_fail_count(proxy_metrics_by_idx.get(i, {}), verify_plan.thresholds),
+                            _proxy_score(proxy_metrics_by_idx.get(i, {})),
+                            fast_scores[i],
+                        ),
+                    )[: max(1, min(topK_fast, len(top_fast_idx)))]
                 if cache_hold_matrices and hold_cache:
                     keep = set(top_fast_idx)
                     hold_cache = {idx: mat for idx, mat in hold_cache.items() if idx in keep}
@@ -1194,7 +1876,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                             A_hold_dcim = assemble_basis_matrix(dcim_elements, X_hold)
                             assert_cuda_tensor(A_hold_dcim, "A_hold_dcim")
-                            pred_hold = A_hold_dcim.matmul(weights)
+                            pred_hold_corr = A_hold_dcim.matmul(weights)
+                            pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                             bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                             in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
                             mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
@@ -1212,6 +1895,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             def _eval_fn(pts: torch.Tensor) -> torch.Tensor:
                                 assert_cuda_tensor(pts, "candidate_eval_points")
                                 out = system.potential(pts)
+                                if use_ref:
+                                    out = out + compute_layered_reference_potential(
+                                        spec,
+                                        pts,
+                                        device=pts.device,
+                                        dtype=pts.dtype,
+                                    )
                                 assert_cuda_tensor(out, "candidate_eval_out")
                                 return out
 
@@ -1228,7 +1918,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             if perturbed is not None:
                                 A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
                                 assert_cuda_tensor(A_hold_pert, "A_hold_dcim_pert")
-                                pert_pred = A_hold_pert.matmul(weights)
+                                pert_pred_corr = A_hold_pert.matmul(weights)
+                                pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
                                 base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                                 pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                                 pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
@@ -1264,6 +1955,69 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "dcim_block_weight": float(dcim_block_weight),
                                 "candidate_name": "dcim_block_baseline",
                             }
+                            if use_gate_proxies and is_layered:
+                                proxy_pts = build_proxy_stability_points(
+                                    bc_hold,
+                                    interior_hold,
+                                    int(verify_plan.samples.get("D_points", 128)),
+                                )
+                                proxy_metrics = {}
+                                if use_gateA_proxy:
+                                    proxy_metrics.update(
+                                        proxy_gateA(
+                                            spec,
+                                            _eval_fn,
+                                            n_interior=int(verify_plan.samples.get("A_interior", 128)),
+                                            exclusion_radius=float(
+                                                verify_plan.thresholds.get("laplacian_exclusion_radius", 5e-2)
+                                            ),
+                                            fd_h=float(verify_plan.thresholds.get("laplacian_fd_h", 2e-2)),
+                                            prefer_autograd=bool(
+                                                verify_plan.thresholds.get("laplacian_prefer_autograd", 1.0)
+                                            ),
+                                            interface_band=float(
+                                                verify_plan.thresholds.get("laplacian_interface_band", 0.0)
+                                            ),
+                                            device=device,
+                                            dtype=torch.float32,
+                                            seed=seed_gen + 1,
+                                            linf_tol=float(verify_plan.thresholds.get("laplacian_linf", 5e-3)),
+                                        )
+                                    )
+                                proxy_metrics.update(
+                                    proxy_gateB(
+                                        spec,
+                                        _eval_fn,
+                                        n_xy=int(verify_plan.samples.get("B_boundary", 96)),
+                                        delta=layered_interface_delta,
+                                        device=device,
+                                        dtype=torch.float32,
+                                        seed=seed_gen + 3,
+                                    )
+                                )
+                                proxy_metrics.update(
+                                    proxy_gateC(
+                                        _eval_fn,
+                                        near_radii=(0.125, 0.5),
+                                        far_radii=(10.0, 20.0),
+                                        n_dir=int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96))),
+                                        device=device,
+                                        dtype=torch.float32,
+                                        seed=seed_gen + 5,
+                                    )
+                                )
+                                proxy_metrics.update(
+                                    proxy_gateD(
+                                        _eval_fn,
+                                        proxy_pts,
+                                        delta=layered_stability_delta,
+                                        seed=seed_gen + 7,
+                                    )
+                                )
+                                proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
+                                proxy_metrics["proxy_score"] = _proxy_score(proxy_metrics)
+                                _count_preflight("proxy_computed_count")
+                                metrics.update(proxy_metrics)
                             score_mid = (
                                 w_bc * rel_bc
                                 + w_pde * rel_lap
@@ -1283,6 +2037,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 best_dcim_score is None or float(score_mid) < best_dcim_score
                             ):
                                 best_dcim_score = float(score_mid)
+                            _count_preflight("mid_scored")
                             fitted_candidates.append(
                                 {
                                     "program": dcim_program,
@@ -1352,7 +2107,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     else:
                         A_hold = assemble_basis_matrix(elements, X_hold)
                     assert_cuda_tensor(A_hold, "A_hold_fit")
-                    pred_hold = A_hold.matmul(weights)
+                    pred_hold_corr = A_hold.matmul(weights)
+                    pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                     bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                     in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
                     mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
@@ -1370,6 +2126,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     def _eval_fn(pts: torch.Tensor) -> torch.Tensor:
                         assert_cuda_tensor(pts, "candidate_eval_points")
                         out = system.potential(pts)
+                        if use_ref:
+                            out = out + compute_layered_reference_potential(
+                                spec,
+                                pts,
+                                device=pts.device,
+                                dtype=pts.dtype,
+                            )
                         assert_cuda_tensor(out, "candidate_eval_out")
                         return out
 
@@ -1386,7 +2149,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     if perturbed is not None:
                         A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
                         assert_cuda_tensor(A_hold_pert, "A_hold_pert")
-                        pert_pred = A_hold_pert.matmul(weights)
+                        pert_pred_corr = A_hold_pert.matmul(weights)
+                        pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
                         base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                         pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                         pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
@@ -1417,6 +2181,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         "n_terms": comp["n_terms"],
                         "complex_count": int(complex_count),
                     }
+                    if use_gate_proxies and is_layered:
+                        proxy_metrics = proxy_metrics_by_idx.get(idx)
+                        if proxy_metrics:
+                            metrics.update(proxy_metrics)
                     score_mid = (
                         w_bc * rel_bc
                         + w_pde * rel_lap
@@ -1424,6 +2192,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         + w_latency * (metrics["eval_time_us"] / 1e6)
                         + w_stability * stability_ratio
                     )
+                    _count_preflight("mid_scored")
                     fitted_candidates.append(
                         {
                             "program": program,
@@ -1434,7 +2203,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         }
                     )
 
-                fitted_candidates.sort(key=lambda x: x["score"])
+                if use_gate_proxies and is_layered:
+                    fitted_candidates.sort(
+                        key=lambda x: (
+                            _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
+                            _proxy_score(x.get("metrics", {})),
+                            x["score"],
+                        )
+                    )
+                else:
+                    fitted_candidates.sort(key=lambda x: x["score"])
                 top_mid = fitted_candidates[: max(1, min(topk_mid, len(fitted_candidates)))]
 
                 top_final = top_mid
@@ -1451,7 +2229,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     for cand in top_mid:
                         A_hold_hi = assemble_basis_matrix(cand["elements"], X_hold)
                         assert_cuda_tensor(A_hold_hi, "A_hold_hi")
-                        pred_hi = A_hold_hi.matmul(cand["weights"])
+                        pred_hi_corr = A_hold_hi.matmul(cand["weights"])
+                        pred_hi = _add_reference(pred_hi_corr, V_ref_hold)
                         bc_err_hi = torch.mean(torch.abs(pred_hi[is_boundary_hold] - V_hold_hi[is_boundary_hold])).item()
                         in_err_hi = torch.mean(torch.abs(pred_hi[~is_boundary_hold] - V_hold_hi[~is_boundary_hold])).item()
                         cand["score_hi"] = float(w_bc * bc_err_hi + w_pde * in_err_hi)
@@ -1463,18 +2242,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 else:
                     top_final = top_mid[: max(1, min(topk_final, len(top_mid)))]
 
+                if use_gate_proxies and is_layered and top_final:
+                    top_final = sorted(
+                        top_final,
+                        key=lambda x: (
+                            _proxy_fail_count(x.get("metrics", {}), verify_plan.thresholds),
+                            _proxy_score(x.get("metrics", {})),
+                            x.get("score_hi", x["score"]),
+                        ),
+                    )
+
                 if refine_enabled and is_layered and top_final:
                     if refine_targets == "holdout":
                         refine_bc = bc_hold
                         refine_interior = interior_hold
-                        refine_bc_target = V_bc_hold_mid if V_bc_hold_mid is not None else V_bc_hold
+                        refine_bc_target = V_bc_hold_mid_corr if V_bc_hold_mid_corr is not None else V_bc_hold_corr
                         refine_X = X_hold
-                        refine_V = V_hold_mid
+                        refine_V = V_hold_mid_corr
                         refine_is_boundary = is_boundary_hold
                     else:
                         refine_bc = bc_train
                         refine_interior = interior_train
-                        refine_bc_target = V_bc_train
+                        refine_bc_target = V_bc_train_corr
                         refine_X = X_train
                         refine_V = V_train
                         refine_is_boundary = is_boundary
@@ -1719,13 +2508,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             assert_cuda_tensor(pts, "refined_eval_points")
                             with torch.no_grad():
                                 out = system_refined.potential(pts)
+                                if use_ref:
+                                    out = out + compute_layered_reference_potential(
+                                        spec,
+                                        pts,
+                                        device=pts.device,
+                                        dtype=pts.dtype,
+                                    )
                             assert_cuda_tensor(out, "refined_eval_out")
                             return out
 
                         with torch.no_grad():
                             A_hold = assemble_basis_matrix(refine_elements, X_hold)
                             assert_cuda_tensor(A_hold, "A_hold_refined")
-                            pred_hold = A_hold.matmul(refined_weights)
+                            pred_hold_corr = A_hold.matmul(refined_weights)
+                            pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                             bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                             in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
                             mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
@@ -1756,7 +2553,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         if perturbed is not None:
                             A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
                             assert_cuda_tensor(A_hold_pert, "A_hold_refined_pert")
-                            pert_pred = A_hold_pert.matmul(refined_weights)
+                            pert_pred_corr = A_hold_pert.matmul(refined_weights)
+                            pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
                             base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                             pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                             pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
@@ -1841,6 +2639,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     def _verify_eval(pts: torch.Tensor) -> torch.Tensor:
                         assert_cuda_tensor(pts, "verifier_points")
                         out = system.potential(pts)
+                        if use_ref:
+                            out = out + compute_layered_reference_potential(
+                                spec,
+                                pts,
+                                device=pts.device,
+                                dtype=pts.dtype,
+                            )
                         assert_cuda_tensor(out, "verifier_out")
                         return out
 
@@ -1874,6 +2679,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     cert_dir = run_dir / "artifacts" / "certificates" / f"gen{gen:03d}_rank{rank}_verifier"
                     cert_status = "error"
                     cert_error = None
+                    _count_preflight("verified_attempted")
                     try:
                         certificate = verifier.run(
                             {"eval_fn": _verify_eval},
@@ -1906,6 +2712,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     }
                     cert_path = run_dir / "artifacts" / "certificates" / f"gen{gen:03d}_rank{rank}_summary.json"
                     write_json(cert_path, cert_payload)
+                    _count_preflight("verified_written")
 
                 gen_rel_bc = float("inf")
                 gen_rel_in = float("inf")
@@ -1929,6 +2736,18 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 per_gen_rel_bc.append(gen_rel_bc)
                 per_gen_rel_in.append(gen_rel_in)
                 per_gen_rel_lap.append(gen_rel_lap)
+                if preflight_enabled and gen_counters is not None:
+                    per_gen_preflight.append(
+                        {"gen": int(gen), "counters": gen_counters.as_dict()}
+                    )
+                    print(
+                        "PREFLIGHT "
+                        f"gen={gen} "
+                        f"compiled_ok={gen_counters.compiled_ok} "
+                        f"solved_ok={gen_counters.solved_ok} "
+                        f"fast_scored={gen_counters.fast_scored} "
+                        f"verified_written={gen_counters.verified_written}"
+                    )
 
                 if ramp_check:
                     improved = False
@@ -1953,12 +2772,14 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     if improved:
                         last_improve_gen = gen
                     if (
-                        (ramp_best_rel_bc is not None or ramp_best_rel_lap is not None)
+                        not ramp_abort
+                        and (ramp_best_rel_bc is not None or ramp_best_rel_lap is not None)
                         and gen - last_improve_gen >= ramp_patience
                     ):
                         print("RAMP ABORT: not improving")
                         ramp_abort = True
-                        break
+                        if should_early_exit(allow_not_ready, ramp_abort):
+                            break
 
                 empty_count = sum(1 for m in fast_metrics if m.get("empty"))
                 empty_frac = empty_count / max(1, len(fast_metrics))
@@ -2004,9 +2825,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         raise
                 else:
                     raise
-            if ramp_abort:
+            if should_early_exit(allow_not_ready, ramp_abort):
                 break
-        if ramp_abort:
+        if should_early_exit(allow_not_ready, ramp_abort):
             break
 
     best_bc_rel = float("nan")
@@ -2179,7 +3000,30 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             )
             print(f"REFINE BEST REL: rel_bc={ref_bc:.3e} rel_lap={ref_lap:.3e}")
 
-    if ramp_abort:
+    if preflight_counters is not None:
+        device_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
+        device_cap = (
+            ".".join(str(v) for v in torch.cuda.get_device_capability(device))
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        nonfinite_total = max(1, preflight_counters.nonfinite_pred_total)
+        extra = {
+            "timestamp": utc_now_iso(),
+            "tag": tag,
+            "config_hash": config_hash,
+            "git_sha": git_sha(),
+            "device_name": device_name,
+            "device_capability": device_cap,
+            "preflight_mode": preflight_mode,
+            "preflight_out": preflight_out,
+            "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
+            "per_gen": per_gen_preflight,
+        }
+        write_preflight_report(run_dir, preflight_counters, extra)
+        summarize_to_stdout(preflight_counters)
+
+    if should_early_exit(allow_not_ready, ramp_abort):
         return 3
 
     if sanity_threshold is not None:

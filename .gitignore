@@ -62,3 +62,6 @@ tmp_debug/
 
 # local outputs
 notes/repro_step2_output.txt
+
+# Codex / Black Hammer scratch
+.blackhammer/

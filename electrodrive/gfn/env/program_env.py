@@ -7,6 +7,7 @@ from typing import List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
+from electrodrive.flows.schemas import SCHEMA_AXIS_POINT, SCHEMA_REAL_POINT
 from electrodrive.gfn.dsl import (
     Action,
     AddBranchCutBlock,
@@ -367,6 +368,16 @@ class ElectrodriveProgramEnv:
 
     def _action_allowed_by_geometry(self, action: Action, state: PartialProgramState) -> bool:
         extra = state.spec_meta.extra
+        if action.action_type == "add_primitive" and not extra.get("allow_real_primitives", True):
+            schema_id = action.discrete_args.get("schema_id")
+            if schema_id is None:
+                return False
+            try:
+                schema_id = int(schema_id)
+            except Exception:
+                return False
+            if schema_id in (SCHEMA_REAL_POINT, SCHEMA_AXIS_POINT):
+                return False
         if action.action_type == "add_branch_cut" and not extra.get("allow_branch_cut", True):
             return False
         if action.action_type == "add_pole" and not extra.get("allow_pole", True):

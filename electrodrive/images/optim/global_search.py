@@ -140,7 +140,8 @@ def cmaes_search(
 
         prev_best = best_loss
         loss_vals = losses.detach().to(device=device, dtype=initial_theta.dtype)
-        history.append(float(loss_vals.min().cpu()))
+        loss_min = float(loss_vals.min().item())
+        history.append(loss_min)
         best_idx = int(torch.argmin(loss_vals).item())
         if float(loss_vals[best_idx].item()) < best_loss:
             best_loss = float(loss_vals[best_idx].item())
@@ -153,7 +154,7 @@ def cmaes_search(
         diff = elite - mean
         diag_cov = torch.sum(weights.view(-1, 1) * diff * diff, dim=0).clamp_min(1e-12)
 
-        if float(loss_vals.min().item()) < prev_best:
+        if loss_min < prev_best:
             sigma = max(1e-4, sigma * 0.9)
         else:
             sigma = min(2.0, sigma * 1.1)
@@ -189,7 +190,7 @@ def basinhop_search(
             full_stats=True,
         )
     current_theta = initial_theta.detach().clone()
-    current_loss = float(base_loss.detach().cpu())
+    current_loss = float(base_loss.detach().item())
     best_theta = current_theta.detach().clone()
     best_loss = current_loss
     best_stats = base_stats

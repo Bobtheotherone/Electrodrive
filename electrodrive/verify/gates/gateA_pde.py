@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -34,6 +34,31 @@ def _bounds_from_spec(spec: Dict[str, Any]) -> Tuple[Tuple[float, float], Tuple[
         hi = torch.max(pts, dim=0).values + 1.0
         return (float(lo[0]), float(hi[0])), (float(lo[1]), float(hi[1])), (float(lo[2]), float(hi[2]))
     return (-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)
+
+
+def _interface_planes_from_spec(spec: Dict[str, Any]) -> List[float]:
+    planes: List[float] = []
+    for layer in spec.get("dielectrics", []) or []:
+        z_min = layer.get("z_min", None)
+        z_max = layer.get("z_max", None)
+        if z_min is not None:
+            planes.append(float(z_min))
+        if z_max is not None:
+            planes.append(float(z_max))
+    if not planes:
+        return []
+    uniq = sorted({z for z in planes if math.isfinite(z)})
+    return uniq
+
+
+def _filter_interface_band(pts: torch.Tensor, planes: List[float], band: float) -> torch.Tensor:
+    if band <= 0.0 or not planes or pts.numel() == 0:
+        return pts
+    z = pts[:, 2]
+    plane_tensor = torch.tensor(planes, device=pts.device, dtype=pts.dtype)
+    dists = torch.abs(z[:, None] - plane_tensor[None, :])
+    mask = torch.all(dists >= band, dim=1)
+    return pts[mask]
 
 
 def _sample_interior(
@@ -118,9 +143,23 @@ def run_gate(
     artifact_dir = cfg.get("artifact_dir", None)
     spec = dict(cfg.get("spec", query.spec))
     candidate_eval = _candidate_eval_fn(cfg)
+    interface_band = float(cfg.get("interface_band", 0.0))
+    interface_planes = _interface_planes_from_spec(spec) if interface_band > 0.0 else []
 
     torch.manual_seed(seed)
     pts = _sample_interior(spec, query.points.device, query.points.dtype, n_samples, seed=seed, exclusion_radius=exclusion_radius)
+    pts = _filter_interface_band(pts, interface_planes, interface_band)
+    if pts.shape[0] == 0:
+        return GateResult(
+            gate="A",
+            status="fail",
+            metrics={"linf": float("inf"), "l2": float("inf"), "p95": float("inf"), "n": 0.0, "method": 1.0},
+            thresholds=thresholds,
+            evidence={},
+            oracle={"method": result.method, "fidelity": result.fidelity.value, "config": result.config_fingerprint},
+            notes=["no_samples_after_interface_band"],
+            config=cfg,
+        )
 
     prefer_autograd = bool(cfg.get("prefer_autograd", False))
     lap_method = "finite_diff"
@@ -131,24 +170,63 @@ def run_gate(
             lap_method = "autograd"
         else:
             fd_pts = pts[: max(16, min(int(cfg.get("fd_max_samples", 128)), pts.shape[0]))].contiguous()
-            lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=float(cfg.get("fd_h", 2e-2)))
+            fd_h = float(cfg.get("fd_h", 2e-2))
+            fd_pts = _filter_interface_band(fd_pts, interface_planes, interface_band + fd_h)
+            if fd_pts.shape[0] == 0:
+                lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
+            else:
+                lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=fd_h)
             pts = fd_pts
     except Exception:
         fd_pts = pts[: max(16, min(int(cfg.get("fd_max_samples", 128)), pts.shape[0]))].contiguous()
-        lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=float(cfg.get("fd_h", 2e-2)))
+        fd_h = float(cfg.get("fd_h", 2e-2))
+        fd_pts = _filter_interface_band(fd_pts, interface_planes, interface_band + fd_h)
+        if fd_pts.shape[0] == 0:
+            lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
+        else:
+            lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=fd_h)
         lap_method = "finite_diff"
         pts = fd_pts
 
-    abs_lap = lap.abs()
-    linf = float(torch.max(abs_lap).item())
-    l2 = float(torch.sqrt(torch.mean(abs_lap * abs_lap)).item())
-    p95 = float(torch.quantile(abs_lap, 0.95).item())
-    metrics = {"linf": linf, "l2": l2, "p95": p95, "n": float(pts.shape[0]), "method": 0.0}
+    if pts.shape[0] == 0 or lap.numel() == 0:
+        return GateResult(
+            gate="A",
+            status="fail",
+            metrics={"linf": float("inf"), "l2": float("inf"), "p95": float("inf"), "n": 0.0, "method": 1.0},
+            thresholds=thresholds,
+            evidence={},
+            oracle={"method": result.method, "fidelity": result.fidelity.value, "config": result.config_fingerprint},
+            notes=["no_samples_after_interface_band"],
+            config=cfg,
+        )
+
+    finite_mask = torch.isfinite(lap)
+    nonfinite_count = int((~finite_mask).sum().item())
+    nonfinite_frac = nonfinite_count / max(1, lap.numel())
+    if nonfinite_count:
+        lap = lap[finite_mask]
+        pts = pts[finite_mask]
+    if lap.numel() == 0:
+        status = "fail"
+        metrics = {"linf": float("inf"), "l2": float("inf"), "p95": float("inf"), "n": float(pts.shape[0]), "method": 1.0}
+    else:
+        abs_lap = lap.abs()
+        linf = float(torch.max(abs_lap).item())
+        abs_lap_f64 = abs_lap.double()
+        l2 = float(torch.sqrt(torch.mean(abs_lap_f64 * abs_lap_f64)).item())
+        p95 = float(torch.quantile(abs_lap_f64, 0.95).item())
+        metrics = {"linf": linf, "l2": l2, "p95": p95, "n": float(pts.shape[0]), "method": 0.0}
+        status = "pass"
+
+    metrics["nonfinite_frac"] = float(nonfinite_frac)
+    metrics["nonfinite_count"] = float(nonfinite_count)
     metrics["method"] = 0.0 if lap_method == "autograd" else 1.0
 
-    status = "pass"
-    if linf > thresholds["linf"] or l2 > thresholds["l2"]:
-        status = "borderline" if linf <= thresholds["linf"] * 2.0 else "fail"
+    if nonfinite_frac > 0.1:
+        status = "fail"
+    elif status != "fail":
+        if metrics["linf"] > thresholds["linf"] or metrics["l2"] > thresholds["l2"]:
+            status = "borderline" if metrics["linf"] <= thresholds["linf"] * 2.0 else "fail"
 
     evidence: Dict[str, str] = {}
     if artifact_dir:
@@ -165,6 +243,12 @@ def run_gate(
         "config": result.config_fingerprint,
     }
 
+    notes = [f"laplacian_method={lap_method}"]
+    if nonfinite_frac > 0.0:
+        notes.append(f"nonfinite_fraction={nonfinite_frac:.3f}")
+    if nonfinite_frac > 0.1:
+        notes.append("reason=nonfinite_fraction")
+
     return GateResult(
         gate="A",
         status=status,
@@ -172,6 +256,6 @@ def run_gate(
         thresholds=thresholds,
         evidence=evidence,
         oracle=oracle_meta,
-        notes=[f"laplacian_method={lap_method}"],
+        notes=notes,
         config=cfg,
     )

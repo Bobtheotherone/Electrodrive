@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import hashlib
 import os
@@ -13,6 +14,7 @@ import torch
 
 from electrodrive.images.basis import (
     ImageBasisElement,
+    PointChargeBasis,
     generate_candidate_basis,
     build_dictionary,
     BasisGenerator,
@@ -266,19 +268,42 @@ def _group_prox(
             )
     else:
         lam_vec = None
-    unique_groups = torch.unique(group_ids)
-    for g_val in unique_groups:
-        mask = group_ids == g_val
-        if not bool(mask.any()):
-            continue
-        w_g = w_out[mask]
-        norm_g = torch.linalg.norm(w_g)
-        lam = float(lam_vec[mask].mean().item()) if lam_vec is not None else float(lambda_group)
-        if float(norm_g) <= lam:
-            w_out[mask] = 0.0
-        else:
-            shrink = (norm_g - lam) / norm_g
-            w_out[mask] = shrink * w_g
+    unique_groups, inverse = torch.unique(
+        group_ids, sorted=True, return_inverse=True
+    )
+    if unique_groups.numel() == 0:
+        return w_out
+
+    norms_sq = torch.zeros(
+        unique_groups.numel(), device=w.device, dtype=w.dtype
+    )
+    norms_sq.scatter_add_(0, inverse, w_out * w_out)
+    norms = torch.sqrt(norms_sq)
+
+    if lam_vec is not None:
+        lam_sum = torch.zeros(
+            unique_groups.numel(), device=w.device, dtype=w.dtype
+        )
+        lam_sum.scatter_add_(0, inverse, lam_vec)
+        counts = torch.bincount(inverse, minlength=unique_groups.numel()).to(
+            device=w.device, dtype=w.dtype
+        )
+        lam_group = lam_sum / counts.clamp_min(1.0)
+    else:
+        lam_group = torch.full(
+            (unique_groups.numel(),),
+            float(lambda_group),
+            device=w.device,
+            dtype=w.dtype,
+        )
+
+    shrink = torch.where(
+        norms > 0,
+        (norms - lam_group) / norms,
+        torch.zeros_like(norms),
+    )
+    shrink = torch.clamp(shrink, min=0.0)
+    w_out = w_out * shrink[inverse]
     return w_out
 
 
@@ -289,6 +314,8 @@ class ImageSystem:
         self.elements = elements
         self.weights = weights
         self.metadata: Dict[str, Any] = metadata or {}
+        self._v2 = None
+        self._v2_cache_key = None
         if weights.numel() > 0:
             self.device = weights.device
             self.dtype = weights.dtype
@@ -303,6 +330,9 @@ class ImageSystem:
         device-mismatch surprises, then convert back to the original
         layout on return.
         """
+        flag = os.getenv("EDE_IMAGE_SYSTEM_V2", "").strip().lower()
+        if flag in {"1", "true", "yes", "on"}:
+            return self._potential_v2(targets)
         orig_device = targets.device
         orig_dtype = targets.dtype
 
@@ -314,12 +344,79 @@ class ImageSystem:
             device=self.device,
             dtype=self.dtype,
         )
-        # Avoid per-element dtype casts and extra allocations.
+
+        point_real_pos: List[torch.Tensor] = []
+        point_real_w: List[torch.Tensor] = []
+        point_complex_pos: List[torch.Tensor] = []
+        point_complex_w: List[torch.Tensor] = []
+        point_complex_z: List[torch.Tensor] = []
+        fallback: List[Tuple[ImageBasisElement, torch.Tensor]] = []
+
         for elem, w in zip(self.elements, self.weights):
+            if isinstance(elem, PointChargeBasis):
+                pos = elem.params["position"].to(
+                    device=self.device, dtype=self.dtype
+                ).view(3)
+                if bool(getattr(elem, "_use_complex", False)):
+                    z_imag = elem.params.get("z_imag")
+                    z_imag_t = torch.as_tensor(
+                        z_imag if z_imag is not None else 0.0,
+                        device=self.device,
+                        dtype=torch.float32,
+                    ).view(())
+                    point_complex_pos.append(pos)
+                    point_complex_w.append(w)
+                    point_complex_z.append(z_imag_t)
+                else:
+                    point_real_pos.append(pos)
+                    point_real_w.append(w)
+                continue
+            fallback.append((elem, w))
+
+        if point_real_pos:
+            pos = torch.stack(point_real_pos, dim=0).contiguous()
+            w = torch.stack(point_real_w).to(device=self.device, dtype=self.dtype)
+            diff = targets_sys[:, None, :] - pos[None, :, :]
+            r = torch.linalg.norm(diff, dim=-1).clamp_min(1e-12)
+            phi = K_E / r
+            V_sys = V_sys + phi @ w
+
+        if point_complex_pos:
+            pos = torch.stack(point_complex_pos, dim=0).contiguous()
+            w = torch.stack(point_complex_w).to(device=self.device, dtype=self.dtype)
+            Xc = targets_sys.to(dtype=torch.float32)
+            pos_c = pos.to(dtype=torch.float32)
+            z_imag = torch.stack(point_complex_z, dim=0).to(dtype=torch.float32)
+            dx = Xc[:, None, 0] - pos_c[None, :, 0]
+            dy = Xc[:, None, 1] - pos_c[None, :, 1]
+            dz = Xc[:, None, 2] - pos_c[None, :, 2]
+            dz_complex = torch.complex(dz, z_imag.view(1, -1).expand_as(dz))
+            r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
+            inv_r = 1.0 / torch.sqrt(r2_complex)
+            phi = (2.0 * inv_r.real).to(dtype=self.dtype)
+            V_sys = V_sys + (K_E * phi) @ w
+
+        # Avoid per-element dtype casts and extra allocations for fallback elements.
+        for elem, w in fallback:
             V_sys.add_(w * elem.potential(targets_sys))
 
         # Preserve the caller's expectations about device/dtype.
         return V_sys.to(device=orig_device, dtype=orig_dtype)
+
+    def _potential_v2(self, targets: torch.Tensor) -> torch.Tensor:
+        key = (
+            id(self.weights),
+            tuple(self.weights.shape),
+            self.weights.device,
+            self.weights.dtype,
+            len(self.elements),
+        )
+        if self._v2 is None or self._v2_cache_key != key:
+            from electrodrive.images.image_system_v2 import ImageSystemV2
+
+            self._v2 = ImageSystemV2(self.elements, self.weights, metadata=self.metadata)
+            self._v2_cache_key = key
+        return self._v2.potential(targets)
 
 
 def _make_collocation_rng() -> np.random.Generator:
@@ -471,6 +568,7 @@ def _normalize_generator_mode(mode: Optional[str]) -> str:
         "hybrid_diffusion",
         "gfn",
         "gfn_flow",
+        "gfdsl",
     }
     if not mode:
         return "static_only"
@@ -479,6 +577,8 @@ def _normalize_generator_mode(mode: Optional[str]) -> str:
         m = "gfn"
     if m in {"gflownet_flow", "gfnflow"}:
         m = "gfn_flow"
+    if m in {"gfdsl_programs", "gfdsl_json"}:
+        m = "gfdsl"
     if m not in allowed:
         return "static_only"
     return m
@@ -2460,6 +2560,7 @@ def discover_images(
     constraint_specs: Optional[list[Any]] = None,
     admm_cfg: Optional[Any] = None,
     constraint_mode: str = "none",
+    gfdsl_program_dir: Optional[str] = None,
 ) -> ImageSystem:
     """Top-level entry point for sparse image discovery."""
 
@@ -2552,6 +2653,36 @@ def discover_images(
                 gfn_seed = int(seed_env)
             except Exception:
                 gfn_seed = None
+
+    gfdsl_candidates: List[ImageBasisElement] = []
+    if mode == "gfdsl":
+        gfdsl_dir = gfdsl_program_dir or os.getenv("EDE_GFDSl_PROGRAM_DIR", "").strip()
+        if not gfdsl_dir:
+            raise ValueError("gfdsl mode requires gfdsl_program_dir or EDE_GFDSl_PROGRAM_DIR.")
+        limit_env = os.getenv("EDE_GFDSl_MAX_PROGRAMS", "").strip()
+        limit = None
+        if limit_env:
+            try:
+                limit = int(limit_env)
+            except Exception:
+                limit = None
+        from electrodrive.gfdsl.program_loader import load_gfdsl_programs
+
+        gfdsl_candidates = load_gfdsl_programs(
+            Path(gfdsl_dir),
+            spec=spec,
+            device=device,
+            dtype=dtype,
+            eval_backend="operator",
+            logger=logger,
+            limit=limit,
+        )
+        logger.info(
+            "Using GFDSL program generator.",
+            mode=mode,
+            program_dir=str(gfdsl_dir),
+            n_candidates=len(gfdsl_candidates),
+        )
 
     if mode in {"diffusion", "hybrid_diffusion"} and basis_generator is None:
         try:
@@ -2662,7 +2793,9 @@ def discover_images(
             logger=logger,
         )
 
-    if mode in {"gfn", "gfn_flow"}:
+    if mode == "gfdsl":
+        candidates = gfdsl_candidates
+    elif mode in {"gfn", "gfn_flow"}:
         candidates = gfn_candidates
     elif mode in {"learned_only", "diffusion"}:
         candidates = learned_candidates

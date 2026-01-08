@@ -1,0 +1,91 @@
+# Gate-ready discovery template:
+# - Aligns layered sampling with verifier A/B/C/D (interfaces + exclusion band).
+# - Uses reference decomposition + gate proxies to target verifier metrics.
+# - Scale knobs for large runs: run.population_B, run.generations, points.*.
+# - Good preflight: compiled_ok/sample > 0.5, solved_ok > 0,
+#   fast_scored > 0 each generation, verified_written > 0 at least once.
+
+seed: 0
+
+run:
+  tag: "black_hammer_gate_ready"
+  generations: 20
+  population_B: 2048
+  topK_fast: 64
+  topk_mid: 8
+  topk_final: 4
+  fixed_spec: true
+  use_dcim_block: true
+  dcim_block_max: 1
+  use_hi_oracle: false
+  ramp_check: false
+  allow_not_ready: true
+  ramp_patience_gens: 6
+  ramp_min_rel_improvement: 0.05
+  score_microbatch: 32
+  cache_hold_matrices: true
+  refine_enabled: true
+  refine_steps: 12
+  refine_lr: 5e-2
+  refine_opt: "adam"
+  refine_max_terms: 32
+  refine_targets: "holdout"
+  preflight_mode: "full"
+  layered_sampling: true
+  use_reference_potential: true
+  use_gate_proxies: true
+  layered_prefer_dcim: true
+  layered_allow_real_primitives: false
+  layered_stability_delta: 1e-2
+  layered_exclusion_radius: 5e-2
+  layered_interface_delta: 1e-2
+  layered_interface_band: 1e-2
+
+points:
+  bc_train: 2048
+  bc_holdout: 1024
+  interior_train: 2048
+  interior_holdout: 1024
+
+reward:
+  w_bc: 1.0
+  w_pde: 0.5
+  w_complexity: 0.02
+  w_latency: 0.10
+  w_stability: 0.10
+  stability_perturb_sigma: 1e-3
+
+model:
+  dtype: "bf16"
+  compile: false
+  use_tf32: true
+  geom_encoder: { name: "current", hidden_dim: 256, layers: 6 }
+  structure_policy: { name: "gflownet", max_steps: 48, replay_size: 200000 }
+  param_sampler:
+    name: "flow"
+    steps: 4
+    solver: "euler"
+    temperature: 1.0
+    dtype: "bf16"
+
+solver:
+  name: "differentiable_lasso"
+  max_iters: 24
+  tol: 1e-6
+  reg_l1: 1e-3
+  fast_column_normalize: true
+
+oracle:
+  fast: { name: "f1", dtype: "fp32" }
+  mid:  { name: "f1", dtype: "fp32" }
+
+spec:
+  family: "layered_3layer"
+  eps_range: [1.0, 80.0]
+  thickness_range: [0.02, 1.0]
+  source_height_range: [0.001, 2.0]
+  domain_scale: 1.0
+
+paths:
+  gfn_checkpoint: "artifacts/step10_gfn_flow_smoke/gfn_ckpt.pt"
+  flow_checkpoint: "artifacts/step10_gfn_flow_smoke/flow_ckpt.pt"

@@ -45,6 +45,10 @@ class VerificationPlan:
     thresholds: Dict[str, float] = field(
         default_factory=lambda: {
             "laplacian_linf": 5e-3,
+            "laplacian_exclusion_radius": 5e-2,
+            "laplacian_fd_h": 2e-2,
+            "laplacian_prefer_autograd": 1.0,
+            "laplacian_interface_band": 0.0,
             "bc_dirichlet": 1e-3,
             "bc_continuity": 5e-3,
             "slope_tol": 0.15,
@@ -286,7 +290,7 @@ class Verifier:
             try:
                 res_f1, backend_f1 = manager.evaluate_with_backend(query_f1)
                 _record(res_f1, backend_f1)
-                cand_eval_f1 = _backend_eval_fn(backend_f1, spec, base_query.quantity, base_query.cache_policy, query_f1.budget)
+                cand_eval_f1 = candidate_eval
                 gate_results_f1 = self._run_gate_pass(
                     spec=spec,
                     query=query_f1,
@@ -321,7 +325,7 @@ class Verifier:
             try:
                 res_f2, backend_f2 = manager.evaluate_with_backend(query_f2)
                 _record(res_f2, backend_f2)
-                cand_eval_f2 = _backend_eval_fn(backend_f2, spec, base_query.quantity, base_query.cache_policy, query_f2.budget)
+                cand_eval_f2 = candidate_eval
                 gate_results_f2 = self._run_gate_pass(
                     spec=spec,
                     query=query_f2,
@@ -339,38 +343,55 @@ class Verifier:
             except Exception:
                 pass
 
-        # Stability and speed gates on final candidate evaluator
-        gate_results["D"] = gateD_stability.run_gate(
-            base_query,
-            result,
-            config={
-                "candidate_eval": candidate_eval,
-                "delta": float(plan.thresholds.get("stability", 5e-2)),
-                "stability_tol": float(plan.thresholds.get("stability", 5e-2)),
-                "n_points": plan.samples.get("D_points", 128),
-                "seed": plan.seeds.get("D", 3),
-                "artifact_dir": _artifact_dir(run_dir, "D"),
-            },
-        )
+        # Stability and speed gates on final candidate evaluator (opt-in via gate_order).
+        run_gate_d = "D" in plan.gate_order
+        run_gate_e = "E" in plan.gate_order
 
-        prefers_layered = geom.startswith("layer") or geom == "plane_layer"
-        baseline_backend = self._baseline_backend(spec, OracleFidelity.F1 if prefers_layered else OracleFidelity.F2, base_query)
-        if baseline_backend is None:
-            baseline_eval = candidate_eval
-        else:
-            baseline_eval = _backend_eval_fn(baseline_backend, spec, base_query.quantity, base_query.cache_policy, base_query.budget)
-        gate_results["E"] = gateE_speed.run_gate(
-            base_query,
-            result,
-            config={
-                "candidate_eval": candidate_eval,
-                "baseline_eval": baseline_eval,
-                "n_bench": plan.samples.get("E_bench", 2048),
-                "min_speedup": plan.thresholds.get("min_speedup", 1.1),
-                "prereq_pass": all(gate_results[g].status == "pass" for g in ("A", "B", "C") if g in gate_results),
-                "artifact_dir": _artifact_dir(run_dir, "E"),
-            },
-        )
+        if run_gate_d:
+            gate_results["D"] = gateD_stability.run_gate(
+                base_query,
+                result,
+                config={
+                    "candidate_eval": candidate_eval,
+                    "delta": float(plan.thresholds.get("stability", 5e-2)),
+                    "stability_tol": float(plan.thresholds.get("stability", 5e-2)),
+                    "n_points": plan.samples.get("D_points", 128),
+                    "seed": plan.seeds.get("D", 3),
+                    "artifact_dir": _artifact_dir(run_dir, "D"),
+                },
+            )
+
+        if run_gate_e:
+            prefers_layered = geom.startswith("layer") or geom == "plane_layer"
+            baseline_backend = self._baseline_backend(
+                spec,
+                OracleFidelity.F1 if prefers_layered else OracleFidelity.F2,
+                base_query,
+            )
+            if baseline_backend is None:
+                baseline_eval = candidate_eval
+            else:
+                baseline_eval = _backend_eval_fn(
+                    baseline_backend,
+                    spec,
+                    base_query.quantity,
+                    base_query.cache_policy,
+                    base_query.budget,
+                )
+            gate_results["E"] = gateE_speed.run_gate(
+                base_query,
+                result,
+                config={
+                    "candidate_eval": candidate_eval,
+                    "baseline_eval": baseline_eval,
+                    "n_bench": plan.samples.get("E_bench", 2048),
+                    "min_speedup": plan.thresholds.get("min_speedup", 1.1),
+                    "prereq_pass": all(
+                        gate_results[g].status == "pass" for g in ("A", "B", "C") if g in gate_results
+                    ),
+                    "artifact_dir": _artifact_dir(run_dir, "E"),
+                },
+            )
 
         final_status = self._final_status(gate_results)
         reasons = self._reasons(gate_results)
@@ -433,16 +454,22 @@ class Verifier:
             if suffix:
                 art_dir = art_dir / suffix
             if gate == "A":
+                exclusion_radius = float(plan.thresholds.get("laplacian_exclusion_radius", 5e-2))
+                interface_band = float(plan.thresholds.get("laplacian_interface_band", 0.0))
                 gate_results["A"] = gateA_pde.run_gate(
                     query,
                     result,
                     config={
                         "seed": plan.seeds.get("A", 0),
                         "n_interior": plan.samples.get("A_interior", 128),
-                        "exclusion_radius": 5e-2,
+                        "exclusion_radius": exclusion_radius,
                         "linf_tol": plan.thresholds.get("laplacian_linf", 5e-3),
                         "l2_tol": plan.thresholds.get("laplacian_linf", 5e-3),
                         "p95_tol": plan.thresholds.get("laplacian_linf", 5e-3),
+                        "fd_h": plan.thresholds.get("laplacian_fd_h", 2e-2),
+                        "prefer_autograd": bool(plan.thresholds.get("laplacian_prefer_autograd", 1.0)),
+                        "interface_band": interface_band,
+                        "autograd_max_samples": plan.samples.get("A_interior", 128),
                         "spec": spec,
                         "candidate_eval": candidate_eval,
                         "artifact_dir": art_dir,

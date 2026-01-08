@@ -224,15 +224,22 @@ class GFlowNetProgramGenerator(BasisGenerator):
         )
 
 
-def _spec_metadata_from_spec(spec: Any) -> SpecMetadata:
+def _spec_metadata_from_spec(
+    spec: Any,
+    *,
+    extra_overrides: Optional[Mapping[str, Any]] = None,
+) -> SpecMetadata:
     geom_type = _infer_geom_type_from_spec(spec)
     dielectrics = getattr(spec, "dielectrics", None) or []
     bc_type = getattr(spec, "BCs", "") or ""
     extra = {
         "allow_branch_cut": bool(dielectrics),
         "allow_pole": True,
+        "allow_real_primitives": True,
         "layered": bool(dielectrics),
     }
+    if extra_overrides:
+        extra.update(dict(extra_overrides))
     return SpecMetadata(
         geom_type=geom_type,
         n_dielectrics=len(dielectrics),

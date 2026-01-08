@@ -261,6 +261,61 @@ def test_laplace_bem_fmm_against_direct(n_panels: int) -> None:
         pytest.fail("\n".join(msg_lines))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for FMM GPU matvec test"
+)
+def test_laplace_bem_fmm_cuda_sigma_device() -> None:
+    dtype = torch.float32
+    n_panels = 64
+    centroids, areas, sigma = _make_random_panels(
+        n_panels=n_panels,
+        dtype=dtype,
+    )
+
+    fmm = make_laplace_fmm_backend(
+        src_centroids=centroids,
+        areas=areas,
+        max_leaf_size=64,
+        theta=0.6,
+        use_dipole=True,
+        logger=None,
+        backend="gpu",
+        device="cuda",
+    )
+
+    sigma_cuda = sigma.to(device="cuda")
+    V_cuda = bem_matvec_gpu(
+        sigma=sigma_cuda,
+        src_centroids=centroids,
+        areas=areas,
+        tile_size=64,
+        self_integrals=None,
+        logger=None,
+        use_keops=False,
+        kernel=DEFAULT_SINGLE_LAYER_KERNEL,
+        backend="external",
+        matvec_impl=fmm.matvec,
+    )
+
+    assert V_cuda.is_cuda
+    assert torch.isfinite(V_cuda).all()
+
+    V_cpu = bem_matvec_gpu(
+        sigma=sigma,
+        src_centroids=centroids,
+        areas=areas,
+        tile_size=64,
+        self_integrals=None,
+        logger=None,
+        use_keops=False,
+        kernel=DEFAULT_SINGLE_LAYER_KERNEL,
+        backend="external",
+        matvec_impl=fmm.matvec,
+    )
+
+    assert torch.allclose(V_cuda.cpu(), V_cpu, rtol=1e-3, atol=1e-4)
+
+
 def test_sanity_suite_bem_against_direct_small() -> None:
     """
     Thin wrapper around ``sanity_suite.run_bem_fmm_against_bem`` with

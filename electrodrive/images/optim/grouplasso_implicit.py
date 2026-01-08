@@ -31,21 +31,49 @@ def _group_prox(
         lam_vec = lambda_group.to(device=w.device, dtype=w.dtype).view(-1)
         if lam_vec.numel() == 1:
             lam_vec = lam_vec.expand_as(w)
+        if lam_vec.numel() != w.shape[0]:
+            raise ValueError(
+                "lambda_group must be scalar or match w shape for group prox."
+            )
     else:
         lam_vec = None
-    unique_groups = torch.unique(group_ids)
-    for g_val in unique_groups:
-        mask = group_ids == g_val
-        if not bool(mask.any()):
-            continue
-        w_g = w_out[mask]
-        norm_g = torch.linalg.norm(w_g)
-        lam = float(lam_vec[mask].mean().item()) if lam_vec is not None else float(lambda_group)
-        if float(norm_g) <= lam:
-            w_out[mask] = 0.0
-        else:
-            shrink = (norm_g - lam) / norm_g
-            w_out[mask] = shrink * w_g
+
+    unique_groups, inverse = torch.unique(
+        group_ids, sorted=True, return_inverse=True
+    )
+    if unique_groups.numel() == 0:
+        return w_out
+
+    norms_sq = torch.zeros(
+        unique_groups.numel(), device=w.device, dtype=w.dtype
+    )
+    norms_sq.scatter_add_(0, inverse, w_out * w_out)
+    norms = torch.sqrt(norms_sq)
+
+    if lam_vec is not None:
+        lam_sum = torch.zeros(
+            unique_groups.numel(), device=w.device, dtype=w.dtype
+        )
+        lam_sum.scatter_add_(0, inverse, lam_vec)
+        counts = torch.bincount(inverse, minlength=unique_groups.numel()).to(
+            device=w.device, dtype=w.dtype
+        )
+        lam_group = lam_sum / counts.clamp_min(1.0)
+    else:
+        lam_group = torch.full(
+            (unique_groups.numel(),),
+            float(lambda_group),
+            device=w.device,
+            dtype=w.dtype,
+        )
+
+    shrink = torch.where(
+        norms > 0,
+        (norms - lam_group) / norms,
+        torch.zeros_like(norms),
+    )
+    shrink = torch.clamp(shrink, min=0.0)
+    w_out = w_out * shrink[inverse]
     return w_out
 
 

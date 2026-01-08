@@ -1,220 +1,268 @@
+# AGENTS.md — Operation Black Hammer (Discovery Push Edition)
 
+This repository is an active research codebase for **Operation Black Hammer**: discovering **new analytical Green’s functions** via a **method-of-images / programmatic AI** approach. Codex must keep the repo **healthy, reproducible, GPU-first, and verifier-aligned**.
 
-## 2) Updated AGENTS.md (GPU-first + discovery workflow + ramp + refinement)
-
-````markdown
-# AGENTS.md — Electrodrive (GPU-First Discovery + Repo Health)
-
-This document defines how humans and AI agents must work on Electrodrive.
-Primary objectives:
-1) Run **GPU-first** discovery experiments safely and reproducibly.
-2) Preserve **repo health** (tests, APIs, CLIs).
-3) Enable **credible discovery** (verified metrics, not just “it ran”).
+This file is the single source of truth for how Codex should operate during any discovery push.
 
 ---
 
-## 0) Non-negotiables
+## 1) Non-negotiables
 
-### 0.1 GPU-first doctrine
-- All heavy compute must be on **CUDA**.
-- If `torch.cuda.is_available()` is false: **STOP**. Do not “try CPU anyway.”
-- Forbidden in hot paths:
-  - large CPU numpy loops
-  - `.cpu()` / `.numpy()` on big tensors
-  - CPU fallback for flows / gfn_flow
+### 1.1 GPU-first doctrine
+Target machine:
+- ROG Zephyrus G16 GU605CX_GU605CX
+- Intel Core Ultra 9 285H
+- NVIDIA Blackwell RTX 5090 (24 GB VRAM)
+- 32 GB RAM
 
-### 0.2 Flows require CUDA
-- The flows subsystem enforces CUDA (device_guard.ensure_cuda).
-- Any path that constructs flow-based generators must pass `device="cuda"` when CUDA is available.
-- If environment variables request CPU but flow mode is active, code must override to CUDA or fail loudly.
+Rules:
+1. **GPU is primary.** Prefer GPU implementations even if it requires extra engineering.
+2. **No implicit CPU fallbacks in hot paths.** `.cpu()`, `.numpy()`, Python loops over tensors, CPU-only kernels in critical loops are treated as defects unless explicitly justified.
+3. Mixed precision policy:
+   - Proposal/generative models: BF16/FP16 allowed
+   - Solver/verification: FP32 default
+   - Certification / numerically sensitive transforms: FP64 where required
 
-### 0.3 Repo health never declines
-- Do not break existing CLIs/APIs.
-- Prefer additive changes behind flags/config.
-- Tests should continue to pass (skips are allowed only for optional deps).
+### 1.2 Do not weaken gates
+The verifier gates (A–D and beyond) are the target. **Do not reduce gate strictness**, thresholds, or sample sizes to “get a pass.” Fix methodology/representation/sampling instead.
 
----
-
-## 1) Environment conventions
-
-- Use `python3` explicitly (do not assume `python` exists).
-- Prefer a venv: `.venv/bin/python`.
-- Always confirm GPU is visible:
-
+### 1.3 Always operate in the venv
+Every shell session begins with:
 ```bash
-python3 - <<'PY'
-import torch
-print(torch.__version__)
-print("cuda:", torch.cuda.is_available())
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA unavailable")
-print("gpu:", torch.cuda.get_device_name(0))
-PY
-nvidia-smi
+source .venv/bin/activate
 ````
 
 ---
 
-## 2) Discovery runner contract
+## 2) Repo health contract
 
-Canonical entrypoint:
+### 2.1 What “repo health” means
+
+Repo health includes:
+
+* No new test failures (relative to baseline)
+* No broken imports / packaging
+* No silent numerical meaning changes without tests + docs
+* No new CPU/GPU transfer regressions in core loops
+* Discovery runs must be diagnosable via **preflight.json** (see §5)
+
+### 2.2 Clean working tree requirement
+
+Before and after any commit, and before/after any run:
 
 ```bash
-python3 -m electrodrive.experiments.run_discovery --config <yaml>
+git status --porcelain
 ```
 
-All runs must produce:
+If non-empty: **STOP** and report exactly what is dirty.
 
+### 2.3 Full pytest command (canonical)
+
+Run full pytest only when explicitly instructed or immediately before merging a major change:
+
+```bash
+source .venv/bin/activate
+pytest --ignore=staging --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py --ignore=temp_AI_upgrade -vv -rs -q --maxfail=1
 ```
-runs/<timestamp>_<tag>/
-  config.yaml
-  env.json
-  git.json
-  metrics.jsonl
-  best.jsonl
-  artifacts/certificates/
+
+Otherwise, use targeted tests only.
+
+---
+
+## 3) Safety system: emergency stop & no-thrashing
+
+### 3.1 Absolute prohibitions
+
+* **No `rm -rf` anywhere** (including `runs/`).
+* Do not delete/overwrite run artifacts. If consolidating, write to a new directory.
+* Do not mass-reformat or rename unrelated files.
+* Do not “fix” failures by disabling tests unless explicitly instructed.
+
+### 3.2 Emergency stop conditions
+
+Trigger EMERGENCY STOP if:
+
+* New widespread failures appear and root cause is unclear
+* You enter an edit→fail→edit loop without clear progress
+* You suspect you’ve corrupted core infrastructure (imports, verifier, solver, device placement)
+
+Emergency stop procedure:
+
+1. Revert protected code:
+
+   ```bash
+   git reset --hard HEAD
+   git clean -fd
+   ```
+2. Write an incident report:
+
+   * `.blackhammer/emergency_stop_report.md`
+   * include what changed, what broke, and why you reverted
+
+After EMERGENCY STOP, you may continue only by adding **new experimental code** in a new namespace until instructed otherwise.
+
+---
+
+## 4) Change discipline (how Codex edits)
+
+### 4.1 Small commits only
+
+* Make surgical edits.
+* Commit in small, reviewable chunks.
+* After each commit: run targeted tests relevant to the change.
+
+### 4.2 No behavioral changes without tests
+
+If you change any of:
+
+* scoring / ranking behavior
+* sampling distributions
+* solver behavior
+* verification wiring
+  you must add/adjust tests and update docs.
+
+### 4.3 Determinism & reproducibility
+
+* Seeds must be recorded in run directories.
+* Runs must record:
+
+  * git SHA
+  * config (as executed)
+  * device info
+  * preflight.json (when enabled)
+
+---
+
+## 5) Discovery runs: required instrumentation
+
+### 5.1 Preflight is mandatory for pushes
+
+Discovery runs must use `preflight_mode`:
+
+* `off`: no counters
+* `lite`: low overhead (for scale)
+* `full`: heavy diagnostics (for debugging/pilots)
+
+**Push runs default to `lite`**. Debug/pilot runs may use `full`.
+
+Artifacts:
+
+* `<RUN_DIR>/preflight.json` must exist when preflight is enabled.
+* If failures occur, `<RUN_DIR>/preflight_first_offender.json` may be written (once per run).
+
+### 5.2 Interpreting preflight.json (minimum signals)
+
+A healthy run typically has:
+
+* `compiled_ok / sampled_programs_total` not tiny (often >0.5)
+* `solved_ok > 0`
+* `fast_scored > 0` every generation
+* `verified_written > 0` at least once per short run and frequently in longer runs
+* `nonfinite_pred_fraction ≈ 0`
+
+If these are violated, treat it as an operational or algorithmic diagnosis task:
+
+* Do not guess. Use preflight counters + first offender snapshot.
+
+---
+
+## 6) Gate-ready operational checklist (must be satisfied before large pushes)
+
+For layered dielectric discovery targeting strict verifier A–D, configs should enable:
+
+* `run.layered_sampling: true`
+* `run.use_reference_potential: true`
+* `run.use_gate_proxies: true`
+* `run.layered_prefer_dcim: true`
+* `run.layered_allow_real_primitives: false`
+* `run.layered_exclusion_radius` aligned to verifier exclusion (~5e-2 typical)
+* `run.layered_interface_delta` aligned to verifier delta (~1e-2 typical)
+* `run.layered_interface_band` aligned to interface delta (~1e-2 typical)
+* `run.layered_stability_delta: 1e-2` (perturbation magnitude)
+* `solver.fast_column_normalize: true`
+* `run.allow_not_ready: true` (avoid early termination during exploration)
+
+**Do not edit verifier thresholds to make passing easier.**
+
+---
+
+## 7) Canonical configs
+
+Repository provides templates:
+
+* Debug/pilot (more diagnostics): `configs/discovery_black_hammer_gate_ready.yaml`
+* Scale/push (low overhead): `configs/discovery_black_hammer_push.yaml`
+
+Use these as baselines. Do not fork ad-hoc configs without recording why.
+
+---
+
+## 8) Performance rules for push readiness
+
+### 8.1 Avoid CPU sync in hot loops
+
+Inside candidate loops:
+
+* avoid `.item()` calls unless necessary
+* batch operations
+* avoid printing per-candidate logs
+
+### 8.2 Stable math first
+
+* Use column normalization in fast solve when enabled.
+* Reject nonfinite candidates early; do not allow NaN scores into ranking.
+
+---
+
+## 9) Required documentation updates
+
+Any change that affects discovery behavior must be logged in:
+
+* `docs/black_hammer_changes.md`
+
+Include:
+
+* what changed
+* why it changed
+* how to validate (tests + minimal run recipe)
+
+---
+
+## 10) Command reference
+
+Activate venv:
+
+```bash
+source .venv/bin/activate
+```
+
+Targeted tests (example patterns):
+
+```bash
+pytest -q tests/test_fast_weights_stability.py -vv -rs --maxfail=1
+pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1
+pytest -q tests/test_reference_decomposition.py -vv -rs --maxfail=1
+```
+
+Full test suite (canonical, only when instructed):
+
+```bash
+pytest --ignore=staging --ignore=electrodrive/fmm3d/tests/test_kernels_gpu_stress.py --ignore=temp_AI_upgrade -vv -rs -q --maxfail=1
+```
+
+CPU fallback scan (use sparingly):
+
+```bash
+rg -n "\.cpu\(|\.numpy\(|\.item\(|to\('cpu'\)" electrodrive
 ```
 
 ---
 
-## 3) Required metrics for credibility
+## 11) Final rule: protect the repo
 
-Every best candidate must log at minimum:
+Black Hammer succeeds only if:
 
-* Absolute:
-
-  * `mean_bc_err_holdout`, `max_bc_err_holdout`
-  * `mean_pde_err_holdout`, `max_pde_err_holdout` (can be laplacian proxy)
-* Relative:
-
-  * `rel_bc_err_holdout`
-  * `rel_lap_holdout` (or `rel_pde_err_holdout` if laplacian not available)
-* Denominators:
-
-  * `oracle_bc_mean_abs_holdout`
-  * `oracle_in_mean_abs_holdout`
-* Complexity / structure:
-
-  * `n_terms`, `complex_count`
-* Timing:
-
-  * `eval_time_us`, `solve_time_us`, `total_time_us`
-
-If relative errors are not logged, discovery claims are not credible.
-
----
-
-## 4) Ramp protocol (monster-run readiness gate)
-
-### 4.1 Ramp config purpose
-
-Ramp is a “cheap” run to determine whether scaling is worth it.
-Ramp must:
-
-* be deterministic or controlled (see 4.2)
-* abort if not improving
-* produce a readiness report
-
-### 4.2 Deterministic ramp
-
-To avoid noise from changing specs:
-
-* Ramp should support `run.fixed_spec: true`
-* If enabled, the same physical spec is reused for all generations.
-* Log `spec_hash` per generation to prove it is constant.
-
-### 4.3 Ramp pass criteria
-
-A run is “READY for monster” only if:
-
-* no ramp abort triggered
-* rel metrics improve by configured thresholds
-* final `rel_bc_err_holdout < 1e-3` (or a clearly justified alternate)
-* empty compilation fraction is low
-* element typing indicates intended basis (DCIM elements present for layered runs)
-
----
-
-## 5) Layered media (DCIM-like) rules
-
-For `spec.BCs == "dielectric_interfaces"`:
-
-### 5.1 Translation invariance
-
-* Image terms should share the source `(x,y)` in layered planar geometry.
-* Refinement must **not** change x/y for layered problems.
-
-### 5.2 Complex images
-
-* `z_imag` must be nonzero for DCIM pole/branch-cut images.
-* Guardrails should prevent “all z_imag == 0” populations in layered runs.
-
-### 5.3 Element identity must be preserved
-
-* `DCIMPoleImageBasis` and `DCIMBranchCutImageBasis` must stay distinct.
-* Serialization/deserialization must keep their types.
-
----
-
-## 6) Refinement policy (if enabled)
-
-Refinement is allowed only if:
-
-* GPU-only
-* config-gated (`run.refine_enabled`)
-* bounded compute (few steps, few candidates)
-* preserves invariants:
-
-  * layered x/y fixed
-  * z_imag clamped to >0 minimum
-  * all params remain CUDA tensors
-
-Refinement must update:
-
-* cand["elements"], cand["weights"], cand["metrics"], and cand["score"]
-  atomically when it accepts an improvement.
-
----
-
-## 7) Testing policy
-
-* Avoid full test suite unless requested.
-
-* Always run targeted tests when fixing regressions:
-
-  * step10 GPU device smoke:
-
-    ```bash
-    pytest -q -vv --maxfail=1 tests/test_step10_integration_e2e.py::test_discover_images_gfn_flow_smoke
-    ```
-
-* If optional deps are missing (pykeops, xitorch), tests should skip cleanly.
-
----
-
-## 8) Performance guidelines
-
-* No `torch.cuda.synchronize()` inside inner loops (only around timing).
-* Use microbatch knobs where implemented (`run.score_microbatch`).
-* Cache expensive intermediates for topK only (e.g., holdout matrices).
-* Prefer BF16/FP16 for proposal nets; keep verification in FP32.
-
----
-
-## 9) “Monster run” definition and when to do it
-
-A monster run means:
-
-* population_B in the thousands (4096–8192)
-* hundreds to thousands of generations
-* large point counts
-
-Do **not** run a monster configuration until:
-
-* ramp is passing (no abort)
-* relative errors are trending down
-* repo health tests for critical paths are green
-
----
-
-
+* the repo remains healthy and testable
+* discovery runs are reproducible and diagnosable
+* GPU-first doctrine is upheld
+* strict A–D gate passes are pursued by **methodology improvements**, not threshold relaxation

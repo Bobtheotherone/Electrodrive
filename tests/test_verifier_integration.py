@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from electrodrive.verify import verifier as verifier_mod
+from electrodrive.verify.gates import GateResult
 from electrodrive.verify.verifier import VerificationPlan, Verifier
 from electrodrive.verify.oracle_types import OracleFidelity
 from electrodrive.verify.oracle_registry import OracleRegistry
@@ -50,6 +52,39 @@ def test_verifier_plane_pass(tmp_path: Path) -> None:
     assert run_dirs, "Verifier did not emit artifacts"
     cert_path = run_dirs[0] / "discovery_certificate.json"
     assert cert_path.exists()
+
+
+def test_verifier_gate_a_exclusion_radius_configurable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _skip_if_no_cuda()
+    spec = {
+        "domain": "halfspace",
+        "BCs": "Dirichlet",
+        "conductors": [{"type": "plane", "z": 0.0, "potential": 0.0}],
+        "charges": [{"type": "point", "q": 1.0, "pos": [0.0, 0.0, 1.0]}],
+        "dielectrics": [],
+    }
+    plan = VerificationPlan()
+    plan.gate_order = ["A"]
+    plan.thresholds["laplacian_exclusion_radius"] = 0.123
+    plan.samples["A_interior"] = 16
+
+    captured = {}
+
+    def _fake_gate(query, result, *, config=None):  # type: ignore[no-untyped-def]
+        captured["exclusion_radius"] = config.get("exclusion_radius")
+        return GateResult(gate="A", status="pass", metrics={}, thresholds={})
+
+    monkeypatch.setattr(verifier_mod.gateA_pde, "run_gate", _fake_gate)
+
+    out_root = tmp_path / "runs_exclusion"
+    verifier = Verifier(registry=_fast_registry(), out_root=out_root)
+
+    def _candidate_fn(p: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(p.shape[0], device=p.device, dtype=p.dtype)
+
+    cert = verifier.run({"eval_fn": _candidate_fn}, spec, plan)
+    assert cert.final_status == "pass"
+    assert captured["exclusion_radius"] == pytest.approx(0.123)
 
 
 def test_verifier_bad_candidate_fail(tmp_path: Path) -> None:

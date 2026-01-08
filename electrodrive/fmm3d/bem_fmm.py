@@ -627,6 +627,7 @@ class LaplaceFmm3D:
 
         dev = self.fmm_device
         dtype = self.cfg.dtype
+        sigma_device = sigma.device
 
         with torch.no_grad():
             # ------------------------------------------------------------------
@@ -636,10 +637,15 @@ class LaplaceFmm3D:
             # once and scale in-place on device. Otherwise, fall back to a
             # pinned host buffer (if available) or a plain host buffer.
             # ------------------------------------------------------------------
+            if self._areas_gpu is None and self.N > 0:
+                self._areas_gpu = self.areas.to(device=dev, dtype=dtype)
+
             if self._areas_gpu is not None:
-                sigma_gpu = sigma.to(device=dev, dtype=dtype, non_blocking=True)
-                sigma_gpu.mul_(self._areas_gpu)  # q_j on device
-                q_gpu = sigma_gpu
+                if sigma_device == dev and sigma.dtype == dtype:
+                    sigma_dev = sigma
+                else:
+                    sigma_dev = sigma.to(device=dev, dtype=dtype, non_blocking=True)
+                q_gpu = sigma_dev * self._areas_gpu  # q_j on device
             else:
                 if self._q_host_pinned is not None:
                     q_cpu = self._q_host_pinned
@@ -712,17 +718,25 @@ class LaplaceFmm3D:
             phi_total_tree_gpu = phi_far_tree_gpu + phi_p2p_tree_gpu
             phi_total_tree_gpu = phi_total_tree_gpu * float(K_E)
 
-            # Map back to original panel order on GPU, then bring result to CPU.
+            # Map back to original panel order on GPU, then move to output device.
             V_gpu_orig = tree_gpu.map_to_original_order(phi_total_tree_gpu)
-            V = V_gpu_orig.to(device=self.device, dtype=self.dtype)
+            if sigma_device.type == "cuda":
+                V = V_gpu_orig
+            else:
+                V = V_gpu_orig.to(device=self.device, dtype=self.dtype)
 
-            # Apply diagonal self-integral correction on CPU.
+            # Apply diagonal self-integral correction on the output device.
             if self_integrals is not None:
                 if self_integrals.shape != sigma.shape:
                     raise ValueError(
                         "self_integrals must have shape (N,) matching sigma."
                     )
-                V = V + self_integrals * sigma * self.areas
+                if sigma_device.type == "cuda":
+                    if self._areas_gpu is None:
+                        self._areas_gpu = self.areas.to(device=dev, dtype=dtype)
+                    V = V + self_integrals * sigma * self._areas_gpu
+                else:
+                    V = V + self_integrals * sigma * self.areas
 
             # Clamp non-finite entries on CPU.
             mask_finite = torch.isfinite(V)
@@ -776,15 +790,41 @@ class LaplaceFmm3D:
             raise ValueError(
                 f"sigma has length {N}, but FMM backend was built for {self.N} panels."
             )
-        if sigma.device.type != "cpu":
-            raise ValueError(
-                "LaplaceFmm3D.matvec currently supports only CPU sigma tensors."
-            )
+        sigma_device = sigma.device
+        if sigma_device.type == "cuda":
+            if self.backend != "gpu":
+                raise ValueError(
+                    "LaplaceFmm3D.matvec requires backend='gpu' for CUDA sigma. "
+                    "Rebuild the backend with backend='gpu' or move sigma to CPU."
+                )
+            fmm_device = self.fmm_device
+            if fmm_device.type == "cuda" and fmm_device.index is None:
+                fmm_device = torch.device("cuda", torch.cuda.current_device())
+            if sigma_device != fmm_device:
+                raise ValueError(
+                    "LaplaceFmm3D.matvec CUDA sigma must live on "
+                    f"{fmm_device}, got {sigma_device}."
+                )
+        elif sigma_device.type != "cpu":
+            raise ValueError("LaplaceFmm3D.matvec only supports CPU or CUDA sigma.")
         if sigma.dtype != self.dtype:
             raise ValueError(
                 f"LaplaceFmm3D sigma dtype mismatch: expected {self.dtype}, "
                 f"got {sigma.dtype}."
             )
+        if self_integrals is not None:
+            if self_integrals.shape != sigma.shape:
+                raise ValueError("self_integrals must have shape (N,) matching sigma.")
+            if self_integrals.device != sigma_device:
+                raise ValueError(
+                    "self_integrals must be on the same device as sigma "
+                    f"(sigma={sigma_device}, self_integrals={self_integrals.device})."
+                )
+            if self_integrals.dtype != sigma.dtype:
+                raise ValueError(
+                    "self_integrals must have the same dtype as sigma "
+                    f"(sigma={sigma.dtype}, self_integrals={self_integrals.dtype})."
+                )
 
         # Cheap fast-path fix: ensure we are working with contiguous
         # 1D storage for sigma. We treat sigma as read-only.

@@ -115,42 +115,41 @@ def run_gate(
     if spec.conductors:
         target_potential = float(spec.conductors[0].get("potential", 0.0))
 
+    has_conductors = bool(spec.conductors)
     points = query.points
     tol = dirichlet_tol
     mask = torch.zeros(points.shape[0], device=device, dtype=torch.bool)
-    if geom == "plane" and spec.conductors:
-        z = float(spec.conductors[0].get("z", 0.0))
-        mask = _plane_mask(points, z, tol)
-    elif geom == "sphere" and spec.conductors:
-        center = torch.tensor(spec.conductors[0].get("center", [0.0, 0.0, 0.0]), device=device, dtype=dtype)
-        radius = float(spec.conductors[0].get("radius", 1.0))
-        mask = _sphere_mask(points, center, radius, dirichlet_tol)
-
     sampled = False
-    if not torch.any(mask):
-        sampled_pts = _sample_boundary(spec, device, dtype, n_samples, seed=seed)
-        if sampled_pts is not None:
-            sampled = True
-            points = sampled_pts
-            V_vals = _ensure_cuda(candidate_eval(points))
+    V_vals = torch.empty(0, device=device, dtype=dtype)
+    max_err = 0.0
+    notes: List[str] = []
+    if has_conductors:
+        if geom == "plane":
+            z = float(spec.conductors[0].get("z", 0.0))
+            mask = _plane_mask(points, z, tol)
+        elif geom == "sphere":
+            center = torch.tensor(spec.conductors[0].get("center", [0.0, 0.0, 0.0]), device=device, dtype=dtype)
+            radius = float(spec.conductors[0].get("radius", 1.0))
+            mask = _sphere_mask(points, center, radius, dirichlet_tol)
+
+        if not torch.any(mask):
+            sampled_pts = _sample_boundary(spec, device, dtype, n_samples, seed=seed)
+            if sampled_pts is not None:
+                sampled = True
+                points = sampled_pts
+                V_vals = _ensure_cuda(candidate_eval(points))
+            else:
+                V_vals = result.V if result.V is not None else torch.empty(0, device=device, dtype=dtype)
         else:
-            V_vals = result.V if result.V is not None else torch.empty(0, device=device, dtype=dtype)
+            V_vals = result.V[mask] if result.V is not None else torch.empty(0, device=device, dtype=dtype)
+
+        if V_vals.numel() == 0:
+            notes.append("no_boundary_samples")
+        else:
+            max_err = float(torch.max(torch.abs(V_vals - target_potential)).item())
     else:
-        V_vals = result.V[mask] if result.V is not None else torch.empty(0, device=device, dtype=dtype)
-
-    if V_vals.numel() == 0:
-        return GateResult(
-            gate="B",
-            status="n_a",
-            metrics={"dirichlet_max_err": 0.0},
-            thresholds={"dirichlet": dirichlet_tol, "continuity": continuity_tol},
-            evidence={},
-            oracle={"method": result.method, "fidelity": result.fidelity.value},
-            notes=["no_boundary_samples"],
-            config=cfg,
-        )
-
-    max_err = float(torch.max(torch.abs(V_vals - target_potential)).item())
+        points = torch.empty(0, 3, device=device, dtype=dtype)
+        notes.append("no_conductors_dirichlet_skipped")
     interface_metrics: List[float] = []
     interface_d_metrics: List[float] = []
     evidence: Dict[str, str] = {}
@@ -212,7 +211,6 @@ def run_gate(
         "dirichlet": dirichlet_tol,
         "continuity": continuity_tol,
     }
-    notes: List[str] = []
     if sampled:
         notes.append("sampled_boundary")
     if interface_metrics:

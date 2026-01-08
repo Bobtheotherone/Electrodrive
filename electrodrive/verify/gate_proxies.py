@@ -161,8 +161,14 @@ def proxy_gateA(
     dtype: torch.dtype,
     seed: int = 0,
     linf_tol: float = 5e-3,
+    autograd_max_samples: int | None = None,
+    fd_max_samples: int = 128,
 ) -> Dict[str, Any]:
     spec_dict = _as_spec_dict(spec)
+    if autograd_max_samples is None:
+        autograd_max_samples = n_interior
+    method = "none"
+    n_used = 0
     if n_interior <= 0:
         return {
             "proxy_gateA_linf": float("inf"),
@@ -170,6 +176,8 @@ def proxy_gateA(
             "proxy_gateA_p95": float("inf"),
             "proxy_gateA_status": "fail",
             "proxy_gateA_worst_ratio": float("inf"),
+            "proxy_gateA_method": method,
+            "proxy_gateA_n_used": n_used,
         }
 
     pts = _sample_interior_gateA(
@@ -189,17 +197,25 @@ def proxy_gateA(
             "proxy_gateA_p95": float("inf"),
             "proxy_gateA_status": "fail",
             "proxy_gateA_worst_ratio": float("inf"),
+            "proxy_gateA_method": method,
+            "proxy_gateA_n_used": n_used,
         }
 
     lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
-    if prefer_autograd and pts.shape[0] <= 64:
+    if prefer_autograd and pts.shape[0] <= autograd_max_samples:
         try:
             lap = _laplacian_autograd(candidate_eval, pts)
+            method = "autograd"
+            n_used = int(pts.shape[0])
         except Exception:
             lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
+            method = "none"
+            n_used = 0
 
     if lap.numel() == 0:
-        fd_pts = _filter_interface_band(pts, interface_planes, interface_band + float(fd_h))
+        fd_limit = max(16, min(int(fd_max_samples), pts.shape[0]))
+        fd_pts = pts[:fd_limit].contiguous()
+        fd_pts = _filter_interface_band(fd_pts, interface_planes, interface_band + float(fd_h))
         if fd_pts.shape[0] == 0:
             return {
                 "proxy_gateA_linf": float("inf"),
@@ -207,9 +223,13 @@ def proxy_gateA(
                 "proxy_gateA_p95": float("inf"),
                 "proxy_gateA_status": "fail",
                 "proxy_gateA_worst_ratio": float("inf"),
+                "proxy_gateA_method": method,
+                "proxy_gateA_n_used": n_used,
             }
         lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=float(fd_h))
         pts = fd_pts
+        method = "finite_diff"
+        n_used = int(fd_pts.shape[0])
 
     finite_mask = torch.isfinite(lap)
     if not torch.any(finite_mask):
@@ -236,6 +256,8 @@ def proxy_gateA(
         "proxy_gateA_p95": p95,
         "proxy_gateA_status": status,
         "proxy_gateA_worst_ratio": worst_ratio,
+        "proxy_gateA_method": method,
+        "proxy_gateA_n_used": n_used,
     }
 
 

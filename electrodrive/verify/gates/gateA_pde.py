@@ -19,6 +19,12 @@ def _ensure_vector(out: Any) -> torch.Tensor:
     return out.flatten()
 
 
+def _laplacian_eval_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return torch.float64
+    return dtype
+
+
 def _candidate_eval_fn(config: Dict[str, object]) -> Callable[[torch.Tensor], torch.Tensor]:
     fn = config.get("candidate_eval", None)
     if not callable(fn):
@@ -51,6 +57,31 @@ def _interface_planes_from_spec(spec: Dict[str, Any]) -> List[float]:
     return uniq
 
 
+def _charge_positions_from_spec(
+    spec: Dict[str, Any], device: torch.device, dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    charges = spec.get("charges", []) or []
+    if not charges:
+        return None
+    return torch.tensor(
+        [c.get("pos", [0.0, 0.0, 0.0]) for c in charges],
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _filter_charge_distance(
+    pts: torch.Tensor,
+    charge_pos: Optional[torch.Tensor],
+    min_dist: float,
+) -> torch.Tensor:
+    if min_dist <= 0.0 or charge_pos is None or pts.numel() == 0:
+        return pts
+    dists = torch.cdist(pts, charge_pos)
+    mask = torch.all(dists > min_dist, dim=1)
+    return pts[mask]
+
+
 def _filter_interface_band(pts: torch.Tensor, planes: List[float], band: float) -> torch.Tensor:
     if band <= 0.0 or not planes or pts.numel() == 0:
         return pts
@@ -69,24 +100,39 @@ def _sample_interior(
     *,
     seed: int,
     exclusion_radius: float,
+    interface_planes: Optional[List[float]] = None,
+    interface_band: float = 0.0,
+    extra_radius: float = 0.0,
+    max_attempts: int = 8,
 ) -> torch.Tensor:
     (x0, x1), (y0, y1), (z0, z1) = _bounds_from_spec(spec)
     # SobolEngine draws on CPU; transfer immediately to CUDA to keep hot paths on GPU.
     engine = torch.quasirandom.SobolEngine(dimension=3, scramble=True, seed=seed)
-    pts = engine.draw(n).to(device=device, dtype=dtype)
     span = torch.tensor([x1 - x0, y1 - y0, z1 - z0], device=device, dtype=dtype)
     base = torch.tensor([x0, y0, z0], device=device, dtype=dtype)
-    pts = pts * span + base
+    charge_pos = _charge_positions_from_spec(spec, device, dtype)
+    min_dist = exclusion_radius + extra_radius
+    interface_planes = interface_planes or []
 
-    charges = spec.get("charges", []) or []
-    if charges:
-        charge_pos = torch.tensor([c.get("pos", [0.0, 0.0, 0.0]) for c in charges], device=device, dtype=dtype)
-        dists = torch.cdist(pts, charge_pos)
-        mask = torch.all(dists > exclusion_radius, dim=1)
-        if torch.any(~mask):
-            pts = pts[mask]
-    if pts.numel() == 0:
-        pts = torch.rand(n, 3, device=device, dtype=dtype) * 2.0 - 1.0
+    collected: List[torch.Tensor] = []
+    total = 0
+    attempts = 0
+    while total < n and attempts < max_attempts:
+        remaining = n - total
+        draw_n = max(remaining * 2, 32)
+        pts = engine.draw(draw_n).to(device=device, dtype=dtype)
+        pts = pts * span + base
+        pts = _filter_charge_distance(pts, charge_pos, min_dist)
+        pts = _filter_interface_band(pts, interface_planes, interface_band)
+        if pts.numel() > 0:
+            collected.append(pts)
+            total += int(pts.shape[0])
+        attempts += 1
+
+    if collected:
+        pts = torch.cat(collected, dim=0)[:n].contiguous()
+    else:
+        pts = torch.zeros(0, 3, device=device, dtype=dtype)
     if not pts.is_cuda:
         raise ValueError("Gate A sampling produced CPU tensor (GPU-first rule)")
     return pts.contiguous()
@@ -94,15 +140,33 @@ def _sample_interior(
 
 def _laplacian_autograd(candidate_eval: Callable[[torch.Tensor], torch.Tensor], pts: torch.Tensor) -> torch.Tensor:
     pts = pts.detach().clone().requires_grad_(True)
-    V = _ensure_vector(candidate_eval(pts))
+    with torch.enable_grad():
+        V = _ensure_vector(candidate_eval(pts))
     if V.shape[0] != pts.shape[0]:
         raise ValueError("candidate_eval must return one value per point")
     lap = torch.zeros_like(V)
     for idx in range(pts.shape[0]):
-        grad_i = torch.autograd.grad(V[idx], pts, retain_graph=True, create_graph=True)[0][idx]
+        grad = torch.autograd.grad(
+            V[idx],
+            pts,
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=True,
+        )[0]
+        if grad is None:
+            continue
+        grad_i = grad[idx]
         second = 0.0
         for dim in range(3):
-            second += torch.autograd.grad(grad_i[dim], pts, retain_graph=True)[0][idx, dim]
+            grad2 = torch.autograd.grad(
+                grad_i[dim],
+                pts,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if grad2 is None:
+                continue
+            second = second + grad2[idx, dim]
         lap[idx] = second
     return lap.detach()
 
@@ -144,12 +208,24 @@ def run_gate(
     spec = dict(cfg.get("spec", query.spec))
     candidate_eval = _candidate_eval_fn(cfg)
     interface_band = float(cfg.get("interface_band", 0.0))
-    interface_planes = _interface_planes_from_spec(spec) if interface_band > 0.0 else []
+    interface_planes = _interface_planes_from_spec(spec)
+    lap_dtype = _laplacian_eval_dtype(query.points.dtype)
+    max_attempts = int(cfg.get("resample_max_attempts", 8))
+    fd_margin = float(cfg.get("fd_stencil_margin", 1.0))
 
     torch.manual_seed(seed)
-    pts = _sample_interior(spec, query.points.device, query.points.dtype, n_samples, seed=seed, exclusion_radius=exclusion_radius)
-    pts = _filter_interface_band(pts, interface_planes, interface_band)
-    if pts.shape[0] == 0:
+    pts = _sample_interior(
+        spec,
+        query.points.device,
+        lap_dtype,
+        n_samples,
+        seed=seed,
+        exclusion_radius=exclusion_radius,
+        interface_planes=interface_planes,
+        interface_band=interface_band,
+        max_attempts=max_attempts,
+    )
+    if pts.shape[0] < n_samples:
         return GateResult(
             gate="A",
             status="fail",
@@ -157,7 +233,7 @@ def run_gate(
             thresholds=thresholds,
             evidence={},
             oracle={"method": result.method, "fidelity": result.fidelity.value, "config": result.config_fingerprint},
-            notes=["no_samples_after_interface_band"],
+            notes=["insufficient_samples_after_filter"],
             config=cfg,
         )
 
@@ -168,21 +244,47 @@ def run_gate(
         if prefer_autograd and pts.shape[0] <= int(cfg.get("autograd_max_samples", 64)):
             lap = _laplacian_autograd(candidate_eval, pts)
             lap_method = "autograd"
+            finite_mask = torch.isfinite(lap)
+            nonfinite_frac = 1.0 - float(finite_mask.float().mean().item())
+            if nonfinite_frac > 0.1:
+                raise ValueError("autograd_laplacian_nonfinite")
         else:
-            fd_pts = pts[: max(16, min(int(cfg.get("fd_max_samples", 128)), pts.shape[0]))].contiguous()
+            fd_limit = max(16, min(int(cfg.get("fd_max_samples", 128)), n_samples))
             fd_h = float(cfg.get("fd_h", 2e-2))
-            fd_pts = _filter_interface_band(fd_pts, interface_planes, interface_band + fd_h)
-            if fd_pts.shape[0] == 0:
-                lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
+            fd_pts = _sample_interior(
+                spec,
+                query.points.device,
+                lap_dtype,
+                fd_limit,
+                seed=seed + 1,
+                exclusion_radius=exclusion_radius,
+                interface_planes=interface_planes,
+                interface_band=interface_band + fd_h,
+                extra_radius=fd_h * fd_margin,
+                max_attempts=max_attempts,
+            )
+            if fd_pts.shape[0] < fd_limit:
+                lap = torch.zeros(0, device=pts.device, dtype=lap_dtype)
             else:
                 lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=fd_h)
             pts = fd_pts
     except Exception:
-        fd_pts = pts[: max(16, min(int(cfg.get("fd_max_samples", 128)), pts.shape[0]))].contiguous()
+        fd_limit = max(16, min(int(cfg.get("fd_max_samples", 128)), n_samples))
         fd_h = float(cfg.get("fd_h", 2e-2))
-        fd_pts = _filter_interface_band(fd_pts, interface_planes, interface_band + fd_h)
-        if fd_pts.shape[0] == 0:
-            lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
+        fd_pts = _sample_interior(
+            spec,
+            query.points.device,
+            lap_dtype,
+            fd_limit,
+            seed=seed + 1,
+            exclusion_radius=exclusion_radius,
+            interface_planes=interface_planes,
+            interface_band=interface_band + fd_h,
+            extra_radius=fd_h * fd_margin,
+            max_attempts=max_attempts,
+        )
+        if fd_pts.shape[0] < fd_limit:
+            lap = torch.zeros(0, device=pts.device, dtype=lap_dtype)
         else:
             lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=fd_h)
         lap_method = "finite_diff"
@@ -196,16 +298,19 @@ def run_gate(
             thresholds=thresholds,
             evidence={},
             oracle={"method": result.method, "fidelity": result.fidelity.value, "config": result.config_fingerprint},
-            notes=["no_samples_after_interface_band"],
+            notes=["insufficient_stencil_safe_samples"],
             config=cfg,
         )
 
-    finite_mask = torch.isfinite(lap)
+    lap_full = lap
+    pts_full = pts
+    finite_mask = torch.isfinite(lap_full)
+    nonfinite_mask = ~finite_mask
     nonfinite_count = int((~finite_mask).sum().item())
-    nonfinite_frac = nonfinite_count / max(1, lap.numel())
+    nonfinite_frac = nonfinite_count / max(1, lap_full.numel())
     if nonfinite_count:
-        lap = lap[finite_mask]
-        pts = pts[finite_mask]
+        lap = lap_full[finite_mask]
+        pts = pts_full[finite_mask]
     if lap.numel() == 0:
         status = "fail"
         metrics = {"linf": float("inf"), "l2": float("inf"), "p95": float("inf"), "n": float(pts.shape[0]), "method": 1.0}
@@ -221,6 +326,31 @@ def run_gate(
     metrics["nonfinite_frac"] = float(nonfinite_frac)
     metrics["nonfinite_count"] = float(nonfinite_count)
     metrics["method"] = 0.0 if lap_method == "autograd" else 1.0
+
+    if nonfinite_count:
+        charge_pos = _charge_positions_from_spec(spec, pts_full.device, pts_full.dtype)
+        if charge_pos is not None and pts_full.numel() > 0:
+            dists = torch.cdist(pts_full, charge_pos)
+            min_dist = torch.min(dists, dim=1).values
+            bad = min_dist[nonfinite_mask]
+            if bad.numel() > 0:
+                metrics["nonfinite_min_charge_dist"] = float(bad.min().item())
+        if interface_planes and pts_full.numel() > 0:
+            plane_tensor = torch.tensor(interface_planes, device=pts_full.device, dtype=pts_full.dtype)
+            dists = torch.abs(pts_full[:, 2:3] - plane_tensor.view(1, -1))
+            min_plane = torch.min(dists, dim=1).values
+            bad_plane = min_plane[nonfinite_mask]
+            if bad_plane.numel() > 0:
+                metrics["nonfinite_min_interface_dist"] = float(bad_plane.min().item())
+        try:
+            with torch.no_grad():
+                V_diag = _ensure_vector(candidate_eval(pts_full))
+            V_abs = V_diag.abs()
+            V_bad = V_abs[nonfinite_mask]
+            if V_bad.numel() > 0 and torch.isfinite(V_bad).any():
+                metrics["nonfinite_max_abs_V"] = float(torch.max(V_bad[torch.isfinite(V_bad)]).item())
+        except Exception:
+            pass
 
     if nonfinite_frac > 0.1:
         status = "fail"

@@ -187,15 +187,16 @@ class PointChargeBasis(ImageBasisElement):
             R = torch.linalg.norm(targets - pos, dim=1).clamp_min(1e-12)
             return K_E / R
 
-        z_imag = torch.as_tensor(z_imag, device=targets.device, dtype=torch.float32).view(())
-        tgt = targets.to(device=targets.device, dtype=torch.float32)
-        pos_f = pos.to(device=targets.device, dtype=torch.float32)
+        complex_real_dtype = torch.float64 if targets.dtype == torch.float64 else torch.float32
+        z_imag = torch.as_tensor(z_imag, device=targets.device, dtype=complex_real_dtype).view(())
+        tgt = targets.to(device=targets.device, dtype=complex_real_dtype)
+        pos_f = pos.to(device=targets.device, dtype=complex_real_dtype)
         delta = tgt - pos_f
         dx, dy, dz = delta[:, 0], delta[:, 1], delta[:, 2]
         dz_complex = torch.complex(dz, z_imag.expand_as(dz))
         r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
         inv_r = 1.0 / torch.sqrt(r2_complex)
-        phi = 2.0 * inv_r.real
+        phi = (2.0 * inv_r.real).to(dtype=targets.dtype)
         return K_E * phi
 
 

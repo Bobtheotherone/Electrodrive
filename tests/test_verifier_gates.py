@@ -121,6 +121,51 @@ def test_gate_a_pde_interface_band_linear_pass(tmp_path: Path) -> None:
     assert out.metrics["linf"] < 1e-1
 
 
+def test_gate_a_pde_autograd_constant_linear_pass(tmp_path: Path) -> None:
+    _skip_if_no_cuda()
+    pts = torch.randn(64, 3, device="cuda", dtype=torch.float32)
+    query, result = _dummy_result(pts)
+
+    def constant(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 0] * 0.0
+
+    def linear(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 2]
+
+    for fn in (constant, linear):
+        out = gateA_pde.run_gate(
+            query,
+            result,
+            config={
+                "candidate_eval": fn,
+                "artifact_dir": tmp_path / "gateA_autograd",
+                "spec": query.spec,
+                "n_interior": 64,
+                "linf_tol": 1e-2,
+                "l2_tol": 1e-2,
+                "prefer_autograd": True,
+                "autograd_max_samples": 64,
+            },
+        )
+        assert out.status in ("pass", "borderline")
+        assert out.metrics["linf"] < 1e-2
+
+
+def test_gate_a_fd_precision_improves() -> None:
+    _skip_if_no_cuda()
+    pts32 = torch.randn(128, 3, device="cuda", dtype=torch.float32)
+    pts64 = pts32.to(dtype=torch.float64)
+
+    def big_linear(p: torch.Tensor) -> torch.Tensor:
+        return 1e9 * p[:, 2]
+
+    lap32 = gateA_pde._laplacian_finite_diff(big_linear, pts32, h=2e-2)
+    lap64 = gateA_pde._laplacian_finite_diff(big_linear, pts64, h=2e-2)
+    err32 = float(torch.median(lap32.abs()).item())
+    err64 = float(torch.median(lap64.abs()).item())
+    assert err64 < err32 * 1e-2
+
+
 def test_gate_b_boundary_plane_pass(tmp_path: Path) -> None:
     _skip_if_no_cuda()
     pts = torch.randn(64, 3, device="cuda", dtype=torch.float32)

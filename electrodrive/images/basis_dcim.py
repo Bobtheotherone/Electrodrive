@@ -69,9 +69,10 @@ class DCIMBlockBasis(ImageBasisElement):
         q = float(meta.get("source_charge", 1.0))
         pref = q / (4.0 * math.pi * eps1)
 
-        depths = torch.as_tensor([img.depth for img in self.images], device=device, dtype=torch.complex128)
-        weights = torch.as_tensor([img.weight for img in self.images], device=device, dtype=torch.complex128)
-        amp = torch.as_tensor(self.amplitude, device=device, dtype=torch.complex128)
+        complex_dtype = torch.complex128 if real_dtype == torch.float64 else torch.complex64
+        depths = torch.as_tensor([img.depth for img in self.images], device=device, dtype=complex_dtype)
+        weights = torch.as_tensor([img.weight for img in self.images], device=device, dtype=complex_dtype)
+        amp = torch.as_tensor(self.amplitude, device=device, dtype=complex_dtype)
         weights = weights * amp * pref
 
         zero_like_depths = torch.zeros((), device=device, dtype=depths.real.dtype)

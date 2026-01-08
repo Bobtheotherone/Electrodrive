@@ -73,7 +73,7 @@ class ImageSystemV2:
                 use_complex = bool(getattr(elem, "_use_complex", False))
                 if use_complex:
                     z_imag = elem.params.get("z_imag")
-                    z_imag_t = torch.as_tensor(z_imag if z_imag is not None else 0.0, device=self.device, dtype=torch.float32).view(())
+                    z_imag_t = torch.as_tensor(z_imag if z_imag is not None else 0.0, device=self.device, dtype=self.dtype).view(())
                     point_complex_pos.append(pos)
                     point_complex_z.append(z_imag_t)
                     point_complex_idx.append(idx)
@@ -104,13 +104,16 @@ class ImageSystemV2:
     def potential(self, targets: torch.Tensor) -> torch.Tensor:
         orig_device = targets.device
         orig_dtype = targets.dtype
+        compute_dtype = torch.promote_types(self.dtype, targets.dtype)
 
-        X = targets.to(device=self.device, dtype=self.dtype)
-        V = torch.zeros(X.shape[0], device=self.device, dtype=self.dtype)
+        X = targets.to(device=self.device, dtype=compute_dtype)
+        V = torch.zeros(X.shape[0], device=self.device, dtype=compute_dtype)
 
         if self._point_real_pos is not None:
-            pos = self._point_real_pos
+            pos = self._point_real_pos.to(dtype=compute_dtype)
             w = self._gather_weights(self._point_real_idx)
+            if w is not None:
+                w = w.to(dtype=compute_dtype)
             diff = X[:, None, :] - pos[None, :, :]
             r = torch.linalg.norm(diff, dim=-1).clamp_min(1e-12)
             phi = (K_E / r)
@@ -118,12 +121,14 @@ class ImageSystemV2:
                 V = V + phi @ w
 
         if self._point_complex_pos is not None and self._point_complex_z_imag is not None:
-            pos = self._point_complex_pos
+            pos = self._point_complex_pos.to(dtype=compute_dtype)
             w = self._gather_weights(self._point_complex_idx)
             if w is not None:
-                Xc = X.to(dtype=torch.float32)
-                pos_c = pos.to(dtype=torch.float32)
-                z_imag = self._point_complex_z_imag.to(dtype=torch.float32)
+                w = w.to(dtype=compute_dtype)
+                complex_real_dtype = torch.float64 if compute_dtype == torch.float64 else torch.float32
+                Xc = X.to(dtype=complex_real_dtype)
+                pos_c = pos.to(dtype=complex_real_dtype)
+                z_imag = self._point_complex_z_imag.to(dtype=complex_real_dtype)
 
                 dx = Xc[:, None, 0] - pos_c[None, :, 0]
                 dy = Xc[:, None, 1] - pos_c[None, :, 1]
@@ -132,17 +137,17 @@ class ImageSystemV2:
                 r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
                 inv_r = 1.0 / torch.sqrt(r2_complex)
                 phi = 2.0 * inv_r.real
-                phi = (K_E * phi).to(dtype=self.dtype)
+                phi = (K_E * phi).to(dtype=compute_dtype)
                 V = V + phi @ w
 
         if self._dcim_elems:
             for elem, idx in zip(self._dcim_elems, self._dcim_idx):
-                w = self.weights[idx]
+                w = self.weights[idx].to(dtype=compute_dtype)
                 V = V + w * elem.potential(X)
 
         if self._fallback_elems:
             for elem, idx in zip(self._fallback_elems, self._fallback_idx):
-                w = self.weights[idx]
+                w = self.weights[idx].to(dtype=compute_dtype)
                 V = V + w * elem.potential(X)
 
         return V.to(device=orig_device, dtype=orig_dtype)

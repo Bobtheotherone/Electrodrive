@@ -335,14 +335,15 @@ class ImageSystem:
             return self._potential_v2(targets)
         orig_device = targets.device
         orig_dtype = targets.dtype
+        compute_dtype = torch.promote_types(self.dtype, targets.dtype)
 
         # Move to the system's device/dtype for basis evaluation.
-        targets_sys = targets.to(device=self.device, dtype=self.dtype)
+        targets_sys = targets.to(device=self.device, dtype=compute_dtype)
 
         V_sys = torch.zeros(
             targets_sys.shape[0],
             device=self.device,
-            dtype=self.dtype,
+            dtype=compute_dtype,
         )
 
         point_real_pos: List[torch.Tensor] = []
@@ -355,14 +356,14 @@ class ImageSystem:
         for elem, w in zip(self.elements, self.weights):
             if isinstance(elem, PointChargeBasis):
                 pos = elem.params["position"].to(
-                    device=self.device, dtype=self.dtype
+                    device=self.device, dtype=compute_dtype
                 ).view(3)
                 if bool(getattr(elem, "_use_complex", False)):
                     z_imag = elem.params.get("z_imag")
                     z_imag_t = torch.as_tensor(
                         z_imag if z_imag is not None else 0.0,
                         device=self.device,
-                        dtype=torch.float32,
+                        dtype=self.dtype,
                     ).view(())
                     point_complex_pos.append(pos)
                     point_complex_w.append(w)
@@ -375,7 +376,8 @@ class ImageSystem:
 
         if point_real_pos:
             pos = torch.stack(point_real_pos, dim=0).contiguous()
-            w = torch.stack(point_real_w).to(device=self.device, dtype=self.dtype)
+            pos = pos.to(dtype=compute_dtype)
+            w = torch.stack(point_real_w).to(device=self.device, dtype=compute_dtype)
             diff = targets_sys[:, None, :] - pos[None, :, :]
             r = torch.linalg.norm(diff, dim=-1).clamp_min(1e-12)
             phi = K_E / r
@@ -383,22 +385,24 @@ class ImageSystem:
 
         if point_complex_pos:
             pos = torch.stack(point_complex_pos, dim=0).contiguous()
-            w = torch.stack(point_complex_w).to(device=self.device, dtype=self.dtype)
-            Xc = targets_sys.to(dtype=torch.float32)
-            pos_c = pos.to(dtype=torch.float32)
-            z_imag = torch.stack(point_complex_z, dim=0).to(dtype=torch.float32)
+            pos = pos.to(dtype=compute_dtype)
+            w = torch.stack(point_complex_w).to(device=self.device, dtype=compute_dtype)
+            complex_real_dtype = torch.float64 if compute_dtype == torch.float64 else torch.float32
+            Xc = targets_sys.to(dtype=complex_real_dtype)
+            pos_c = pos.to(dtype=complex_real_dtype)
+            z_imag = torch.stack(point_complex_z, dim=0).to(dtype=complex_real_dtype)
             dx = Xc[:, None, 0] - pos_c[None, :, 0]
             dy = Xc[:, None, 1] - pos_c[None, :, 1]
             dz = Xc[:, None, 2] - pos_c[None, :, 2]
             dz_complex = torch.complex(dz, z_imag.view(1, -1).expand_as(dz))
             r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
             inv_r = 1.0 / torch.sqrt(r2_complex)
-            phi = (2.0 * inv_r.real).to(dtype=self.dtype)
+            phi = (2.0 * inv_r.real).to(dtype=compute_dtype)
             V_sys = V_sys + (K_E * phi) @ w
 
         # Avoid per-element dtype casts and extra allocations for fallback elements.
         for elem, w in fallback:
-            V_sys.add_(w * elem.potential(targets_sys))
+            V_sys.add_(w.to(dtype=compute_dtype) * elem.potential(targets_sys))
 
         # Preserve the caller's expectations about device/dtype.
         return V_sys.to(device=orig_device, dtype=orig_dtype)

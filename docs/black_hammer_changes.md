@@ -67,3 +67,13 @@
   - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_proxyA_transform.py -vv -rs --maxfail=1`
 - validate: proxy Gate A diagnostics report method/n_used, transform remains finite for extreme ratios, and balanced mode prefers candidates that pass B/C/D.
+
+## Phase 4.1: Gate A precision + stencil-safe sampling
+- change: Gate A Laplacian runs in float64, autograd handles constant-gradient second derivatives, and FD sampling resamples until stencil-safe counts are met.
+- change: point-charge complex evaluation respects input dtype (float32→complex64, float64→complex128) in ImageSystem/PointCharge/DCIM paths.
+- why: eliminate NaN/Inf blowups from autograd/FD cancellation and prevent dtype downcasts from corrupting Gate A metrics.
+- reproduce:
+  - `pytest -q tests/test_verifier_gates.py -k "gate_a_pde_autograd_constant_linear_pass or gate_a_fd_precision_improves" -vv -rs --maxfail=1`
+  - `pytest -q tests/test_imagesystem_dtype.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
+- validate: Gate A passes for linear/constant harmonic functions, FD precision improves in float64, and float64 candidate_eval remains differentiable.

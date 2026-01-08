@@ -117,6 +117,7 @@ def test_proxy_gateA_cpu_harmonic() -> None:
         assert metrics["proxy_gateA_status"] in ("pass", "borderline")
         assert torch.isfinite(torch.tensor(metrics["proxy_gateA_linf"]))
         assert metrics["proxy_gateA_linf"] < 1e-3
+        assert metrics["proxy_gateA_eval_dtype"] == "float64"
 
 
 def test_proxy_gateA_cuda_prefers_autograd() -> None:
@@ -146,3 +147,4 @@ def test_proxy_gateA_cuda_prefers_autograd() -> None:
     assert metrics["proxy_gateA_method"] == "autograd"
     assert metrics["proxy_gateA_status"] in ("pass", "borderline")
     assert torch.isfinite(torch.tensor(metrics["proxy_gateA_linf"]))
+    assert metrics["proxy_gateA_eval_dtype"] == "float64"

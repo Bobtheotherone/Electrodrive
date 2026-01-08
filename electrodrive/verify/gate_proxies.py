@@ -25,6 +25,24 @@ def _eval_tensor(fn: Callable[[torch.Tensor], torch.Tensor], pts: torch.Tensor) 
     return out.flatten()
 
 
+def _laplacian_eval_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+        return torch.float64
+    return dtype
+
+
+def _dtype_label(dtype: torch.dtype) -> str:
+    if dtype == torch.float16:
+        return "float16"
+    if dtype == torch.bfloat16:
+        return "bfloat16"
+    if dtype == torch.float32:
+        return "float32"
+    if dtype == torch.float64:
+        return "float64"
+    return str(dtype)
+
+
 def _bounds_from_spec(spec: Dict[str, Any]) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
     try:
         return gateA_pde._bounds_from_spec(spec)  # type: ignore[attr-defined]
@@ -77,23 +95,44 @@ def _sample_interior_fallback(
     *,
     seed: int,
     exclusion_radius: float,
+    interface_planes: list[float] | None = None,
+    interface_band: float = 0.0,
+    extra_radius: float = 0.0,
+    max_attempts: int = 8,
 ) -> torch.Tensor:
     (x0, x1), (y0, y1), (z0, z1) = _bounds_from_spec(spec)
     engine = torch.quasirandom.SobolEngine(dimension=3, scramble=True, seed=seed)
-    pts = engine.draw(n).to(device=device, dtype=dtype)
     span = torch.tensor([x1 - x0, y1 - y0, z1 - z0], device=device, dtype=dtype)
     base = torch.tensor([x0, y0, z0], device=device, dtype=dtype)
-    pts = pts * span + base
-
+    interface_planes = interface_planes or []
+    min_dist = exclusion_radius + extra_radius
     charges = spec.get("charges", []) or []
+    charge_pos = None
     if charges:
         charge_pos = torch.tensor([c.get("pos", [0.0, 0.0, 0.0]) for c in charges], device=device, dtype=dtype)
-        dists = torch.cdist(pts, charge_pos)
-        mask = torch.all(dists > exclusion_radius, dim=1)
-        if torch.any(~mask):
+
+    collected: list[torch.Tensor] = []
+    total = 0
+    attempts = 0
+    while total < n and attempts < max_attempts:
+        remaining = n - total
+        draw_n = max(remaining * 2, 32)
+        pts = engine.draw(draw_n).to(device=device, dtype=dtype)
+        pts = pts * span + base
+        if charge_pos is not None and min_dist > 0.0:
+            dists = torch.cdist(pts, charge_pos)
+            mask = torch.all(dists > min_dist, dim=1)
             pts = pts[mask]
-    if pts.numel() == 0:
-        pts = torch.rand(n, 3, device=device, dtype=dtype) * 2.0 - 1.0
+        pts = _filter_interface_band(pts, interface_planes, interface_band)
+        if pts.numel() > 0:
+            collected.append(pts)
+            total += int(pts.shape[0])
+        attempts += 1
+
+    if collected:
+        pts = torch.cat(collected, dim=0)[:n].contiguous()
+    else:
+        pts = torch.zeros(0, 3, device=device, dtype=dtype)
     return pts.contiguous()
 
 
@@ -105,28 +144,70 @@ def _sample_interior_gateA(
     *,
     seed: int,
     exclusion_radius: float,
+    interface_planes: list[float] | None = None,
+    interface_band: float = 0.0,
+    extra_radius: float = 0.0,
+    max_attempts: int = 8,
 ) -> torch.Tensor:
     if device.type == "cuda":
         try:
             return gateA_pde._sample_interior(  # type: ignore[attr-defined]
-                spec, device, dtype, n, seed=seed, exclusion_radius=exclusion_radius
+                spec,
+                device,
+                dtype,
+                n,
+                seed=seed,
+                exclusion_radius=exclusion_radius,
+                interface_planes=interface_planes,
+                interface_band=interface_band,
+                extra_radius=extra_radius,
+                max_attempts=max_attempts,
             )
         except Exception:
             pass
-    return _sample_interior_fallback(spec, device, dtype, n, seed=seed, exclusion_radius=exclusion_radius)
+    return _sample_interior_fallback(
+        spec,
+        device,
+        dtype,
+        n,
+        seed=seed,
+        exclusion_radius=exclusion_radius,
+        interface_planes=interface_planes,
+        interface_band=interface_band,
+        extra_radius=extra_radius,
+        max_attempts=max_attempts,
+    )
 
 
 def _laplacian_autograd(candidate_eval: Callable[[torch.Tensor], torch.Tensor], pts: torch.Tensor) -> torch.Tensor:
     pts = pts.detach().clone().requires_grad_(True)
-    V = _eval_tensor(candidate_eval, pts)
+    with torch.enable_grad():
+        V = _eval_tensor(candidate_eval, pts)
     if V.shape[0] != pts.shape[0]:
         raise ValueError("candidate_eval must return one value per point")
     lap = torch.zeros_like(V)
     for idx in range(pts.shape[0]):
-        grad_i = torch.autograd.grad(V[idx], pts, retain_graph=True, create_graph=True)[0][idx]
+        grad = torch.autograd.grad(
+            V[idx],
+            pts,
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=True,
+        )[0]
+        if grad is None:
+            continue
+        grad_i = grad[idx]
         second = 0.0
         for dim in range(3):
-            second += torch.autograd.grad(grad_i[dim], pts, retain_graph=True)[0][idx, dim]
+            grad2 = torch.autograd.grad(
+                grad_i[dim],
+                pts,
+                retain_graph=True,
+                allow_unused=True,
+            )[0]
+            if grad2 is None:
+                continue
+            second = second + grad2[idx, dim]
         lap[idx] = second
     return lap.detach()
 
@@ -163,42 +244,51 @@ def proxy_gateA(
     linf_tol: float = 5e-3,
     autograd_max_samples: int | None = None,
     fd_max_samples: int = 128,
+    fd_stencil_margin: float = 1.0,
+    resample_max_attempts: int = 8,
 ) -> Dict[str, Any]:
     spec_dict = _as_spec_dict(spec)
+    lap_dtype = _laplacian_eval_dtype(dtype)
+    eval_dtype_label = _dtype_label(lap_dtype)
     if autograd_max_samples is None:
         autograd_max_samples = n_interior
     method = "none"
     n_used = 0
+    fail_value = 1e12
     if n_interior <= 0:
         return {
-            "proxy_gateA_linf": float("inf"),
-            "proxy_gateA_l2": float("inf"),
-            "proxy_gateA_p95": float("inf"),
+            "proxy_gateA_linf": fail_value,
+            "proxy_gateA_l2": fail_value,
+            "proxy_gateA_p95": fail_value,
             "proxy_gateA_status": "fail",
             "proxy_gateA_worst_ratio": float("inf"),
             "proxy_gateA_method": method,
             "proxy_gateA_n_used": n_used,
+            "proxy_gateA_eval_dtype": eval_dtype_label,
         }
 
+    interface_planes = _interface_planes_from_spec(spec_dict)
     pts = _sample_interior_gateA(
         spec_dict,
         device,
-        dtype,
+        lap_dtype,
         n_interior,
         seed=seed,
         exclusion_radius=exclusion_radius,
+        interface_planes=interface_planes,
+        interface_band=interface_band,
+        max_attempts=resample_max_attempts,
     )
-    interface_planes = _interface_planes_from_spec(spec_dict) if interface_band > 0.0 else []
-    pts = _filter_interface_band(pts, interface_planes, interface_band)
-    if pts.shape[0] == 0:
+    if pts.shape[0] < n_interior:
         return {
-            "proxy_gateA_linf": float("inf"),
-            "proxy_gateA_l2": float("inf"),
-            "proxy_gateA_p95": float("inf"),
+            "proxy_gateA_linf": fail_value,
+            "proxy_gateA_l2": fail_value,
+            "proxy_gateA_p95": fail_value,
             "proxy_gateA_status": "fail",
             "proxy_gateA_worst_ratio": float("inf"),
             "proxy_gateA_method": method,
             "proxy_gateA_n_used": n_used,
+            "proxy_gateA_eval_dtype": eval_dtype_label,
         }
 
     lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
@@ -207,24 +297,41 @@ def proxy_gateA(
             lap = _laplacian_autograd(candidate_eval, pts)
             method = "autograd"
             n_used = int(pts.shape[0])
+            finite_mask = torch.isfinite(lap)
+            nonfinite_frac = 1.0 - float(finite_mask.float().mean().item())
+            if nonfinite_frac > 0.1:
+                lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
+                method = "none"
+                n_used = 0
         except Exception:
             lap = torch.zeros(0, device=pts.device, dtype=pts.dtype)
             method = "none"
             n_used = 0
 
     if lap.numel() == 0:
-        fd_limit = max(16, min(int(fd_max_samples), pts.shape[0]))
-        fd_pts = pts[:fd_limit].contiguous()
-        fd_pts = _filter_interface_band(fd_pts, interface_planes, interface_band + float(fd_h))
-        if fd_pts.shape[0] == 0:
+        fd_limit = max(16, min(int(fd_max_samples), n_interior))
+        fd_pts = _sample_interior_gateA(
+            spec_dict,
+            device,
+            lap_dtype,
+            fd_limit,
+            seed=seed + 1,
+            exclusion_radius=exclusion_radius,
+            interface_planes=interface_planes,
+            interface_band=interface_band + float(fd_h),
+            extra_radius=float(fd_h) * fd_stencil_margin,
+            max_attempts=resample_max_attempts,
+        )
+        if fd_pts.shape[0] < fd_limit:
             return {
-                "proxy_gateA_linf": float("inf"),
-                "proxy_gateA_l2": float("inf"),
-                "proxy_gateA_p95": float("inf"),
+                "proxy_gateA_linf": fail_value,
+                "proxy_gateA_l2": fail_value,
+                "proxy_gateA_p95": fail_value,
                 "proxy_gateA_status": "fail",
                 "proxy_gateA_worst_ratio": float("inf"),
                 "proxy_gateA_method": method,
                 "proxy_gateA_n_used": n_used,
+                "proxy_gateA_eval_dtype": eval_dtype_label,
             }
         lap = _laplacian_finite_diff(candidate_eval, fd_pts, h=float(fd_h))
         pts = fd_pts
@@ -233,16 +340,16 @@ def proxy_gateA(
 
     finite_mask = torch.isfinite(lap)
     if not torch.any(finite_mask):
-        linf = float("inf")
-        l2 = float("inf")
-        p95 = float("inf")
+        linf = fail_value
+        l2 = fail_value
+        p95 = fail_value
     else:
         lap = lap[finite_mask]
         abs_lap = torch.abs(lap)
-        linf = float(torch.max(abs_lap).item()) if abs_lap.numel() > 0 else float("inf")
+        linf = float(torch.max(abs_lap).item()) if abs_lap.numel() > 0 else fail_value
         abs_lap_f64 = abs_lap.double()
-        l2 = float(torch.sqrt(torch.mean(abs_lap_f64 * abs_lap_f64)).item()) if abs_lap_f64.numel() > 0 else float("inf")
-        p95 = float(torch.quantile(abs_lap_f64, 0.95).item()) if abs_lap_f64.numel() > 0 else float("inf")
+        l2 = float(torch.sqrt(torch.mean(abs_lap_f64 * abs_lap_f64)).item()) if abs_lap_f64.numel() > 0 else fail_value
+        p95 = float(torch.quantile(abs_lap_f64, 0.95).item()) if abs_lap_f64.numel() > 0 else fail_value
 
     worst_ratio = float(max(linf / linf_tol, l2 / linf_tol)) if linf_tol > 0 else float("inf")
     status = "fail"
@@ -258,6 +365,7 @@ def proxy_gateA(
         "proxy_gateA_worst_ratio": worst_ratio,
         "proxy_gateA_method": method,
         "proxy_gateA_n_used": n_used,
+        "proxy_gateA_eval_dtype": eval_dtype_label,
     }
 
 

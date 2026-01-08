@@ -568,6 +568,27 @@ def _nonfinite_count(t: torch.Tensor) -> int:
     return int(torch.count_nonzero(~torch.isfinite(t)).item())
 
 
+def _validate_weights(weights: torch.Tensor) -> Tuple[bool, str]:
+    if not torch.is_tensor(weights):
+        return False, "weights_not_tensor"
+    if weights.numel() == 0:
+        return False, "weights_empty"
+    if torch.is_complex(weights):
+        return False, "weights_complex"
+    if not weights.is_floating_point():
+        return False, "weights_nonfloat"
+    if not torch.isfinite(weights).all().item():
+        return False, "weights_nonfinite"
+    return True, ""
+
+
+def _weights_serializable(weights: torch.Tensor) -> Tuple[Optional[List[float]], str]:
+    ok, reason = _validate_weights(weights)
+    if not ok:
+        return None, reason
+    return weights.detach().cpu().tolist(), ""
+
+
 def _tensor_absmax(t: Optional[torch.Tensor]) -> float:
     if t is None or t.numel() == 0:
         return float("nan")
@@ -1154,6 +1175,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     per_gen_preflight: List[Dict[str, Any]] = []
     gen_counters: Optional[RunCounters] = None
     first_offender_written = False
+    weights_reject_reasons: set[str] = set()
 
     def _count_preflight(key: str, n: int = 1) -> None:
         if preflight_counters is None:
@@ -1198,6 +1220,39 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         }
         if write_first_offender(run_dir, payload):
             first_offender_written = True
+
+    def _reject_invalid_weights(
+        *,
+        gen_idx: int,
+        program_idx: int,
+        program: Any,
+        elements: Sequence[ImageBasisElement],
+        A_train: Optional[torch.Tensor],
+        V_train: Optional[torch.Tensor],
+        weights: Optional[torch.Tensor],
+        pred_hold: Optional[torch.Tensor],
+        reason: str,
+    ) -> None:
+        if preflight_counters is not None:
+            _count_preflight("solved_failed")
+            if torch.is_tensor(weights):
+                _count_preflight("weights_total", int(weights.numel()))
+                if reason == "weights_nonfinite":
+                    _count_preflight("weights_nonfinite_count", _nonfinite_count(weights))
+                if weights.numel() == 0:
+                    _count_preflight("weights_empty")
+        weights_reject_reasons.add(reason)
+        _maybe_write_first_offender(
+            gen_idx=gen_idx,
+            program_idx=program_idx,
+            program=program,
+            elements=elements,
+            A_train=A_train,
+            V_train=V_train,
+            weights=weights,
+            pred_hold=pred_hold,
+            reason=reason,
+        )
 
     fixed_spec_obj: Optional[CanonicalSpec] = None
     if fixed_spec:
@@ -1950,6 +2005,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         weights = weights_scaled / col_norms
                         if weights.numel() > 0:
                             assert_cuda_tensor(weights, "weights_dcim")
+                            weights_ok, reason = _validate_weights(weights)
+                            if not weights_ok:
+                                _reject_invalid_weights(
+                                    gen_idx=gen,
+                                    program_idx=-1,
+                                    program=dcim_program,
+                                    elements=dcim_elements,
+                                    A_train=A_train_dcim,
+                                    V_train=V_train,
+                                    weights=weights,
+                                    pred_hold=None,
+                                    reason=reason,
+                                )
+                                weights = weights[:0]
+                        if weights.numel() > 0:
                             end.record()
                             torch.cuda.synchronize()
                             t_solve_ms = float(start.elapsed_time(end))
@@ -2184,6 +2254,20 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     if weights.numel() == 0:
                         continue
                     assert_cuda_tensor(weights, "weights")
+                    weights_ok, reason = _validate_weights(weights)
+                    if not weights_ok:
+                        _reject_invalid_weights(
+                            gen_idx=gen,
+                            program_idx=idx,
+                            program=program,
+                            elements=elements,
+                            A_train=A_train,
+                            V_train=V_train,
+                            weights=weights,
+                            pred_hold=None,
+                            reason=reason,
+                        )
+                        continue
                     end.record()
                     torch.cuda.synchronize()
                     t_solve_ms = float(start.elapsed_time(end))
@@ -2634,6 +2718,20 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         if refined_weights.numel() == 0:
                             continue
                         assert_cuda_tensor(refined_weights, "refined_weights")
+                        weights_ok, reason = _validate_weights(refined_weights)
+                        if not weights_ok:
+                            _reject_invalid_weights(
+                                gen_idx=gen,
+                                program_idx=-1,
+                                program=cand["program"],
+                                elements=refine_elements,
+                                A_train=A_refine,
+                                V_train=refine_V,
+                                weights=refined_weights,
+                                pred_hold=None,
+                                reason=reason,
+                            )
+                            continue
                         end.record()
                         torch.cuda.synchronize()
                         t_solve_ms = float(start.elapsed_time(end))
@@ -2770,6 +2868,20 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 best_refined_rel_lap = rel_lap_val
 
                 for rank, cand in enumerate(top_final):
+                    weights_ok, reason = _validate_weights(cand["weights"])
+                    if not weights_ok:
+                        _reject_invalid_weights(
+                            gen_idx=gen,
+                            program_idx=rank,
+                            program=cand["program"],
+                            elements=cand["elements"],
+                            A_train=None,
+                            V_train=None,
+                            weights=cand["weights"],
+                            pred_hold=None,
+                            reason=reason,
+                        )
+                        continue
                     system = ImageSystem(cand["elements"], cand["weights"])
 
                     def _verify_eval(pts: torch.Tensor) -> torch.Tensor:
@@ -3156,6 +3268,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
             "per_gen": per_gen_preflight,
         }
+        if weights_reject_reasons:
+            extra["weights_reject_reasons"] = sorted(weights_reject_reasons)
         write_preflight_report(run_dir, preflight_counters, extra)
         summarize_to_stdout(preflight_counters)
 

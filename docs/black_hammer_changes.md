@@ -77,3 +77,12 @@
   - `pytest -q tests/test_imagesystem_dtype.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
 - validate: Gate A passes for linear/constant harmonic functions, FD precision improves in float64, and float64 candidate_eval remains differentiable.
+
+## Phase 4.2: Nonfinite weight rejection + finite proxy fails
+- change: added weight validation guards before mid/refine/verification; reject nonfinite weights and record reasons in preflight.
+- change: proxy_gateA failure payloads now keep `proxy_gateA_worst_ratio` finite (1e12).
+- change: added tests covering nonfinite weight rejection and summary serialization.
+- reproduce:
+  - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_weights_validation.py -vv -rs --maxfail=1`
+- validate: nonfinite weights are rejected before verification, summaries never contain non-numeric weights, and proxy failures remain finite.

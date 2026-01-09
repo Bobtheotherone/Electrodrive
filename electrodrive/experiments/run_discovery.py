@@ -608,6 +608,18 @@ def _mean_abs(x: torch.Tensor) -> float:
     return float(torch.mean(vals).item())
 
 
+def _mean_safe(x: torch.Tensor, *, fail_value: float = float("inf")) -> float:
+    if x.numel() == 0:
+        return 0.0
+    mean = torch.mean(x)
+    if torch.isfinite(mean).item():
+        return float(mean.item())
+    mean64 = torch.mean(x.double())
+    if torch.isfinite(mean64).item():
+        return float(mean64.item())
+    return float(fail_value)
+
+
 def _laplacian_denom(oracle_in_mean_abs: float, oracle_bc_mean_abs: float) -> float:
     return max(float(oracle_in_mean_abs), 1e-6 * float(oracle_bc_mean_abs), 1e-12)
 
@@ -2000,8 +2012,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
-                        bc_err = torch.mean(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])).item()
-                        in_err = torch.mean(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])).item()
+                        bc_err = _mean_safe(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold]))
+                        in_err = _mean_safe(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold]))
                         holdout_ok, holdout_vals, holdout_nonfinite = _sanitize_metric_block(
                             {"mean_bc": bc_err, "mean_in": in_err},
                             fail_value=HOLDOUT_FAIL_VALUE,
@@ -2345,15 +2357,15 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                             bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                             in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
-                            mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
-                            mean_in = float(torch.mean(in_err).item()) if in_err.numel() else 0.0
+                            mean_bc = _mean_safe(bc_err)
+                            mean_in = _mean_safe(in_err)
                             max_bc = float(torch.max(bc_err).item()) if bc_err.numel() else 0.0
                             max_in = float(torch.max(in_err).item()) if in_err.numel() else 0.0
 
                             mid_bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                             mid_in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                            mean_bc_mid = float(torch.mean(mid_bc_err).item()) if mid_bc_err.numel() else 0.0
-                            mean_in_mid = float(torch.mean(mid_in_err).item()) if mid_in_err.numel() else 0.0
+                            mean_bc_mid = _mean_safe(mid_bc_err)
+                            mean_in_mid = _mean_safe(mid_in_err)
                             rel_bc = mean_bc_mid / max(oracle_bc_mean_abs, 1e-12)
                             rel_in = mean_in_mid / max(oracle_in_mean_abs, 1e-12)
 
@@ -2372,7 +2384,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                             lap = _laplacian_fd(_eval_fn, interior_hold, h=1e-2)
                             lap_abs = torch.abs(lap)
-                            lap_mean = float(torch.mean(lap_abs).item()) if lap_abs.numel() else 0.0
+                            lap_mean = _mean_safe(lap_abs)
                             lap_max = float(torch.max(lap_abs).item()) if lap_abs.numel() else 0.0
                             rel_lap = lap_mean / lap_denom
 
@@ -2388,7 +2400,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                                 pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                                 pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                                pert_err = w_bc * float(torch.mean(pert_bc).item()) + w_pde * float(torch.mean(pert_in).item())
+                                pert_err = w_bc * _mean_safe(pert_bc) + w_pde * _mean_safe(pert_in)
                                 stability_ratio = float(pert_err / max(base_err, 1e-8))
                             if not math.isfinite(stability_ratio):
                                 stability_ratio = 1.0
@@ -2686,15 +2698,15 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                     bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                     in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
-                    mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
-                    mean_in = float(torch.mean(in_err).item()) if in_err.numel() else 0.0
+                    mean_bc = _mean_safe(bc_err)
+                    mean_in = _mean_safe(in_err)
                     max_bc = float(torch.max(bc_err).item()) if bc_err.numel() else 0.0
                     max_in = float(torch.max(in_err).item()) if in_err.numel() else 0.0
 
                     mid_bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                     mid_in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                    mean_bc_mid = float(torch.mean(mid_bc_err).item()) if mid_bc_err.numel() else 0.0
-                    mean_in_mid = float(torch.mean(mid_in_err).item()) if mid_in_err.numel() else 0.0
+                    mean_bc_mid = _mean_safe(mid_bc_err)
+                    mean_in_mid = _mean_safe(mid_in_err)
                     rel_bc = mean_bc_mid / max(oracle_bc_mean_abs, 1e-12)
                     rel_in = mean_in_mid / max(oracle_in_mean_abs, 1e-12)
 
@@ -2713,7 +2725,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                     lap = _laplacian_fd(_eval_fn, interior_hold, h=1e-2)
                     lap_abs = torch.abs(lap)
-                    lap_mean = float(torch.mean(lap_abs).item()) if lap_abs.numel() else 0.0
+                    lap_mean = _mean_safe(lap_abs)
                     lap_max = float(torch.max(lap_abs).item()) if lap_abs.numel() else 0.0
                     rel_lap = lap_mean / lap_denom
 
@@ -2729,7 +2741,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                         pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                         pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                        pert_err = w_bc * float(torch.mean(pert_bc).item()) + w_pde * float(torch.mean(pert_in).item())
+                        pert_err = w_bc * _mean_safe(pert_bc) + w_pde * _mean_safe(pert_in)
                         stability_ratio = float(pert_err / max(base_err, 1e-8))
                     if not math.isfinite(stability_ratio):
                         stability_ratio = 1.0
@@ -2921,8 +2933,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         assert_cuda_tensor(A_hold_hi, "A_hold_hi")
                         pred_hi_corr = A_hold_hi.matmul(cand["weights"])
                         pred_hi = _add_reference(pred_hi_corr, V_ref_hold)
-                        bc_err_hi = torch.mean(torch.abs(pred_hi[is_boundary_hold] - V_hold_hi[is_boundary_hold])).item()
-                        in_err_hi = torch.mean(torch.abs(pred_hi[~is_boundary_hold] - V_hold_hi[~is_boundary_hold])).item()
+                        bc_err_hi = _mean_safe(torch.abs(pred_hi[is_boundary_hold] - V_hold_hi[is_boundary_hold]))
+                        in_err_hi = _mean_safe(torch.abs(pred_hi[~is_boundary_hold] - V_hold_hi[~is_boundary_hold]))
                         cand["score_hi"] = float(w_bc * bc_err_hi + w_pde * in_err_hi)
                         cand["metrics"]["hi_bc_mean_abs"] = float(bc_err_hi)
                         cand["metrics"]["hi_pde_mean_abs"] = float(in_err_hi)
@@ -3256,21 +3268,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                             bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
                             in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
-                            mean_bc = float(torch.mean(bc_err).item()) if bc_err.numel() else 0.0
-                            mean_in = float(torch.mean(in_err).item()) if in_err.numel() else 0.0
+                            mean_bc = _mean_safe(bc_err)
+                            mean_in = _mean_safe(in_err)
                             max_bc = float(torch.max(bc_err).item()) if bc_err.numel() else 0.0
                             max_in = float(torch.max(in_err).item()) if in_err.numel() else 0.0
 
                             mid_bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                             mid_in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                            mean_bc_mid = float(torch.mean(mid_bc_err).item()) if mid_bc_err.numel() else 0.0
-                            mean_in_mid = float(torch.mean(mid_in_err).item()) if mid_in_err.numel() else 0.0
+                            mean_bc_mid = _mean_safe(mid_bc_err)
+                            mean_in_mid = _mean_safe(mid_in_err)
                             rel_bc = mean_bc_mid / denom_bc
                             rel_in = mean_in_mid / max(oracle_in_mean_abs, 1e-12)
 
                             lap = _laplacian_fd(_eval_fn, interior_hold, h=1e-2)
                             lap_abs = torch.abs(lap)
-                            lap_mean = float(torch.mean(lap_abs).item()) if lap_abs.numel() else 0.0
+                            lap_mean = _mean_safe(lap_abs)
                             lap_max = float(torch.max(lap_abs).item()) if lap_abs.numel() else 0.0
                             rel_lap = lap_mean / denom_lap
 
@@ -3289,7 +3301,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
                             pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
                             pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                            pert_err = w_bc * float(torch.mean(pert_bc).item()) + w_pde * float(torch.mean(pert_in).item())
+                            pert_err = w_bc * _mean_safe(pert_bc) + w_pde * _mean_safe(pert_in)
                             stability_ratio = float(pert_err / max(base_err, 1e-8))
 
                         comp = _complexity(cand["program"], refine_elements)

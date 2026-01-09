@@ -1236,6 +1236,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     per_gen_preflight: List[Dict[str, Any]] = []
     gen_counters: Optional[RunCounters] = None
     first_offender_written = False
+    holdout_offender_logged = False
     weights_reject_reasons: set[str] = set()
     holdout_reject_reasons: set[str] = set()
 
@@ -1338,9 +1339,11 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         denom_lap: float,
         reason: str,
     ) -> None:
+        nonlocal holdout_offender_logged
         holdout_reject_reasons.add(reason)
-        if preflight_counters is None or first_offender_written:
+        if preflight_counters is None or holdout_offender_logged:
             return
+        holdout_offender_logged = True
 
         pred_in = None
         oracle_in = None

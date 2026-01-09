@@ -37,6 +37,12 @@ class RunCounters:
     dcim_baseline_nonfinite_count: int = 0
     interior_metric_nonfinite_count: int = 0
     lap_metric_nonfinite_count: int = 0
+    holdout_total: int = 0
+    holdout_boundary_total: int = 0
+    holdout_interior_total: int = 0
+    holdout_boundary_empty_count: int = 0
+    holdout_interior_empty_count: int = 0
+    holdout_denom_nonfinite_count: int = 0
 
     def add(self, key: str, n: int = 1) -> None:
         if not hasattr(self, key):

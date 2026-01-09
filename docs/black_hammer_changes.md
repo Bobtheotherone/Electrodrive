@@ -94,3 +94,10 @@
 - reproduce:
   - `pytest -q tests/test_holdout_metric_finiteness.py -vv -rs --maxfail=1`
 - validate: pilot run shows no `score=nan used_as_best=True` or `best_in_abs=inf` and preflight includes holdout counters.
+
+## Phase 4.4: Holdout partition + denom stability
+- change: compute oracle holdout mean-abs denominators in float64; track holdout partition sizes and denom stats in preflight; resample interior holdout if filtered empty and flag empty partitions.
+- why: prevent denom_in/lap_denom overflow to inf and keep holdout metrics meaningful during discovery scoring.
+- reproduce:
+  - `pytest -q tests/test_holdout_partitioning.py -vv -rs --maxfail=1`
+- validate: pilot run logs finite denom values, holdout_interior_empty_count stays near 0, and DCIM baseline is either finite or reported unavailable.

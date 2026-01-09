@@ -1922,6 +1922,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 reason="holdout_nonfinite_fast",
                             )
                             fast_scores.append(float(HOLDOUT_FAIL_VALUE))
+                            _count_preflight("fast_scored")
                             fast_metrics.append(
                                 {
                                     "holdout_nonfinite": True,

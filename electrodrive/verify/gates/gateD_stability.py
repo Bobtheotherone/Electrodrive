@@ -8,6 +8,13 @@ from . import GateResult, _assert_cuda_inputs
 from ..oracle_types import OracleQuery, OracleResult
 
 
+_GATE_D_NONFINITE_PENALTY = 1e30
+
+
+def _finite_tensor(tensor: torch.Tensor) -> bool:
+    return bool(torch.isfinite(tensor).all().item())
+
+
 def _ensure_eval(cfg: Dict[str, object]) -> Callable[[torch.Tensor], torch.Tensor]:
     fn = cfg.get("candidate_eval", None)
     if not callable(fn):
@@ -45,12 +52,28 @@ def run_gate(
     if not (base_val.is_cuda and pert_val.is_cuda):
         raise ValueError("Gate D expects CUDA tensors")
 
-    diff = base_val.flatten() - pert_val.flatten()
-    denom = torch.norm(base_val.flatten()).clamp_min(1e-8)
-    rel_change = float((torch.norm(diff) / denom).item())
-    var_base = float(torch.var(base_val).item())
-
-    status = "pass" if rel_change <= tolerance else "borderline" if rel_change <= tolerance * 2.0 else "fail"
+    base64 = base_val.double()
+    pert64 = pert_val.double()
+    notes = []
+    if not _finite_tensor(base64) or not _finite_tensor(pert64):
+        rel_change = float(_GATE_D_NONFINITE_PENALTY)
+        var_base = float(_GATE_D_NONFINITE_PENALTY)
+        status = "fail"
+        notes.append("nonfinite_inputs")
+    else:
+        diff = base64.flatten() - pert64.flatten()
+        denom = torch.linalg.norm(base64.flatten()).clamp_min(1e-12)
+        rel_change_t = torch.linalg.norm(diff) / denom
+        var_base_t = torch.var(base64)
+        if not _finite_tensor(rel_change_t) or not _finite_tensor(var_base_t):
+            rel_change = float(_GATE_D_NONFINITE_PENALTY)
+            var_base = float(_GATE_D_NONFINITE_PENALTY)
+            status = "fail"
+            notes.append("nonfinite_metrics")
+        else:
+            rel_change = float(rel_change_t.item())
+            var_base = float(var_base_t.item())
+            status = "pass" if rel_change <= tolerance else "borderline" if rel_change <= tolerance * 2.0 else "fail"
 
     evidence = {}
     if artifact_dir:
@@ -72,6 +95,6 @@ def run_gate(
         thresholds=thresholds,
         evidence=evidence,
         oracle={"method": result.method, "fidelity": result.fidelity.value},
-        notes=[],
+        notes=notes,
         config=cfg,
     )

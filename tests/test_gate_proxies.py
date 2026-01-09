@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from electrodrive.verify.gate_proxies import proxy_gateA, proxy_gateB, proxy_gateC, proxy_gateD
@@ -88,6 +90,32 @@ def test_proxy_gateD_does_not_mutate_rng() -> None:
 
     assert a == a2
     assert b == b2
+
+
+def test_proxy_gateD_handles_large_values() -> None:
+    device = torch.device("cpu")
+    pts = torch.randn(128, 3, device=device, dtype=torch.float32)
+
+    def huge_linear(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 2] * 1e35
+
+    metrics = proxy_gateD(huge_linear, pts, delta=1e-2, seed=0)
+    assert math.isfinite(metrics["proxy_gateD_rel_change"])
+    assert math.isfinite(metrics["proxy_gateD_variance"])
+
+
+def test_proxy_gateB_handles_nonfinite_inputs() -> None:
+    spec = _layered_spec()
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    def huge_linear(p: torch.Tensor) -> torch.Tensor:
+        return p[:, 2] * 1e40
+
+    metrics = proxy_gateB(spec, huge_linear, n_xy=16, delta=0.01, device=device, dtype=dtype)
+    assert math.isfinite(metrics["proxy_gateB_max_v_jump"])
+    assert math.isfinite(metrics["proxy_gateB_max_d_jump"])
+    assert metrics.get("proxy_gateB_nonfinite") is True
 
 
 def test_proxy_gateA_cpu_harmonic() -> None:

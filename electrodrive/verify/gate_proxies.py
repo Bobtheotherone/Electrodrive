@@ -25,6 +25,13 @@ def _eval_tensor(fn: Callable[[torch.Tensor], torch.Tensor], pts: torch.Tensor) 
     return out.flatten()
 
 
+_PROXY_NONFINITE_PENALTY = 1e30
+
+
+def _finite_tensor(tensor: torch.Tensor) -> bool:
+    return bool(torch.isfinite(tensor).all().item())
+
+
 def _laplacian_eval_dtype(dtype: torch.dtype) -> torch.dtype:
     if dtype in (torch.float16, torch.bfloat16, torch.float32):
         return torch.float64
@@ -390,6 +397,7 @@ def proxy_gateB(
 
     max_v_jump = 0.0
     max_d_jump = 0.0
+    fail_value = float(_PROXY_NONFINITE_PENALTY)
     for z_val, eps_up, eps_down in interfaces:
         pts_up = torch.stack(
             [xy[:, 0], xy[:, 1], torch.full((n_xy,), z_val + delta, device=device, dtype=dtype)],
@@ -403,16 +411,38 @@ def proxy_gateB(
         pts_dn = pts_dn.detach().clone().requires_grad_(True)
         V_up = _eval_tensor(candidate_eval, pts_up)
         V_dn = _eval_tensor(candidate_eval, pts_dn)
+        if not _finite_tensor(V_up) or not _finite_tensor(V_dn):
+            return {
+                "proxy_gateB_max_v_jump": fail_value,
+                "proxy_gateB_max_d_jump": fail_value,
+                "proxy_gateB_nonfinite": True,
+            }
         grad_up = torch.autograd.grad(V_up, pts_up, grad_outputs=torch.ones_like(V_up), create_graph=False)[0]
         grad_dn = torch.autograd.grad(V_dn, pts_dn, grad_outputs=torch.ones_like(V_dn), create_graph=False)[0]
-        normal = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
-        d_jump = torch.abs(eps_up * torch.sum(grad_up * normal, dim=1) - eps_down * torch.sum(grad_dn * normal, dim=1))
-        v_jump = torch.abs(V_up - V_dn)
+        if not _finite_tensor(grad_up) or not _finite_tensor(grad_dn):
+            return {
+                "proxy_gateB_max_v_jump": fail_value,
+                "proxy_gateB_max_d_jump": fail_value,
+                "proxy_gateB_nonfinite": True,
+            }
+        V_up64 = V_up.double()
+        V_dn64 = V_dn.double()
+        v_jump = torch.abs(V_up64 - V_dn64)
+        grad_up_z = grad_up[:, 2].double()
+        grad_dn_z = grad_dn[:, 2].double()
+        d_jump = torch.abs(eps_up * grad_up_z - eps_down * grad_dn_z)
+        if not _finite_tensor(v_jump) or not _finite_tensor(d_jump):
+            return {
+                "proxy_gateB_max_v_jump": fail_value,
+                "proxy_gateB_max_d_jump": fail_value,
+                "proxy_gateB_nonfinite": True,
+            }
         max_v_jump = max(max_v_jump, float(torch.max(v_jump).item()))
         max_d_jump = max(max_d_jump, float(torch.max(d_jump).item()))
     return {
         "proxy_gateB_max_v_jump": max_v_jump,
         "proxy_gateB_max_d_jump": max_d_jump,
+        "proxy_gateB_nonfinite": False,
     }
 
 
@@ -466,13 +496,29 @@ def proxy_gateD(
     perturb = noise * delta
     base_val = _eval_tensor(candidate_eval, pts)
     pert_val = _eval_tensor(candidate_eval, pts + perturb)
-    diff = base_val - pert_val
-    denom = torch.norm(base_val).clamp_min(1e-8)
-    rel_change = float((torch.norm(diff) / denom).item())
-    var_base = float(torch.var(base_val).item())
+    fail_value = float(_PROXY_NONFINITE_PENALTY)
+    base64 = base_val.double()
+    pert64 = pert_val.double()
+    if not _finite_tensor(base64) or not _finite_tensor(pert64):
+        return {
+            "proxy_gateD_rel_change": fail_value,
+            "proxy_gateD_variance": fail_value,
+            "proxy_gateD_nonfinite": True,
+        }
+    diff = base64 - pert64
+    denom = torch.linalg.norm(base64).clamp_min(1e-12)
+    rel_change = torch.linalg.norm(diff) / denom
+    var_base = torch.var(base64)
+    if not _finite_tensor(rel_change) or not _finite_tensor(var_base):
+        return {
+            "proxy_gateD_rel_change": fail_value,
+            "proxy_gateD_variance": fail_value,
+            "proxy_gateD_nonfinite": True,
+        }
     return {
-        "proxy_gateD_rel_change": rel_change,
-        "proxy_gateD_variance": var_base,
+        "proxy_gateD_rel_change": float(rel_change.item()),
+        "proxy_gateD_variance": float(var_base.item()),
+        "proxy_gateD_nonfinite": False,
     }
 
 

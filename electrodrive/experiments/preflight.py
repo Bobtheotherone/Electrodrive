@@ -23,6 +23,7 @@ class RunCounters:
     nonfinite_pred_count: int = 0
     nonfinite_pred_total: int = 0
     proxy_computed_count: int = 0
+    proxy_score_nonfinite_sanitized: int = 0
     complex_guard_failed: int = 0
     weights_empty: int = 0
     a_train_nonfinite_count: int = 0

@@ -486,6 +486,46 @@ def _proxyA_effective_ratio(metrics: Dict[str, Any], cap: float, transform: str)
     return a_clamped
 
 
+PROXY_NONFINITE_PENALTY = 1e30
+
+
+def _safe_proxy_float(value: Any) -> Tuple[float, bool]:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return 0.0, True
+    if not math.isfinite(val):
+        return 0.0, True
+    return val, False
+
+
+def _proxy_score_with_sanitized(
+    metrics: Dict[str, Any],
+    *,
+    a_weight: float,
+    a_cap: float,
+    a_transform: str,
+) -> Tuple[float, bool]:
+    if not metrics:
+        return float(PROXY_NONFINITE_PENALTY), True
+    a_eff = _proxyA_effective_ratio(metrics, a_cap, a_transform)
+    b_v, b_v_bad = _safe_proxy_float(metrics.get("proxy_gateB_max_v_jump", None))
+    b_d, b_d_bad = _safe_proxy_float(metrics.get("proxy_gateB_max_d_jump", None))
+    if b_v_bad or b_d_bad:
+        return float(PROXY_NONFINITE_PENALTY), True
+    far_slope, far_bad = _safe_proxy_float(metrics.get("proxy_gateC_far_slope", None))
+    near_slope, near_bad = _safe_proxy_float(metrics.get("proxy_gateC_near_slope", None))
+    spurious, spurious_bad = _safe_proxy_float(metrics.get("proxy_gateC_spurious_fraction", None))
+    d, d_bad = _safe_proxy_float(metrics.get("proxy_gateD_rel_change", None))
+    if far_bad or near_bad or spurious_bad or d_bad:
+        return float(PROXY_NONFINITE_PENALTY), True
+    c = abs(far_slope + 1.0) + abs(near_slope + 1.0) + spurious * 10.0
+    score = a_weight * a_eff + max(b_v, b_d) + c + d
+    if not math.isfinite(score):
+        return float(PROXY_NONFINITE_PENALTY), True
+    return float(score), False
+
+
 def _proxy_score(
     metrics: Dict[str, Any],
     *,
@@ -493,19 +533,13 @@ def _proxy_score(
     a_cap: float,
     a_transform: str,
 ) -> float:
-    if not metrics:
-        return float("inf")
-    a_eff = _proxyA_effective_ratio(metrics, a_cap, a_transform)
-    b = max(
-        float(metrics.get("proxy_gateB_max_v_jump", 0.0)),
-        float(metrics.get("proxy_gateB_max_d_jump", 0.0)),
+    score, _ = _proxy_score_with_sanitized(
+        metrics,
+        a_weight=a_weight,
+        a_cap=a_cap,
+        a_transform=a_transform,
     )
-    far_slope = float(metrics.get("proxy_gateC_far_slope", 0.0))
-    near_slope = float(metrics.get("proxy_gateC_near_slope", 0.0))
-    spurious = float(metrics.get("proxy_gateC_spurious_fraction", 0.0))
-    c = abs(far_slope + 1.0) + abs(near_slope + 1.0) + spurious * 10.0
-    d = float(metrics.get("proxy_gateD_rel_change", 0.0))
-    return a_weight * a_eff + b + c + d
+    return score
 
 
 def build_proxy_stability_points(
@@ -2231,12 +2265,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                         )
                         proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
-                        proxy_metrics["proxy_score"] = _proxy_score(
+                        proxy_score, score_sanitized = _proxy_score_with_sanitized(
                             proxy_metrics,
                             a_weight=proxyA_weight,
                             a_cap=proxyA_cap,
                             a_transform=proxyA_transform,
                         )
+                        proxy_metrics["proxy_score"] = proxy_score
+                        if score_sanitized:
+                            proxy_metrics["proxy_score_nonfinite_sanitized"] = True
+                            _count_preflight("proxy_score_nonfinite_sanitized")
                         _count_preflight("proxy_computed_count")
                         proxy_metrics_by_idx[idx] = proxy_metrics
                         if idx < len(fast_metrics):
@@ -2561,12 +2599,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     )
                                 )
                                 proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
-                                proxy_metrics["proxy_score"] = _proxy_score(
+                                proxy_score, score_sanitized = _proxy_score_with_sanitized(
                                     proxy_metrics,
                                     a_weight=proxyA_weight,
                                     a_cap=proxyA_cap,
                                     a_transform=proxyA_transform,
                                 )
+                                proxy_metrics["proxy_score"] = proxy_score
+                                if score_sanitized:
+                                    proxy_metrics["proxy_score_nonfinite_sanitized"] = True
+                                    _count_preflight("proxy_score_nonfinite_sanitized")
                                 _count_preflight("proxy_computed_count")
                                 metrics.update(proxy_metrics)
                             score_mid = (

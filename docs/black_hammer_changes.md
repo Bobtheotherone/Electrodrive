@@ -101,3 +101,13 @@
 - reproduce:
   - `pytest -q tests/test_holdout_partitioning.py -vv -rs --maxfail=1`
 - validate: pilot run logs finite denom values, holdout_interior_empty_count stays near 0, and DCIM baseline is either finite or reported unavailable.
+
+## Phase 4.5: Proxy finiteness contract (Gate B/D + proxy score)
+- change: proxy_gateB/proxy_gateD now compute stability metrics in float64 and sanitize nonfinite inputs to large finite penalties; emit `proxy_gateB_nonfinite`/`proxy_gateD_nonfinite` flags.
+- change: proxy_score sanitizes nonfinite proxy inputs to a finite penalty and records `proxy_score_nonfinite_sanitized` in preflight.
+- change: verifier Gate D stability metrics now use float64, clamp denominators, and coerce nonfinite outputs to finite fail values.
+- why: prevent float32 overflow (e.g., 1e35 scale → variance inf) from propagating NaN/Infinity proxy metrics into summaries during push runs.
+- reproduce:
+  - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_proxyA_transform.py -vv -rs --maxfail=1`
+- validate: proxy Gate B/D metrics and proxy_score remain finite under extreme magnitudes and large runs no longer emit NaN/Infinity proxy fields.

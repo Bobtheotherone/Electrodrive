@@ -33,6 +33,10 @@ class RunCounters:
     v_train_total: int = 0
     weights_nonfinite_count: int = 0
     weights_total: int = 0
+    holdout_nonfinite_candidate_count: int = 0
+    dcim_baseline_nonfinite_count: int = 0
+    interior_metric_nonfinite_count: int = 0
+    lap_metric_nonfinite_count: int = 0
 
     def add(self, key: str, n: int = 1) -> None:
         if not hasattr(self, key):

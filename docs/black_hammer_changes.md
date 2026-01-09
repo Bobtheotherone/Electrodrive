@@ -86,3 +86,11 @@
   - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_weights_validation.py -vv -rs --maxfail=1`
 - validate: nonfinite weights are rejected before verification, summaries never contain non-numeric weights, and proxy failures remain finite.
+
+## Phase 4.3: Holdout metric finiteness contract
+- change: enforce finite holdout/interior/laplacian metrics in discovery scoring; nonfinite candidates receive finite penalties and are excluded from best/ramp tracking; DCIM baseline cannot be chosen if nonfinite.
+- change: added preflight counters for holdout nonfinite and DCIM baseline nonfinite plus holdout reject reasons.
+- why: prevent NaN/Inf metrics from corrupting readiness/refine selection and console summaries.
+- reproduce:
+  - `pytest -q tests/test_holdout_metric_finiteness.py -vv -rs --maxfail=1`
+- validate: pilot run shows no `score=nan used_as_best=True` or `best_in_abs=inf` and preflight includes holdout counters.

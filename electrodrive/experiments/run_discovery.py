@@ -609,6 +609,54 @@ def _laplacian_denom(oracle_in_mean_abs: float, oracle_bc_mean_abs: float) -> fl
     return max(float(oracle_in_mean_abs), 1e-6 * float(oracle_bc_mean_abs), 1e-12)
 
 
+HOLDOUT_FAIL_VALUE = 1e30
+
+
+def _finite(val: Any) -> bool:
+    if torch.is_tensor(val):
+        if val.numel() == 0:
+            return True
+        if val.numel() != 1:
+            return bool(torch.isfinite(val).all().item())
+        return bool(torch.isfinite(val).item())
+    try:
+        return math.isfinite(float(val))
+    except Exception:
+        return False
+
+
+def _finite_or_fail(val: Any, fail_value: float) -> float:
+    if not _finite(val):
+        return float(fail_value)
+    if torch.is_tensor(val):
+        if val.numel() == 0:
+            return float(fail_value)
+        return float(val.item())
+    return float(val)
+
+
+def _tensor_all_finite(t: Optional[torch.Tensor]) -> bool:
+    if t is None or not torch.is_tensor(t) or t.numel() == 0:
+        return True
+    return bool(torch.isfinite(t).all().item())
+
+
+def _sanitize_metric_block(
+    values: Dict[str, Any],
+    *,
+    fail_value: float,
+) -> Tuple[bool, Dict[str, float], List[str]]:
+    nonfinite = []
+    sanitized: Dict[str, float] = {}
+    for key, val in values.items():
+        if _finite(val):
+            sanitized[key] = _finite_or_fail(val, fail_value)
+        else:
+            nonfinite.append(key)
+            sanitized[key] = float(fail_value)
+    return len(nonfinite) == 0, sanitized, nonfinite
+
+
 def _timed_cuda(fn: Any, *args: Any, warmup: int = 1, repeat: int = 3) -> float:
     if not torch.cuda.is_available():
         return float("nan")
@@ -705,6 +753,19 @@ def _has_dcim_block(elements: Sequence[ImageBasisElement]) -> bool:
             return True
         if hasattr(elem, "block") or hasattr(elem, "certificate"):
             return True
+    return False
+
+
+def _dcim_used_as_best(
+    best_rel_metrics: Optional[Dict[str, Any]],
+    best_rel_elements: Optional[Sequence[ImageBasisElement]],
+) -> bool:
+    if best_rel_metrics and best_rel_metrics.get("is_dcim_block_baseline"):
+        return not bool(best_rel_metrics.get("holdout_nonfinite"))
+    if best_rel_elements and _has_dcim_block(best_rel_elements):
+        if best_rel_metrics and best_rel_metrics.get("holdout_nonfinite"):
+            return False
+        return True
     return False
 
 
@@ -1176,6 +1237,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     gen_counters: Optional[RunCounters] = None
     first_offender_written = False
     weights_reject_reasons: set[str] = set()
+    holdout_reject_reasons: set[str] = set()
 
     def _count_preflight(key: str, n: int = 1) -> None:
         if preflight_counters is None:
@@ -1195,10 +1257,19 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         weights: Optional[torch.Tensor],
         pred_hold: Optional[torch.Tensor],
         reason: str,
+        extra_stats: Optional[Dict[str, Any]] = None,
     ) -> None:
         nonlocal first_offender_written
         if preflight_counters is None or first_offender_written:
             return
+        stats = {
+            "A_train_absmax": _tensor_absmax(A_train),
+            "V_train_absmax": _tensor_absmax(V_train),
+            "weights_absmax": _tensor_absmax(weights),
+            "pred_hold_absmax": _tensor_absmax(pred_hold),
+        }
+        if extra_stats:
+            stats.update(extra_stats)
         payload = {
             "gen": int(gen_idx),
             "program_idx": int(program_idx),
@@ -1211,12 +1282,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 "use_gate_proxies": bool(use_gate_proxies),
                 "layered_prefer_dcim": bool(layered_prefer_dcim),
             },
-            "stats": {
-                "A_train_absmax": _tensor_absmax(A_train),
-                "V_train_absmax": _tensor_absmax(V_train),
-                "weights_absmax": _tensor_absmax(weights),
-                "pred_hold_absmax": _tensor_absmax(pred_hold),
-            },
+            "stats": stats,
         }
         if write_first_offender(run_dir, payload):
             first_offender_written = True
@@ -1252,6 +1318,82 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             weights=weights,
             pred_hold=pred_hold,
             reason=reason,
+        )
+
+    def _log_holdout_nonfinite(
+        *,
+        gen_idx: int,
+        program_idx: int,
+        program: Any,
+        elements: Sequence[ImageBasisElement],
+        A_train: Optional[torch.Tensor],
+        V_train: Optional[torch.Tensor],
+        weights: Optional[torch.Tensor],
+        pred_hold: Optional[torch.Tensor],
+        V_hold: Optional[torch.Tensor],
+        V_hold_mid: Optional[torch.Tensor],
+        is_boundary_hold: Optional[torch.Tensor],
+        lap: Optional[torch.Tensor],
+        denom_in: float,
+        denom_lap: float,
+        reason: str,
+    ) -> None:
+        holdout_reject_reasons.add(reason)
+        if preflight_counters is None or first_offender_written:
+            return
+
+        pred_in = None
+        oracle_in = None
+        diff_in = None
+        if pred_hold is not None and is_boundary_hold is not None:
+            pred_in = pred_hold[~is_boundary_hold]
+        if V_hold_mid is not None and is_boundary_hold is not None:
+            oracle_in = V_hold_mid[~is_boundary_hold]
+        elif V_hold is not None and is_boundary_hold is not None:
+            oracle_in = V_hold[~is_boundary_hold]
+        if pred_in is not None and oracle_in is not None:
+            diff_in = pred_in - oracle_in
+
+        def _nonfinite_or_zero(t: Optional[torch.Tensor]) -> int:
+            if t is None or not torch.is_tensor(t) or t.numel() == 0:
+                return 0
+            return _nonfinite_count(t)
+
+        stats = {
+            "pred_in_nonfinite_count": _nonfinite_or_zero(pred_in),
+            "oracle_in_nonfinite_count": _nonfinite_or_zero(oracle_in),
+            "diff_in_nonfinite_count": _nonfinite_or_zero(diff_in),
+            "lap_nonfinite_count": _nonfinite_or_zero(lap),
+            "pred_in_absmax": _tensor_absmax(pred_in),
+            "oracle_in_absmax": _tensor_absmax(oracle_in),
+            "diff_in_absmax": _tensor_absmax(diff_in),
+            "lap_absmax": _tensor_absmax(lap),
+            "denom_in": float(denom_in),
+            "denom_lap": float(denom_lap),
+        }
+        print(
+            "NONFINITE HOLDOUT:"
+            f" gen={gen_idx}"
+            f" idx={program_idx}"
+            f" reason={reason}"
+            f" pred_in_nonfinite={stats['pred_in_nonfinite_count']}"
+            f" oracle_in_nonfinite={stats['oracle_in_nonfinite_count']}"
+            f" diff_in_nonfinite={stats['diff_in_nonfinite_count']}"
+            f" lap_nonfinite={stats['lap_nonfinite_count']}"
+            f" denom_in={stats['denom_in']:.3e}"
+            f" denom_lap={stats['denom_lap']:.3e}"
+        )
+        _maybe_write_first_offender(
+            gen_idx=gen_idx,
+            program_idx=program_idx,
+            program=program,
+            elements=elements,
+            A_train=A_train,
+            V_train=V_train,
+            weights=weights,
+            pred_hold=pred_hold,
+            reason=reason,
+            extra_stats=stats,
         )
 
     fixed_spec_obj: Optional[CanonicalSpec] = None
@@ -1754,15 +1896,73 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             continue
                         bc_err = torch.mean(torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])).item()
                         in_err = torch.mean(torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])).item()
+                        holdout_ok, holdout_vals, holdout_nonfinite = _sanitize_metric_block(
+                            {"mean_bc": bc_err, "mean_in": in_err},
+                            fail_value=HOLDOUT_FAIL_VALUE,
+                        )
+                        if not holdout_ok:
+                            _count_preflight("holdout_nonfinite_candidate_count")
+                            if "mean_in" in holdout_nonfinite:
+                                _count_preflight("interior_metric_nonfinite_count")
+                            _log_holdout_nonfinite(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=weights,
+                                pred_hold=pred_hold,
+                                V_hold=V_hold,
+                                V_hold_mid=V_hold_mid,
+                                is_boundary_hold=is_boundary_hold,
+                                lap=None,
+                                denom_in=oracle_in_mean_abs,
+                                denom_lap=lap_denom,
+                                reason="holdout_nonfinite_fast",
+                            )
+                            fast_scores.append(float(HOLDOUT_FAIL_VALUE))
+                            fast_metrics.append(
+                                {
+                                    "holdout_nonfinite": True,
+                                    "holdout_nonfinite_fields": holdout_nonfinite,
+                                    "bc_mean_abs": holdout_vals["mean_bc"],
+                                    "pde_mean_abs": holdout_vals["mean_in"],
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
                         comp = _complexity(program, elements)
-                        score = w_bc * bc_err + w_pde * in_err + w_complexity * comp["n_terms"]
+                        score = w_bc * holdout_vals["mean_bc"] + w_pde * holdout_vals["mean_in"] + w_complexity * comp["n_terms"]
+                        if not _finite(score):
+                            _count_preflight("holdout_nonfinite_candidate_count")
+                            _log_holdout_nonfinite(
+                                gen_idx=gen,
+                                program_idx=idx,
+                                program=program,
+                                elements=elements,
+                                A_train=A_train,
+                                V_train=V_train,
+                                weights=weights,
+                                pred_hold=pred_hold,
+                                V_hold=V_hold,
+                                V_hold_mid=V_hold_mid,
+                                is_boundary_hold=is_boundary_hold,
+                                lap=None,
+                                denom_in=oracle_in_mean_abs,
+                                denom_lap=lap_denom,
+                                reason="score_nonfinite_fast",
+                            )
+                            score = float(HOLDOUT_FAIL_VALUE)
                         fast_scores.append(float(score))
                         _count_preflight("fast_scored")
                         n_terms_list.append(int(comp["n_terms"]))
                         fast_metrics.append(
                             {
-                                "bc_mean_abs": float(bc_err),
-                                "pde_mean_abs": float(in_err),
+                                "bc_mean_abs": holdout_vals["mean_bc"],
+                                "pde_mean_abs": holdout_vals["mean_in"],
                                 "n_terms": comp["n_terms"],
                                 "program_hash": meta.get("program_hash"),
                                 "complex_count": int(complex_count),
@@ -2080,6 +2280,69 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             if not math.isfinite(stability_ratio):
                                 stability_ratio = 1.0
 
+                            holdout_ok, holdout_vals, holdout_nonfinite = _sanitize_metric_block(
+                                {
+                                    "mean_bc": mean_bc,
+                                    "mean_in": mean_in,
+                                    "max_bc": max_bc,
+                                    "max_in": max_in,
+                                    "mean_bc_mid": mean_bc_mid,
+                                    "mean_in_mid": mean_in_mid,
+                                    "rel_bc": rel_bc,
+                                    "rel_in": rel_in,
+                                },
+                                fail_value=HOLDOUT_FAIL_VALUE,
+                            )
+                            lap_ok, lap_vals, lap_nonfinite = _sanitize_metric_block(
+                                {"lap_mean": lap_mean, "lap_max": lap_max, "rel_lap": rel_lap},
+                                fail_value=HOLDOUT_FAIL_VALUE,
+                            )
+                            holdout_nonfinite_fields = holdout_nonfinite + lap_nonfinite
+                            holdout_nonfinite_flag = bool(holdout_nonfinite_fields)
+                            if holdout_nonfinite_flag:
+                                _count_preflight("holdout_nonfinite_candidate_count")
+                                _count_preflight("dcim_baseline_nonfinite_count")
+                                if {"mean_in", "mean_in_mid", "rel_in", "max_in"} & set(holdout_nonfinite):
+                                    _count_preflight("interior_metric_nonfinite_count")
+                                if lap_nonfinite:
+                                    _count_preflight("lap_metric_nonfinite_count")
+                                _log_holdout_nonfinite(
+                                    gen_idx=gen,
+                                    program_idx=-1,
+                                    program=dcim_program,
+                                    elements=dcim_elements,
+                                    A_train=A_train_dcim,
+                                    V_train=V_train,
+                                    weights=weights,
+                                    pred_hold=pred_hold,
+                                    V_hold=V_hold,
+                                    V_hold_mid=V_hold_mid,
+                                    is_boundary_hold=is_boundary_hold,
+                                    lap=lap,
+                                    denom_in=oracle_in_mean_abs,
+                                    denom_lap=lap_denom,
+                                    reason="holdout_nonfinite_dcim",
+                                )
+
+                            mean_bc = holdout_vals["mean_bc"]
+                            mean_in = holdout_vals["mean_in"]
+                            max_bc = holdout_vals["max_bc"]
+                            max_in = holdout_vals["max_in"]
+                            mean_bc_mid = holdout_vals["mean_bc_mid"]
+                            mean_in_mid = holdout_vals["mean_in_mid"]
+                            rel_bc = holdout_vals["rel_bc"]
+                            rel_in = holdout_vals["rel_in"]
+                            lap_mean = lap_vals["lap_mean"]
+                            lap_max = lap_vals["lap_max"]
+                            rel_lap = lap_vals["rel_lap"]
+
+                            eval_time_us = float(eval_ms * 1000.0) if _finite(eval_ms) else float(HOLDOUT_FAIL_VALUE)
+                            solve_time_us = float(t_solve_ms * 1000.0) if _finite(t_solve_ms) else float(HOLDOUT_FAIL_VALUE)
+                            if _finite(eval_ms) and _finite(t_solve_ms):
+                                total_time_us = float((eval_ms + t_solve_ms) * 1000.0)
+                            else:
+                                total_time_us = float(HOLDOUT_FAIL_VALUE)
+
                             comp = _complexity(dcim_program, dcim_elements)
                             complex_count = _count_complex_terms(dcim_elements, device=device)
                             metrics = {
@@ -2096,9 +2359,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "oracle_bc_mean_abs_holdout": float(oracle_bc_mean_abs),
                                 "oracle_in_mean_abs_holdout": float(oracle_in_mean_abs),
                                 "stability_ratio": stability_ratio,
-                                "eval_time_us": float(eval_ms * 1000.0) if eval_ms == eval_ms else float("nan"),
-                                "solve_time_us": float(t_solve_ms * 1000.0) if t_solve_ms == t_solve_ms else float("nan"),
-                                "total_time_us": float((eval_ms + t_solve_ms) * 1000.0) if eval_ms == eval_ms else float("nan"),
+                                "eval_time_us": eval_time_us,
+                                "solve_time_us": solve_time_us,
+                                "total_time_us": total_time_us,
                                 "complexity_terms": comp["n_terms"],
                                 "complexity_nodes": comp["n_nodes"],
                                 "n_terms": comp["n_terms"],
@@ -2107,6 +2370,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "dcim_block_weight": float(dcim_block_weight),
                                 "candidate_name": "dcim_block_baseline",
                             }
+                            if holdout_nonfinite_flag:
+                                metrics["holdout_nonfinite"] = True
+                                metrics["holdout_nonfinite_fields"] = holdout_nonfinite_fields
                             if use_gate_proxies and is_layered:
                                 proxy_pts = build_proxy_stability_points(
                                     bc_hold,
@@ -2182,15 +2448,37 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 + w_latency * (metrics["eval_time_us"] / 1e6)
                                 + w_stability * stability_ratio
                             )
-                            if math.isfinite(float(rel_bc)) and (
+                            if not _finite(score_mid):
+                                _count_preflight("holdout_nonfinite_candidate_count")
+                                _count_preflight("dcim_baseline_nonfinite_count")
+                                _log_holdout_nonfinite(
+                                    gen_idx=gen,
+                                    program_idx=-1,
+                                    program=dcim_program,
+                                    elements=dcim_elements,
+                                    A_train=A_train_dcim,
+                                    V_train=V_train,
+                                    weights=weights,
+                                    pred_hold=pred_hold,
+                                    V_hold=V_hold,
+                                    V_hold_mid=V_hold_mid,
+                                    is_boundary_hold=is_boundary_hold,
+                                    lap=lap,
+                                    denom_in=oracle_in_mean_abs,
+                                    denom_lap=lap_denom,
+                                    reason="score_nonfinite_dcim",
+                                )
+                                metrics["holdout_nonfinite"] = True
+                                score_mid = float(HOLDOUT_FAIL_VALUE)
+                            if not metrics.get("holdout_nonfinite") and math.isfinite(float(rel_bc)) and (
                                 best_dcim_rel_bc is None or float(rel_bc) < best_dcim_rel_bc
                             ):
                                 best_dcim_rel_bc = float(rel_bc)
-                            if math.isfinite(float(rel_lap)) and (
+                            if not metrics.get("holdout_nonfinite") and math.isfinite(float(rel_lap)) and (
                                 best_dcim_rel_lap is None or float(rel_lap) < best_dcim_rel_lap
                             ):
                                 best_dcim_rel_lap = float(rel_lap)
-                            if math.isfinite(float(score_mid)) and (
+                            if not metrics.get("holdout_nonfinite") and math.isfinite(float(score_mid)) and (
                                 best_dcim_score is None or float(score_mid) < best_dcim_score
                             ):
                                 best_dcim_score = float(score_mid)
@@ -2327,6 +2615,70 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
                         pert_err = w_bc * float(torch.mean(pert_bc).item()) + w_pde * float(torch.mean(pert_in).item())
                         stability_ratio = float(pert_err / max(base_err, 1e-8))
+                    if not math.isfinite(stability_ratio):
+                        stability_ratio = 1.0
+
+                    holdout_ok, holdout_vals, holdout_nonfinite = _sanitize_metric_block(
+                        {
+                            "mean_bc": mean_bc,
+                            "mean_in": mean_in,
+                            "max_bc": max_bc,
+                            "max_in": max_in,
+                            "mean_bc_mid": mean_bc_mid,
+                            "mean_in_mid": mean_in_mid,
+                            "rel_bc": rel_bc,
+                            "rel_in": rel_in,
+                        },
+                        fail_value=HOLDOUT_FAIL_VALUE,
+                    )
+                    lap_ok, lap_vals, lap_nonfinite = _sanitize_metric_block(
+                        {"lap_mean": lap_mean, "lap_max": lap_max, "rel_lap": rel_lap},
+                        fail_value=HOLDOUT_FAIL_VALUE,
+                    )
+                    holdout_nonfinite_fields = holdout_nonfinite + lap_nonfinite
+                    holdout_nonfinite_flag = bool(holdout_nonfinite_fields)
+                    if holdout_nonfinite_flag:
+                        _count_preflight("holdout_nonfinite_candidate_count")
+                        if {"mean_in", "mean_in_mid", "rel_in", "max_in"} & set(holdout_nonfinite):
+                            _count_preflight("interior_metric_nonfinite_count")
+                        if lap_nonfinite:
+                            _count_preflight("lap_metric_nonfinite_count")
+                        _log_holdout_nonfinite(
+                            gen_idx=gen,
+                            program_idx=idx,
+                            program=program,
+                            elements=elements,
+                            A_train=A_train,
+                            V_train=V_train,
+                            weights=weights,
+                            pred_hold=pred_hold,
+                            V_hold=V_hold,
+                            V_hold_mid=V_hold_mid,
+                            is_boundary_hold=is_boundary_hold,
+                            lap=lap,
+                            denom_in=oracle_in_mean_abs,
+                            denom_lap=lap_denom,
+                            reason="holdout_nonfinite_mid",
+                        )
+
+                    mean_bc = holdout_vals["mean_bc"]
+                    mean_in = holdout_vals["mean_in"]
+                    max_bc = holdout_vals["max_bc"]
+                    max_in = holdout_vals["max_in"]
+                    mean_bc_mid = holdout_vals["mean_bc_mid"]
+                    mean_in_mid = holdout_vals["mean_in_mid"]
+                    rel_bc = holdout_vals["rel_bc"]
+                    rel_in = holdout_vals["rel_in"]
+                    lap_mean = lap_vals["lap_mean"]
+                    lap_max = lap_vals["lap_max"]
+                    rel_lap = lap_vals["rel_lap"]
+
+                    eval_time_us = float(eval_ms * 1000.0) if _finite(eval_ms) else float(HOLDOUT_FAIL_VALUE)
+                    solve_time_us = float(t_solve_ms * 1000.0) if _finite(t_solve_ms) else float(HOLDOUT_FAIL_VALUE)
+                    if _finite(eval_ms) and _finite(t_solve_ms):
+                        total_time_us = float((eval_ms + t_solve_ms) * 1000.0)
+                    else:
+                        total_time_us = float(HOLDOUT_FAIL_VALUE)
 
                     comp = _complexity(program, elements)
                     complex_count = _count_complex_terms(elements, device=device)
@@ -2344,14 +2696,17 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         "oracle_bc_mean_abs_holdout": float(oracle_bc_mean_abs),
                         "oracle_in_mean_abs_holdout": float(oracle_in_mean_abs),
                         "stability_ratio": stability_ratio,
-                        "eval_time_us": float(eval_ms * 1000.0) if eval_ms == eval_ms else float("nan"),
-                        "solve_time_us": float(t_solve_ms * 1000.0) if t_solve_ms == t_solve_ms else float("nan"),
-                        "total_time_us": float((eval_ms + t_solve_ms) * 1000.0) if eval_ms == eval_ms else float("nan"),
+                        "eval_time_us": eval_time_us,
+                        "solve_time_us": solve_time_us,
+                        "total_time_us": total_time_us,
                         "complexity_terms": comp["n_terms"],
                         "complexity_nodes": comp["n_nodes"],
                         "n_terms": comp["n_terms"],
                         "complex_count": int(complex_count),
                     }
+                    if holdout_nonfinite_flag:
+                        metrics["holdout_nonfinite"] = True
+                        metrics["holdout_nonfinite_fields"] = holdout_nonfinite_fields
                     if use_gate_proxies and is_layered:
                         proxy_metrics = proxy_metrics_by_idx.get(idx)
                         if proxy_metrics:
@@ -2363,6 +2718,27 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         + w_latency * (metrics["eval_time_us"] / 1e6)
                         + w_stability * stability_ratio
                     )
+                    if not _finite(score_mid):
+                        _count_preflight("holdout_nonfinite_candidate_count")
+                        _log_holdout_nonfinite(
+                            gen_idx=gen,
+                            program_idx=idx,
+                            program=program,
+                            elements=elements,
+                            A_train=A_train,
+                            V_train=V_train,
+                            weights=weights,
+                            pred_hold=pred_hold,
+                            V_hold=V_hold,
+                            V_hold_mid=V_hold_mid,
+                            is_boundary_hold=is_boundary_hold,
+                            lap=lap,
+                            denom_in=oracle_in_mean_abs,
+                            denom_lap=lap_denom,
+                            reason="score_nonfinite_mid",
+                        )
+                        metrics["holdout_nonfinite"] = True
+                        score_mid = float(HOLDOUT_FAIL_VALUE)
                     _count_preflight("mid_scored")
                     fitted_candidates.append(
                         {
@@ -2522,6 +2898,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                     for cand in top_final:
                         if _has_dcim_block(cand["elements"]):
+                            continue
+                        if cand["metrics"].get("holdout_nonfinite"):
                             continue
                         if refine_max_terms > 0 and len(cand["elements"]) > refine_max_terms:
                             continue
@@ -2906,21 +3284,22 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         cand["metrics"],
                         cand["score"],
                     )
+                    holdout_ok = not cand["metrics"].get("holdout_nonfinite")
                     mean_bc = float(cand["metrics"].get("mean_bc_err_holdout", float("inf")))
-                    if best_mean_bc is None or mean_bc < best_mean_bc:
+                    if holdout_ok and (best_mean_bc is None or mean_bc < best_mean_bc):
                         best_mean_bc = mean_bc
                     rel_bc_val = float(cand["metrics"].get("rel_bc_err_holdout", float("inf")))
-                    if math.isfinite(rel_bc_val) and (best_rel_bc is None or rel_bc_val < best_rel_bc):
+                    if holdout_ok and math.isfinite(rel_bc_val) and (best_rel_bc is None or rel_bc_val < best_rel_bc):
                         best_rel_bc = rel_bc_val
                         best_rel_in = float(cand["metrics"].get("rel_pde_err_holdout", float("inf")))
                         best_rel_elements = cand["elements"]
                         best_rel_metrics = cand["metrics"]
                     rel_in_val = float(cand["metrics"].get("rel_pde_err_holdout", float("inf")))
-                    if math.isfinite(rel_in_val) and (best_rel_in is None or rel_in_val < best_rel_in):
+                    if holdout_ok and math.isfinite(rel_in_val) and (best_rel_in is None or rel_in_val < best_rel_in):
                         best_rel_in = rel_in_val
                         best_rel_in_metrics = cand["metrics"]
                     rel_lap_val = float(cand["metrics"].get("rel_lap_holdout", float("inf")))
-                    if math.isfinite(rel_lap_val) and (best_rel_lap is None or rel_lap_val < best_rel_lap):
+                    if holdout_ok and math.isfinite(rel_lap_val) and (best_rel_lap is None or rel_lap_val < best_rel_lap):
                         best_rel_lap = rel_lap_val
                         best_rel_lap_metrics = cand["metrics"]
 
@@ -2966,6 +3345,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 gen_rel_in = float("inf")
                 gen_rel_lap = float("inf")
                 for cand in top_final:
+                    if cand["metrics"].get("holdout_nonfinite"):
+                        continue
                     rel_bc_val = cand["metrics"].get("rel_bc_err_holdout")
                     rel_in_val = cand["metrics"].get("rel_pde_err_holdout")
                     rel_lap_val = cand["metrics"].get("rel_lap_holdout")
@@ -3156,11 +3537,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     else:
         print("BEST ELEMENT TYPES: none")
 
-    dcim_used_as_best = False
-    if best_rel_metrics is not None and best_rel_metrics.get("is_dcim_block_baseline"):
-        dcim_used_as_best = True
-    if best_rel_elements and _has_dcim_block(best_rel_elements):
-        dcim_used_as_best = True
+    dcim_used_as_best = _dcim_used_as_best(best_rel_metrics, best_rel_elements)
     dcim_rel_bc = best_dcim_rel_bc if best_dcim_rel_bc is not None else float("nan")
     dcim_rel_lap = best_dcim_rel_lap if best_dcim_rel_lap is not None else float("nan")
     dcim_score = best_dcim_score if best_dcim_score is not None else float("nan")
@@ -3270,6 +3647,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         }
         if weights_reject_reasons:
             extra["weights_reject_reasons"] = sorted(weights_reject_reasons)
+        if holdout_reject_reasons:
+            extra["holdout_reject_reasons"] = sorted(holdout_reject_reasons)
         write_preflight_report(run_dir, preflight_counters, extra)
         summarize_to_stdout(preflight_counters)
 

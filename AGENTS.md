@@ -54,7 +54,15 @@ Before and after any commit, and before/after any run:
 git status --porcelain
 ```
 
-If non-empty: **STOP** and report exactly what is dirty.
+If non-empty:
+
+1. If the only entries are **obvious artifacts** (e.g., `runs/**`, `__pycache__/`, `*.pyc`, `.DS_Store`, `.ipynb_checkpoints/`, logs): **note them once and continue.**
+2. Otherwise, **checkpoint automatically**, then continue from a clean tree:
+
+   ```bash
+   git stash push -u -m "checkpoint: dirty tree before <next action>"
+   git status --porcelain  # must be empty
+   ```
 
 ### 2.3 Full pytest command (canonical)
 

@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
+GATE_ORDER = ("A", "B", "C", "D", "E")
+
+
 def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -21,7 +24,7 @@ def _find_summaries(run_dir: Path) -> List[Path]:
 def _gate_statuses(cert: Dict[str, Any]) -> Dict[str, str]:
     gates = cert.get("gates", {}) if isinstance(cert.get("gates", {}), dict) else {}
     statuses: Dict[str, str] = {}
-    for name in ("A", "B", "C", "D", "E"):
+    for name in GATE_ORDER:
         gate = gates.get(name, {})
         statuses[name] = str(gate.get("status", "unknown"))
     return statuses
@@ -99,6 +102,26 @@ def _plot_hist(values: List[float], out_path: Path, title: str) -> None:
     plt.close(fig)
 
 
+def _plot_pass_k_hist(hist: Dict[int, int], out_path: Path) -> None:
+    if not hist:
+        return
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        return
+    labels = sorted(hist.keys())
+    counts = [hist[k] for k in labels]
+    fig = plt.figure()
+    ax = fig.add_subplot(1, 1, 1)
+    ax.bar(labels, counts)
+    ax.set_title("hist_pass_k")
+    ax.set_xlabel("gates_passed")
+    ax.set_ylabel("count")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze Stage 9 verifier results.")
     parser.add_argument("run_dir", help="Run directory with artifacts/certificates.")
@@ -111,6 +134,7 @@ def main() -> None:
         return
 
     counts = {"A": 0, "AB": 0, "ABC": 0, "ABCD": 0, "ABCDE": 0}
+    hist_pass_k = {k: 0 for k in range(len(GATE_ORDER) + 1)}
     lap_vals: List[float] = []
     bc_vals: List[float] = []
     asym_vals: List[float] = []
@@ -118,6 +142,7 @@ def main() -> None:
     speed_vals: List[float] = []
     near_misses: List[Dict[str, Any]] = []
     best_candidates: List[Dict[str, Any]] = []
+    best_partial: Dict[str, Any] | None = None
 
     for summary_path in summaries:
         summary = _load_json(summary_path)
@@ -130,8 +155,14 @@ def main() -> None:
             continue
         cert = _load_json(cert_path)
         statuses = _gate_statuses(cert)
-        status_list = [statuses.get(g, "unknown") for g in ("A", "B", "C", "D", "E")]
+        status_list = [statuses.get(g, "unknown") for g in GATE_ORDER]
         pass_flags = [s == "pass" for s in status_list]
+        pass_k = int(sum(pass_flags))
+        hist_pass_k[pass_k] = hist_pass_k.get(pass_k, 0) + 1
+        gates_passed = [g for g, ok in zip(GATE_ORDER, pass_flags) if ok]
+        failed_gates = [g for g, ok in zip(GATE_ORDER, pass_flags) if not ok]
+        fail_margins = {g: _gate_margin(g, cert) for g in failed_gates}
+        fail_margin_sum = float(sum(fail_margins.values())) if fail_margins else 0.0
 
         if pass_flags[0]:
             counts["A"] += 1
@@ -163,7 +194,7 @@ def main() -> None:
         if "speedup" in metrics_e and math.isfinite(metrics_e["speedup"]):
             speed_vals.append(metrics_e["speedup"])
 
-        failed = [g for g, ok in zip(("A", "B", "C", "D", "E"), pass_flags) if not ok]
+        failed = [g for g, ok in zip(GATE_ORDER, pass_flags) if not ok]
         if len(failed) == 1:
             gate = failed[0]
             margin = _gate_margin(gate, cert)
@@ -177,6 +208,26 @@ def main() -> None:
                     "verification_path": str(verify_path),
                 }
             )
+
+        candidate_summary = {
+            "generation": summary.get("generation"),
+            "rank": summary.get("rank"),
+            "summary_path": str(summary_path),
+            "verification_path": str(verify_path),
+            "pass_k": pass_k,
+            "gates_passed": gates_passed,
+            "failed_gates": failed_gates,
+            "fail_margin_sum": fail_margin_sum,
+            "fail_margins": fail_margins,
+        }
+        if best_partial is None:
+            best_partial = candidate_summary
+        elif pass_k > int(best_partial.get("pass_k", -1)):
+            best_partial = candidate_summary
+        elif pass_k == int(best_partial.get("pass_k", -1)) and fail_margin_sum < float(
+            best_partial.get("fail_margin_sum", float("inf"))
+        ):
+            best_partial = candidate_summary
 
         if cert.get("final_status") == "pass":
             best_candidates.append(
@@ -199,9 +250,11 @@ def main() -> None:
     _plot_hist(asym_vals, analysis_dir / "hist_gateC_asym_error.png", "gateC_asym_error")
     _plot_hist(stab_vals, analysis_dir / "hist_gateD_relative_change.png", "gateD_relative_change")
     _plot_hist(speed_vals, analysis_dir / "hist_gateE_speedup.png", "gateE_speedup")
+    _plot_pass_k_hist(hist_pass_k, analysis_dir / "hist_pass_k.png")
 
     summary_out = {
         "counts": counts,
+        "hist_pass_k": hist_pass_k,
         "histograms": {
             "gateA_linf": _hist(lap_vals),
             "gateB_interface_jump": _hist(bc_vals),
@@ -211,6 +264,7 @@ def main() -> None:
         },
         "near_misses": near_misses[:10],
         "best_candidates": best_candidates[:10],
+        "best_partial": best_partial,
     }
     (analysis_dir / "analysis_summary.json").write_text(
         json.dumps(summary_out, indent=2), encoding="utf-8"
@@ -218,10 +272,18 @@ def main() -> None:
 
     print(f"analysis_dir={analysis_dir}")
     print(f"counts={counts}")
+    print(f"hist_pass_k={hist_pass_k}")
     if near_misses:
         print("near_misses:")
         for entry in near_misses[:5]:
             print(f"  gate={entry['gate']} margin={entry['margin']:.3g} summary={entry['summary_path']}")
+    if best_partial:
+        print(
+            "best_partial="
+            f"pass_k={best_partial.get('pass_k')} "
+            f"gates={best_partial.get('gates_passed')} "
+            f"summary={best_partial.get('summary_path')}"
+        )
     if best_candidates:
         print(f"best_candidates={len(best_candidates)}")
 

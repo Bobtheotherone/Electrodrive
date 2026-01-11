@@ -178,3 +178,9 @@
 - why: avoid near-singular complex images that overflow scoring metrics during Stage 9 discovery.
 - reproduce:
   - `pytest -q tests/test_complex_depth_schema_clamp.py -vv -rs --maxfail=1`
+
+## Phase 9.4: Align Stage 9 max_steps with GFN training length
+- change: set Stage 9 discovery `structure_policy.max_steps` to 12 to match the GFN training horizon (max_length=10).
+- why: reduce out-of-distribution long programs that trigger nonfinite weights during pilot discovery.
+- reproduce:
+  - `python -m electrodrive.experiments.run_discovery --config configs/stage9/discovery_stage9_pilot.yaml`

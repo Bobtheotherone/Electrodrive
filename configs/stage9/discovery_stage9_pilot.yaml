@@ -88,7 +88,7 @@ model:
     layers: 6
   structure_policy:
     name: gflownet
-    max_steps: 48
+    max_steps: 12
     replay_size: 200000
   param_sampler:
     name: flow

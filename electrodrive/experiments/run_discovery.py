@@ -75,6 +75,10 @@ from electrodrive.experiments.preflight import (
     write_first_offender,
     write_preflight_report,
 )
+from electrodrive.experiments.vtrain_diagnostics import (
+    build_vtrain_explosion_snapshot,
+    write_vtrain_explosion_snapshot,
+)
 
 
 class _NullLogger:
@@ -1513,6 +1517,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     per_gen_preflight: List[Dict[str, Any]] = []
     gen_counters: Optional[RunCounters] = None
     first_offender_written = False
+    v_train_snapshot_written = False
     holdout_offender_logged = False
     holdout_stats: Dict[str, Any] = {}
     weights_reject_reasons: set[str] = set()
@@ -2000,15 +2005,26 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                      torch.zeros(interior_hold.shape[0], device=device, dtype=torch.bool)],
                     dim=0,
                 )
+                v_train_total_val = int(V_train.numel())
                 v_train_nonfinite_val = 0
-                v_train_total_val = 0
                 v_train_has_nonfinite = False
                 if preflight_counters is not None:
                     v_train_nonfinite_val = _nonfinite_count(V_train)
-                    v_train_total_val = int(V_train.numel())
                     v_train_has_nonfinite = v_train_nonfinite_val > 0
                 else:
                     v_train_has_nonfinite = not torch.isfinite(V_train).all().item()
+                    if v_train_has_nonfinite:
+                        v_train_nonfinite_val = _nonfinite_count(V_train)
+                v_train_absmax = _tensor_absmax(V_train)
+                v_train_frac_nonfinite = (
+                    float(v_train_nonfinite_val) / max(1, v_train_total_val)
+                    if v_train_total_val > 0
+                    else 0.0
+                )
+                v_train_explosion = bool(v_train_absmax > 1e10 or v_train_frac_nonfinite > 0.0)
+                v_train_nan_to_num_applied = False
+                v_train_clamp_applied = False
+                v_train_reference_subtracted = bool(use_ref)
 
                 fast_proxy_near_pts = torch.empty((0, 3), device=device, dtype=torch.float32)
                 fast_proxy_far_pts = torch.empty((0, 3), device=device, dtype=torch.float32)
@@ -2235,6 +2251,22 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         _count_preflight("assembled_ok")
                         assert_cuda_tensor(A_train, "A_train_fast")
                         assert_cuda_tensor(A_hold, "A_hold_fast")
+                        if v_train_explosion and not v_train_snapshot_written:
+                            payload = build_vtrain_explosion_snapshot(
+                                spec,
+                                X_train,
+                                V_train,
+                                A_train,
+                                layered_reference_enabled=use_ref,
+                                reference_subtracted_for_fit=v_train_reference_subtracted,
+                                nan_to_num_applied=v_train_nan_to_num_applied,
+                                clamp_applied=v_train_clamp_applied,
+                                seed=seed_gen,
+                                gen=gen,
+                                program_idx=idx,
+                            )
+                            if write_vtrain_explosion_snapshot(run_dir, payload):
+                                v_train_snapshot_written = True
                         if cache_hold_matrices:
                             hold_cache[idx] = A_hold
                         a_train_nonfinite = 0

@@ -277,7 +277,8 @@ class ComplexDepthPointSchema(ParamSchema):
         z_raw = u_pos[..., 2]
         pos_z = z_lo + torch.sigmoid(z_raw) * (z_hi - z_lo)
         pos = torch.stack([pos[..., 0], pos[..., 1], pos_z], dim=-1)
-        z_imag = torch.nn.functional.softplus(u[..., 3]) + 1e-6
+        # Clamp imag depth to avoid near-singular candidates and runaway scales.
+        z_imag = torch.nn.functional.softplus(u[..., 3]).clamp(min=1e-3, max=8.0)
         if node_ctx and node_ctx.get("conjugate"):
             z_imag = -z_imag
         return {

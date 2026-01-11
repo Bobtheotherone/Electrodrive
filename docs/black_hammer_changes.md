@@ -172,3 +172,9 @@
 - why: mitigate nonfinite weights observed during pilot discovery (preflight_first_offender: weights_nonfinite).
 - reproduce:
   - `python -m electrodrive.experiments.run_discovery --config configs/stage9/discovery_stage9_pilot.yaml`
+
+## Phase 9.3: Clamp complex-depth imag range for flow schemas
+- change: clamp complex-depth imag scale to `[1e-3, 8.0]` in `ComplexDepthPointSchema`.
+- why: avoid near-singular complex images that overflow scoring metrics during Stage 9 discovery.
+- reproduce:
+  - `pytest -q tests/test_complex_depth_schema_clamp.py -vv -rs --maxfail=1`

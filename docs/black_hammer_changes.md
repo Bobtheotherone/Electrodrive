@@ -191,3 +191,10 @@
 - reproduce:
   - `pytest -q tests/test_fast_weights_stability.py -vv -rs --maxfail=1`
 - validate: overflow guard test passes and weights remain finite under extreme scaling.
+
+## Phase 9.6: Resample exploding oracle targets during training
+- change: training collocation targets are resampled when oracle outputs are nonfinite or exceed `run.train_target_abs_max` (default `1e10`); added preflight counters for resampled points and a resampling unit test.
+- why: eliminate V_train explosions (~1e38) that still produced `weights_nonfinite` despite fp64 solves.
+- reproduce:
+  - `pytest -q tests/test_oracle_target_resample.py -vv -rs --maxfail=1`
+- validate: resampling test passes and Stage 9 pilots no longer emit `weights_nonfinite` first offenders.

@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import yaml
@@ -424,6 +424,56 @@ def _oracle_eval(
         raise RuntimeError("Oracle returned no potential values.")
     assert_cuda_tensor(result.V, "oracle_V")
     return result.V, result
+
+
+def _resample_invalid_oracle_targets(
+    *,
+    points: torch.Tensor,
+    values: torch.Tensor,
+    sample_fn: Callable[[int, int], torch.Tensor],
+    eval_fn: Callable[[torch.Tensor], torch.Tensor],
+    max_abs: float,
+    max_attempts: int,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    if points.numel() == 0 or values.numel() == 0 or max_attempts <= 0:
+        return points, values, 0, 0
+    pts = points.clone()
+    vals = values.clone()
+    total_nonfinite = 0
+    total_extreme = 0
+    for attempt in range(max_attempts + 1):
+        nonfinite_mask = ~torch.isfinite(vals)
+        if max_abs > 0.0:
+            extreme_mask = torch.abs(vals) > max_abs
+        else:
+            extreme_mask = torch.zeros_like(nonfinite_mask)
+        invalid_mask = nonfinite_mask | extreme_mask
+        invalid_count = int(torch.count_nonzero(invalid_mask).item())
+        if invalid_count == 0:
+            break
+        total_nonfinite += int(torch.count_nonzero(nonfinite_mask).item())
+        total_extreme += int(torch.count_nonzero(extreme_mask).item())
+        if attempt == max_attempts:
+            raise RuntimeError("Oracle target resampling exhausted without producing finite targets.")
+        new_points = sample_fn(invalid_count, seed + attempt + 1)
+        new_values = eval_fn(new_points).to(dtype=vals.dtype)
+        new_finite = torch.isfinite(new_values)
+        if max_abs > 0.0:
+            new_valid = new_finite & (torch.abs(new_values) <= max_abs)
+        else:
+            new_valid = new_finite
+        if not torch.any(new_valid):
+            continue
+        invalid_idx = torch.nonzero(invalid_mask, as_tuple=False).view(-1)
+        valid_idx = torch.nonzero(new_valid, as_tuple=False).view(-1)
+        n_replace = min(int(invalid_idx.numel()), int(valid_idx.numel()))
+        if n_replace > 0:
+            replace_idx = invalid_idx[:n_replace]
+            src_idx = valid_idx[:n_replace]
+            pts[replace_idx] = new_points[src_idx]
+            vals[replace_idx] = new_values[src_idx]
+    return pts, vals, total_nonfinite, total_extreme
 
 
 def _laplacian_fd(eval_fn: Any, pts: torch.Tensor, h: float) -> torch.Tensor:
@@ -1406,6 +1456,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     stability_sigma = float(reward_cfg.get("stability_perturb_sigma", 1e-3))
 
     points_cfg = cfg.get("points", {}) if isinstance(cfg.get("points", {}), dict) else {}
+    train_target_abs_max = float(run_cfg.get("train_target_abs_max", 1e10))
+    train_target_resample_attempts = int(run_cfg.get("train_target_resample_attempts", 4))
+    if train_target_resample_attempts < 0:
+        train_target_resample_attempts = 0
 
     backoff = BackoffState(
         population_B=int(run_cfg.get("population_B", 512)),
@@ -1823,14 +1877,112 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 V_in_hold_mid, _ = _oracle_eval(oracle_mid, spec, interior_hold, dtype=mid_dtype)
                 V_bc_hold_mid = V_bc_hold_mid.to(dtype=bc_hold.dtype)
                 V_in_hold_mid = V_in_hold_mid.to(dtype=interior_hold.dtype)
-                bc_train_mask = torch.isfinite(V_bc_train)
-                in_train_mask = torch.isfinite(V_in_train)
-                if not torch.all(bc_train_mask):
-                    bc_train = bc_train[bc_train_mask]
-                    V_bc_train = V_bc_train[bc_train_mask]
-                if not torch.all(in_train_mask):
-                    interior_train = interior_train[in_train_mask]
-                    V_in_train = V_in_train[in_train_mask]
+                def _sample_train_boundary(n: int, seed_val: int) -> torch.Tensor:
+                    if is_layered and layered_sampling:
+                        bc_pts, _ = _sample_points_layered(
+                            spec,
+                            n_boundary=n,
+                            n_interior=0,
+                            domain_scale=domain_scale,
+                            device=device,
+                            dtype=torch.float32,
+                            seed=seed_val,
+                            exclusion_radius=layered_exclusion_radius,
+                            interface_band=layered_interface_band,
+                            interface_delta=layered_interface_delta,
+                        )
+                    else:
+                        bc_pts, _ = _sample_points_gpu(
+                            spec,
+                            n_boundary=n,
+                            n_interior=0,
+                            domain_scale=domain_scale,
+                            device=device,
+                            dtype=torch.float32,
+                            seed=seed_val,
+                        )
+                    return bc_pts
+
+                def _sample_train_interior(n: int, seed_val: int) -> torch.Tensor:
+                    if is_layered and layered_sampling:
+                        _, in_pts = _sample_points_layered(
+                            spec,
+                            n_boundary=0,
+                            n_interior=n,
+                            domain_scale=domain_scale,
+                            device=device,
+                            dtype=torch.float32,
+                            seed=seed_val,
+                            exclusion_radius=layered_exclusion_radius,
+                            interface_band=layered_interface_band,
+                            interface_delta=layered_interface_delta,
+                        )
+                    else:
+                        _, in_pts = _sample_points_gpu(
+                            spec,
+                            n_boundary=0,
+                            n_interior=n,
+                            domain_scale=domain_scale,
+                            device=device,
+                            dtype=torch.float32,
+                            seed=seed_val,
+                        )
+                    return in_pts
+
+                def _eval_fast(pts: torch.Tensor) -> torch.Tensor:
+                    vals, _ = _oracle_eval(oracle_fast, spec, pts, dtype=fast_dtype)
+                    return vals.to(dtype=pts.dtype)
+
+                try:
+                    bc_train, V_bc_train, bc_resample_nonfinite, bc_resample_extreme = (
+                        _resample_invalid_oracle_targets(
+                            points=bc_train,
+                            values=V_bc_train,
+                            sample_fn=_sample_train_boundary,
+                            eval_fn=_eval_fast,
+                            max_abs=train_target_abs_max,
+                            max_attempts=train_target_resample_attempts,
+                            seed=seed_gen + 31,
+                        )
+                    )
+                    interior_train, V_in_train, in_resample_nonfinite, in_resample_extreme = (
+                        _resample_invalid_oracle_targets(
+                            points=interior_train,
+                            values=V_in_train,
+                            sample_fn=_sample_train_interior,
+                            eval_fn=_eval_fast,
+                            max_abs=train_target_abs_max,
+                            max_attempts=train_target_resample_attempts,
+                            seed=seed_gen + 37,
+                        )
+                    )
+                except RuntimeError as exc:
+                    X_train = torch.cat([bc_train, interior_train], dim=0)
+                    V_train = torch.cat([V_bc_train, V_in_train], dim=0)
+                    payload = build_vtrain_explosion_snapshot(
+                        spec,
+                        X_train,
+                        V_train,
+                        None,
+                        layered_reference_enabled=use_ref,
+                        reference_subtracted_for_fit=bool(use_ref),
+                        nan_to_num_applied=False,
+                        clamp_applied=False,
+                        seed=seed_gen,
+                        gen=gen,
+                        program_idx=None,
+                    )
+                    payload["reason"] = "oracle_resample_exhausted"
+                    write_vtrain_explosion_snapshot(run_dir, payload)
+                    raise RuntimeError(str(exc)) from exc
+
+                if preflight_counters is not None:
+                    total_nonfinite = int(bc_resample_nonfinite + in_resample_nonfinite)
+                    total_extreme = int(bc_resample_extreme + in_resample_extreme)
+                    if total_nonfinite > 0:
+                        _count_preflight("oracle_nonfinite_resample_count", total_nonfinite)
+                    if total_extreme > 0:
+                        _count_preflight("oracle_extreme_resample_count", total_extreme)
                 bc_hold_mask = torch.isfinite(V_bc_hold) & torch.isfinite(V_bc_hold_mid)
                 in_hold_mask = torch.isfinite(V_in_hold) & torch.isfinite(V_in_hold_mid)
                 if not torch.all(bc_hold_mask):
@@ -4375,6 +4527,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             "device_capability": device_cap,
             "preflight_mode": preflight_mode,
             "preflight_out": preflight_out,
+            "train_target_abs_max": float(train_target_abs_max),
+            "train_target_resample_attempts": int(train_target_resample_attempts),
             "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
             "per_gen": per_gen_preflight,
         }

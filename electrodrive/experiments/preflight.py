@@ -41,6 +41,8 @@ class RunCounters:
     a_hold_total: int = 0
     v_train_nonfinite_count: int = 0
     v_train_total: int = 0
+    oracle_nonfinite_resample_count: int = 0
+    oracle_extreme_resample_count: int = 0
     weights_nonfinite_count: int = 0
     weights_total: int = 0
     holdout_nonfinite_candidate_count: int = 0

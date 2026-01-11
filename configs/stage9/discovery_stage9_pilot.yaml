@@ -1,7 +1,7 @@
 seed: 0
 run:
   tag: black_hammer_push
-  generations: 8
+  generations: 3
   population_B: 4096
   topK_fast: 4096
   topk_mid: 2048
@@ -22,7 +22,7 @@ run:
   refine_opt: adam
   refine_max_terms: 32
   refine_targets: holdout
-  preflight_mode: lite
+  preflight_mode: full
   layered_sampling: true
   use_reference_potential: true
   use_gate_proxies: true

@@ -1,6 +1,6 @@
 seed: 123
-output_path: "artifacts/stage9_gfn_rich/gfn_ckpt.pt"
-spec_dim: 16
+output_path: "artifacts/stage9_gfn_rich_spec32/gfn_ckpt.pt"
+spec_dim: 32
 steps: 200
 batch_size: 16
 lr: 1e-3

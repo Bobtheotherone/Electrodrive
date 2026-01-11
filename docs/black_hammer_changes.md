@@ -159,3 +159,10 @@
   - `python -m electrodrive.gfn.train.run_train --config configs/stage9/train_gfn_rich_gate_proxy.yaml`
   - `python tools/stage9/patch_discovery_config.py --input configs/discovery_black_hammer_push.yaml --output configs/stage9/discovery_stage9_push.yaml`
   - `python tools/stage9/analyze_verifier_results.py <RUN_DIR>`
+
+## Phase 9.1: Align Stage 9 spec_dim with flow checkpoint
+- change: set `spec_dim: 32` and moved Stage 9 rich GFN checkpoints to `artifacts/stage9_gfn_rich_spec32/` to match the flow checkpoint spec embedding width.
+- why: prevent flow parameter sampler shape mismatches during Stage 9 discovery with gfn_flow.
+- reproduce:
+  - `python -m electrodrive.gfn.train.run_train --config configs/stage9/train_gfn_rich_gate_proxy.yaml`
+  - `python tools/stage9/inspect_gfn_samples.py --checkpoint artifacts/stage9_gfn_rich_spec32/gfn_ckpt.pt --n-programs 512 --batch-size 32 --seed 123`

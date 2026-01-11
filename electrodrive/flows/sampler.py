@@ -289,6 +289,7 @@ class ParamFlowSampler:
         n_steps = int(cfg.get("n_steps", self.config.n_steps))
         solver = str(cfg.get("solver", self.config.solver))
         temperature = float(cfg.get("temperature", 1.0))
+        latent_clip = cfg.get("latent_clip", self.config.latent_clip)
         max_tokens = cfg.get("max_tokens", self.config.max_tokens)
         max_ast_len = cfg.get("max_ast_len", self.config.max_ast_len)
 
@@ -398,6 +399,11 @@ class ParamFlowSampler:
             )
             self.model.to(device=device, dtype=dtype)
             u_latent = self._integrate(u_latent, cond, n_steps=n_steps, solver=solver, mask=dim_mask)
+
+        if latent_clip is not None:
+            clip = float(latent_clip)
+            if clip > 0:
+                u_latent = u_latent.clamp(min=-clip, max=clip)
 
         return ParamPayload(
             u_latent=u_latent,

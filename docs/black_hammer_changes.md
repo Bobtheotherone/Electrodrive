@@ -168,7 +168,7 @@
   - `python tools/stage9/inspect_gfn_samples.py --checkpoint artifacts/stage9_gfn_rich_spec32/gfn_ckpt.pt --n-programs 512 --batch-size 32 --seed 123`
 
 ## Phase 9.2: Stabilize flow sampling for Stage 9 pilot/push
-- change: reduced Stage 9 flow temperature to 0.5 and set flow sampling dtype to fp32 in Stage 9 discovery configs.
+- change: reduced Stage 9 flow temperature to 0.5, set flow sampling dtype to fp32, and added `latent_clip: 8.0` for flow latents in Stage 9 discovery configs.
 - why: mitigate nonfinite weights observed during pilot discovery (preflight_first_offender: weights_nonfinite).
 - reproduce:
   - `python -m electrodrive.experiments.run_discovery --config configs/stage9/discovery_stage9_pilot.yaml`

@@ -95,6 +95,7 @@ model:
     steps: 4
     solver: euler
     temperature: 0.5
+    latent_clip: 8.0
     dtype: fp32
 solver:
   name: differentiable_lasso

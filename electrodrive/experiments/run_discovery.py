@@ -141,6 +141,15 @@ def _coerce_optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def _set_perf_flags(cfg: Dict[str, Any]) -> None:
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model", {}), dict) else {}
     use_tf32 = bool(model_cfg.get("use_tf32", True))
@@ -1303,10 +1312,12 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             flow_max_ast_len = max_steps
         if flow_max_tokens is None or flow_max_tokens < max_steps:
             flow_max_tokens = max_steps
+        flow_latent_clip = _coerce_optional_float(param_cfg.get("latent_clip"))
         flow_cfg = FlowConfig(
             n_steps=int(param_cfg.get("steps", 4)),
             solver=str(param_cfg.get("solver", "euler")),
             temperature=float(param_cfg.get("temperature", 1.0)),
+            latent_clip=flow_latent_clip,
             dtype=str(param_cfg.get("dtype", "bf16")),
             max_ast_len=flow_max_ast_len,
             max_tokens=flow_max_tokens,
@@ -2094,19 +2105,20 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             max_ast_len=gfn.flow_config.max_ast_len,
                             max_tokens=gfn.flow_config.max_tokens,
                         )
-                        payload = gfn.param_sampler.sample(
-                            program_batch,
-                            spec,
-                            spec_embedding,
-                            seed=seed_gen,
-                            device=device,
-                            dtype=gfn.flow_dtype,
-                            n_steps=gfn.flow_config.n_steps,
-                            solver=gfn.flow_config.solver,
-                            temperature=gfn.flow_config.temperature,
-                            max_tokens=gfn.flow_config.max_tokens,
-                            max_ast_len=gfn.flow_config.max_ast_len,
-                        )
+                            payload = gfn.param_sampler.sample(
+                                program_batch,
+                                spec,
+                                spec_embedding,
+                                seed=seed_gen,
+                                device=device,
+                                dtype=gfn.flow_dtype,
+                                n_steps=gfn.flow_config.n_steps,
+                                solver=gfn.flow_config.solver,
+                                temperature=gfn.flow_config.temperature,
+                                latent_clip=gfn.flow_config.latent_clip,
+                                max_tokens=gfn.flow_config.max_tokens,
+                                max_ast_len=gfn.flow_config.max_ast_len,
+                            )
                         payload_map = {
                             program: payload.for_program(idx)
                             for idx, program in enumerate(param_programs)

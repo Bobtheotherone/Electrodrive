@@ -83,6 +83,7 @@ class FlowConfig:
     n_steps: int = 4
     solver: str = "euler"
     temperature: float = 1.0
+    latent_clip: float | None = None
     dtype: str = "fp32"
     seed: int | None = None
 

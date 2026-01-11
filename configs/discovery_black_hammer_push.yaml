@@ -37,6 +37,40 @@ run:
   layered_exclusion_radius: 5e-2
   layered_interface_delta: 1e-2
   layered_interface_band: 1e-2
+  layered_complex_boost:
+    enabled: true
+    programs: 256
+    blocks_min: 2
+    blocks_max: 4
+    poles_min: 2
+    poles_max: 8
+    branches_min: 1
+    branches_max: 3
+    complex_terms_min: 2
+    complex_terms_max: 6
+    anchor_terms: 1
+    xy_jitter: 0.05
+    imag_min_scale: 1e-3
+    imag_max_scale: 8.0
+    log_cluster_std: 0.6
+  fast_proxy:
+    enabled: true
+    n_far: 24
+    n_interface: 24
+    near_radius: 0.5
+    far_radius: 12.0
+    far_weight: 0.15
+    interface_weight: 0.2
+    cond_weight: 0.05
+    speed_weight: 0.02
+    dcim_term_cost: 1.5
+    dcim_block_cost: 2.5
+    far_target: 0.4
+    far_max_ratio: 4.0
+    cond_target: 5e3
+    cond_max: 2e6
+    fail_hard: false
+  dcim_diversity: true
 
 points:
   bc_train: 2048

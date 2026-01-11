@@ -111,3 +111,15 @@
   - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_proxyA_transform.py -vv -rs --maxfail=1`
 - validate: proxy Gate B/D metrics and proxy_score remain finite under extreme magnitudes and large runs no longer emit NaN/Infinity proxy fields.
+
+## Phase 5: Complex/DCIM boost + fast proxy alignment
+- change: added layered complex/DCIM boost generator with multi-block DCIM sampling, depth clustering, and interface exclusion; wired via `run.layered_complex_boost` and `run.dcim_diversity`.
+- change: added fast proxy metrics (far-field ratio, interface jump, condition ratio, speed proxy) to fast scoring; optional hard rejection for pathological candidates.
+- change: preflight now records complex/DCIM fractions plus histograms for pole/block counts, max |Im(z)|, max |weights|, and condition ratio; includes baseline backend name.
+- why: expand expressive complex/DCIM search space, align fast scoring with gates B-E, and diagnose DCIM/complex coverage in push runs.
+- reproduce:
+  - `pytest -q tests/test_layered_complex_candidates_determinism.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_fast_proxy_metrics.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_complex_pair_real_cuda.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_dcim_block_eval_shape.py -vv -rs --maxfail=1`
+- validate: preflight reports nontrivial complex/DCIM fractions, fast proxy metrics are finite, and CUDA-only tests pass.

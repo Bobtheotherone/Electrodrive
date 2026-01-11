@@ -25,6 +25,15 @@ class RunCounters:
     proxy_computed_count: int = 0
     proxy_score_nonfinite_sanitized: int = 0
     complex_guard_failed: int = 0
+    complex_candidates: int = 0
+    dcim_candidates: int = 0
+    dcim_pole_terms: int = 0
+    dcim_branch_terms: int = 0
+    dcim_block_terms: int = 0
+    fast_proxy_far_reject: int = 0
+    fast_proxy_interface_reject: int = 0
+    fast_proxy_condition_reject: int = 0
+    interface_exclusion_reject: int = 0
     weights_empty: int = 0
     a_train_nonfinite_count: int = 0
     a_train_total: int = 0

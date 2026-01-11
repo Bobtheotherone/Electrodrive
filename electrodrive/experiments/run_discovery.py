@@ -38,7 +38,9 @@ from electrodrive.images.basis import (
     DCIMPoleImageBasis,
     ImageBasisElement,
     PointChargeBasis,
+    annotate_group_info,
 )
+from electrodrive.images.basis_dcim import DCIMBlockBasis
 from electrodrive.images.geo_encoder import GeoEncoder
 from electrodrive.images.learned_generator import SimpleGeoEncoder
 from electrodrive.images.search import ImageSystem, assemble_basis_matrix, solve_sparse
@@ -56,6 +58,16 @@ from electrodrive.experiments.layered_sampling import (
     parse_layered_interfaces,
     sample_layered_interior,
     sample_layered_interface_pairs,
+)
+from electrodrive.experiments.fast_proxy_metrics import (
+    condition_ratio,
+    far_field_ratio,
+    interface_jump,
+    log10_bucket,
+)
+from electrodrive.experiments.layered_complex_candidates import (
+    LayeredComplexBoostConfig,
+    build_layered_complex_candidates,
 )
 from electrodrive.experiments.preflight import (
     RunCounters,
@@ -772,6 +784,150 @@ def _count_complex_terms(
     return int((z_stack.abs() > thresh).sum().item())
 
 
+def _dcim_stats(elements: Sequence[ImageBasisElement]) -> Dict[str, int]:
+    dcim_poles = 0
+    dcim_branches = 0
+    dcim_blocks = 0
+    block_ids: set[int] = set()
+    for elem in elements:
+        if isinstance(elem, DCIMPoleImageBasis):
+            dcim_poles += 1
+        elif isinstance(elem, DCIMBranchCutImageBasis):
+            dcim_branches += 1
+        elif isinstance(elem, DCIMBlockBasis):
+            dcim_blocks += 1
+        else:
+            elem_type = getattr(elem, "type", "")
+            if isinstance(elem_type, str) and elem_type.startswith("dcim_block"):
+                dcim_blocks += 1
+        info = getattr(elem, "_group_info", None)
+        if isinstance(info, dict) and "block_id" in info:
+            try:
+                block_ids.add(int(info.get("block_id", 0)))
+            except Exception:
+                pass
+    dcim_terms = dcim_poles + dcim_branches + dcim_blocks
+    if dcim_terms > 0 and not block_ids:
+        block_ids.add(0)
+    return {
+        "dcim_poles": int(dcim_poles),
+        "dcim_branches": int(dcim_branches),
+        "dcim_blocks": int(len(block_ids)),
+        "dcim_terms": int(dcim_terms),
+    }
+
+
+def _max_abs_imag_depth(
+    elements: Sequence[ImageBasisElement],
+    *,
+    device: torch.device,
+) -> float:
+    max_val = torch.zeros((), device=device, dtype=torch.float32)
+    for elem in elements:
+        z_imag = elem.params.get("z_imag")
+        if z_imag is not None:
+            if torch.is_tensor(z_imag):
+                z_val = torch.abs(z_imag.to(device=device).reshape(-1))
+                if z_val.numel() > 0:
+                    max_val = torch.maximum(max_val, torch.max(z_val))
+            else:
+                try:
+                    z_val = abs(float(z_imag))
+                    max_val = torch.maximum(max_val, torch.tensor(z_val, device=device))
+                except Exception:
+                    pass
+        if isinstance(elem, DCIMBlockBasis) and getattr(elem, "images", None):
+            try:
+                depths = torch.tensor(
+                    [img.depth for img in elem.images], device=device, dtype=torch.complex64
+                )
+                imag = torch.abs(depths.imag)
+                if imag.numel() > 0:
+                    max_val = torch.maximum(max_val, torch.max(imag))
+            except Exception:
+                pass
+    if not torch.isfinite(max_val):
+        return float("nan")
+    return float(max_val.item())
+
+
+def _bucket_count(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count <= 2:
+        return "1-2"
+    if count <= 5:
+        return "3-5"
+    if count <= 9:
+        return "6-9"
+    return "10+"
+
+
+def _candidate_signature(dcim_stats: Dict[str, int], imag_bucket: str) -> str:
+    block_count = dcim_stats.get("dcim_blocks", 0)
+    pole_bucket = _bucket_count(dcim_stats.get("dcim_poles", 0))
+    return f"b{block_count}_p{pole_bucket}_i{imag_bucket}"
+
+
+def _speed_proxy(
+    n_terms: int,
+    dcim_terms: int,
+    dcim_blocks: int,
+    *,
+    dcim_term_cost: float,
+    dcim_block_cost: float,
+) -> float:
+    base = float(n_terms)
+    return base + float(dcim_terms) * float(dcim_term_cost) + float(dcim_blocks) * float(dcim_block_cost)
+
+
+def _update_hist(hist: Dict[str, int], key: object, n: int = 1) -> None:
+    k = str(key)
+    hist[k] = hist.get(k, 0) + int(n)
+
+
+def _sample_sphere_points(
+    n: int,
+    radius: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    if n <= 0:
+        return torch.empty((0, 3), device=device, dtype=dtype)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    vec = torch.randn((n, 3), generator=gen, device=device, dtype=dtype)
+    norms = torch.linalg.norm(vec, dim=1, keepdim=True).clamp_min(1e-12)
+    vec = vec / norms
+    return vec * float(radius)
+
+
+def _violates_interface_exclusion(
+    elements: Sequence[ImageBasisElement],
+    interfaces: Sequence[float],
+    exclusion_radius: float,
+    *,
+    device: torch.device,
+) -> bool:
+    if exclusion_radius <= 0.0 or not interfaces:
+        return False
+    z_vals: List[torch.Tensor] = []
+    for elem in elements:
+        pos = elem.params.get("position")
+        if pos is None:
+            continue
+        if torch.is_tensor(pos):
+            z_vals.append(pos.to(device=device).reshape(-1)[2])
+    if not z_vals:
+        return False
+    z_stack = torch.stack(z_vals)
+    planes = torch.tensor(list(interfaces), device=device, dtype=z_stack.dtype)
+    dists = torch.abs(z_stack[:, None] - planes[None, :])
+    return bool(torch.any(dists < exclusion_radius).item())
+
+
 def _perturb_elements(
     elements: Sequence[ImageBasisElement],
     sigma: float,
@@ -918,6 +1074,18 @@ def _build_dcim_block_elements(
     elems = dcim_basis_from_block(block)
     if not elems:
         raise RuntimeError("DCIM block baseline produced no basis elements.")
+    for idx, elem in enumerate(elems):
+        annotate_group_info(
+            elem,
+            conductor_id=0,
+            family_name="dcim_block",
+            motif_index=idx,
+        )
+        info = getattr(elem, "_group_info", None)
+        if isinstance(info, dict):
+            info["block_id"] = 0
+            info["block_kind"] = "dcim_block_baseline"
+            setattr(elem, "_group_info", info)
 
     max_blocks = max(0, int(max_blocks))
     if max_blocks <= 0:
@@ -1008,6 +1176,26 @@ def _candidate_to_record(
 def _select_topk(scores: Sequence[float], k: int) -> List[int]:
     order = sorted(range(len(scores)), key=lambda i: scores[i])
     return order[: max(0, min(k, len(order)))]
+
+
+def _diversity_select(indices: Sequence[int], signatures: Dict[int, str], k: int) -> List[int]:
+    if not indices:
+        return []
+    buckets: Dict[str, List[int]] = {}
+    for idx in indices:
+        sig = signatures.get(idx, "none")
+        buckets.setdefault(sig, []).append(idx)
+    selected: List[int] = []
+    while buckets and len(selected) < k:
+        for sig in list(buckets.keys()):
+            if not buckets[sig]:
+                buckets.pop(sig, None)
+                continue
+            selected.append(buckets[sig].pop(0))
+            if len(selected) >= k:
+                break
+        buckets = {sig: vals for sig, vals in buckets.items() if vals}
+    return selected[: max(0, min(k, len(selected)))]
 
 
 def _oracle_for_name(name: str) -> OracleFidelity:
@@ -1240,6 +1428,26 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     layered_stability_delta = float(run_cfg.get("layered_stability_delta", 1e-2))
     layered_prefer_dcim = bool(run_cfg.get("layered_prefer_dcim", True))
     layered_allow_real_primitives = bool(run_cfg.get("layered_allow_real_primitives", False))
+    complex_boost_cfg = LayeredComplexBoostConfig.from_dict(run_cfg.get("layered_complex_boost", {}))
+    fast_proxy_cfg = run_cfg.get("fast_proxy", {}) if isinstance(run_cfg.get("fast_proxy", {}), dict) else {}
+    fast_proxy_enabled = bool(fast_proxy_cfg.get("enabled", False))
+    fast_proxy_n_far = int(fast_proxy_cfg.get("n_far", 24))
+    fast_proxy_n_interface = int(fast_proxy_cfg.get("n_interface", 24))
+    fast_proxy_near_radius = float(fast_proxy_cfg.get("near_radius", 0.5))
+    fast_proxy_far_radius = float(fast_proxy_cfg.get("far_radius", 12.0))
+    fast_proxy_far_weight = float(fast_proxy_cfg.get("far_weight", 0.0))
+    fast_proxy_interface_weight = float(fast_proxy_cfg.get("interface_weight", 0.0))
+    fast_proxy_cond_weight = float(fast_proxy_cfg.get("cond_weight", 0.0))
+    fast_proxy_speed_weight = float(fast_proxy_cfg.get("speed_weight", 0.0))
+    fast_proxy_dcim_term_cost = float(fast_proxy_cfg.get("dcim_term_cost", 1.5))
+    fast_proxy_dcim_block_cost = float(fast_proxy_cfg.get("dcim_block_cost", 2.5))
+    fast_proxy_far_target = float(fast_proxy_cfg.get("far_target", 0.4))
+    fast_proxy_far_max = float(fast_proxy_cfg.get("far_max_ratio", 4.0))
+    fast_proxy_cond_target = float(fast_proxy_cfg.get("cond_target", 5e3))
+    fast_proxy_interface_max = float(fast_proxy_cfg.get("interface_max_jump", 0.0))
+    fast_proxy_cond_max = float(fast_proxy_cfg.get("cond_max", 0.0))
+    fast_proxy_fail_hard = bool(fast_proxy_cfg.get("fail_hard", False))
+    dcim_diversity = bool(run_cfg.get("dcim_diversity", False))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
     refine_steps = int(run_cfg.get("refine_steps", 12))
     refine_lr = float(run_cfg.get("refine_lr", 5e-2))
@@ -1298,6 +1506,14 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     holdout_stats: Dict[str, Any] = {}
     weights_reject_reasons: set[str] = set()
     holdout_reject_reasons: set[str] = set()
+    baseline_backend_name: Optional[str] = None
+    dcim_pole_hist: Dict[str, int] = {}
+    dcim_block_hist: Dict[str, int] = {}
+    max_imag_hist: Dict[str, int] = {}
+    max_weight_hist: Dict[str, int] = {}
+    cond_ratio_hist: Dict[str, int] = {}
+    low_dcim_streak = 0
+    low_complex_streak = 0
 
     def _count_preflight(key: str, n: int = 1) -> None:
         if preflight_counters is None:
@@ -1483,6 +1699,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         domain_scale = float(spec_cfg.get("domain_scale", 1.0))
         seed_gen = seed + gen * 13
         is_layered = getattr(spec, "BCs", "") == "dielectric_interfaces"
+        interface_planes = parse_layered_interfaces(spec) if is_layered else []
         use_ref = bool(use_reference_potential and is_layered)
         prefer_dcim = bool(layered_prefer_dcim and is_layered)
         allow_real_primitives = bool(layered_allow_real_primitives or not prefer_dcim)
@@ -1552,6 +1769,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                 oracle_fast = _build_oracle_backend(fast_fidelity, spec)
                 oracle_mid = _build_oracle_backend(mid_fidelity, spec)
+                if baseline_backend_name is None:
+                    baseline_backend_name = oracle_fast.__class__.__name__
 
                 V_bc_train, _ = _oracle_eval(oracle_fast, spec, bc_train, dtype=fast_dtype)
                 V_in_train, _ = _oracle_eval(oracle_fast, spec, interior_train, dtype=fast_dtype)
@@ -1780,6 +1999,39 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 else:
                     v_train_has_nonfinite = not torch.isfinite(V_train).all().item()
 
+                fast_proxy_near_pts = torch.empty((0, 3), device=device, dtype=torch.float32)
+                fast_proxy_far_pts = torch.empty((0, 3), device=device, dtype=torch.float32)
+                fast_proxy_iface_up = torch.empty((0, 3), device=device, dtype=torch.float32)
+                fast_proxy_iface_dn = torch.empty((0, 3), device=device, dtype=torch.float32)
+                if fast_proxy_enabled and is_layered:
+                    near_radius = max(1e-3, float(fast_proxy_near_radius) * float(domain_scale))
+                    far_radius = max(near_radius * 2.0, float(fast_proxy_far_radius) * float(domain_scale))
+                    n_far = max(8, int(fast_proxy_n_far))
+                    fast_proxy_near_pts = _sample_sphere_points(
+                        n_far,
+                        near_radius,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 11,
+                    )
+                    fast_proxy_far_pts = _sample_sphere_points(
+                        n_far,
+                        far_radius,
+                        device=device,
+                        dtype=torch.float32,
+                        seed=seed_gen + 13,
+                    )
+                    if fast_proxy_n_interface > 0:
+                        fast_proxy_iface_up, fast_proxy_iface_dn = sample_layered_interface_pairs(
+                            spec,
+                            n_xy=int(fast_proxy_n_interface),
+                            device=device,
+                            dtype=torch.float32,
+                            seed=seed_gen + 17,
+                            delta=layered_interface_delta,
+                            domain_scale=domain_scale,
+                        )
+
                 spec_embedding, _, _ = geo_encoder.encode(spec, device=device, dtype=torch.float32)
                 spec_embedding = spec_embedding.to(device=device, dtype=torch.float32)
                 spec_batch = [
@@ -1805,58 +2057,96 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 if seeded:
                     programs.extend(seeded)
 
+                manual_elements: Dict[Program, List[ImageBasisElement]] = {}
+                manual_meta: Dict[Program, Dict[str, object]] = {}
+                if complex_boost_cfg.enabled and is_layered:
+                    max_extra = max(0, backoff.population_B - len(programs))
+                    if max_extra > 0:
+                        manual_candidates = build_layered_complex_candidates(
+                            spec,
+                            device=device,
+                            dtype=torch.float32,
+                            seed=seed_gen + 19,
+                            config=complex_boost_cfg,
+                            max_terms=max_steps - 1,
+                            domain_scale=domain_scale,
+                            exclusion_radius=layered_exclusion_radius,
+                            allow_real_primitives=allow_real_primitives,
+                        )
+                        if manual_candidates:
+                            if len(manual_candidates) > max_extra:
+                                manual_candidates = manual_candidates[:max_extra]
+                            manual_elements = {c.program: c.elements for c in manual_candidates}
+                            manual_meta = {c.program: c.meta for c in manual_candidates}
+                            programs.extend([c.program for c in manual_candidates])
+
                 _count_preflight("sampled_programs_total", len(programs))
                 if not programs:
                     raise RuntimeError("No programs sampled; aborting generation.")
                 program_lengths = [len(getattr(p, "nodes", []) or []) for p in programs]
-                payload = None
+                payload_map: Dict[Program, Any] = {}
                 if use_param_sampler:
-                    program_batch = gfn.param_sampler.build_program_batch(
-                        programs,
-                        device=device,
-                        max_ast_len=gfn.flow_config.max_ast_len,
-                        max_tokens=gfn.flow_config.max_tokens,
-                    )
-                    payload = gfn.param_sampler.sample(
-                        program_batch,
-                        spec,
-                        spec_embedding,
-                        seed=seed_gen,
-                        device=device,
-                        dtype=gfn.flow_dtype,
-                        n_steps=gfn.flow_config.n_steps,
-                        solver=gfn.flow_config.solver,
-                        temperature=gfn.flow_config.temperature,
-                        max_tokens=gfn.flow_config.max_tokens,
-                        max_ast_len=gfn.flow_config.max_ast_len,
-                    )
+                    param_programs = [p for p in programs if p not in manual_elements]
+                    if param_programs:
+                        program_batch = gfn.param_sampler.build_program_batch(
+                            param_programs,
+                            device=device,
+                            max_ast_len=gfn.flow_config.max_ast_len,
+                            max_tokens=gfn.flow_config.max_tokens,
+                        )
+                        payload = gfn.param_sampler.sample(
+                            program_batch,
+                            spec,
+                            spec_embedding,
+                            seed=seed_gen,
+                            device=device,
+                            dtype=gfn.flow_dtype,
+                            n_steps=gfn.flow_config.n_steps,
+                            solver=gfn.flow_config.solver,
+                            temperature=gfn.flow_config.temperature,
+                            max_tokens=gfn.flow_config.max_tokens,
+                            max_ast_len=gfn.flow_config.max_ast_len,
+                        )
+                        payload_map = {
+                            program: payload.for_program(idx)
+                            for idx, program in enumerate(param_programs)
+                        }
 
                 fast_scores: List[float] = []
                 fast_metrics: List[Dict[str, Any]] = []
                 n_terms_list: List[int] = []
                 complex_counts: List[int] = []
+                candidate_signatures: Dict[int, str] = {}
+                gen_candidates_total = 0
+                gen_complex_candidates = 0
+                gen_dcim_candidates = 0
                 hold_cache: Dict[int, torch.Tensor] = {} if cache_hold_matrices else {}
                 for start in range(0, len(programs), score_microbatch):
                     end = min(len(programs), start + score_microbatch)
                     for idx in range(start, end):
                         program = programs[idx]
                         try:
-                            if payload is not None:
-                                per_payload = payload.for_program(idx)
-                                elements, _, meta = compile_program_to_basis(
-                                    program,
-                                    spec,
-                                    device,
-                                    param_payload=per_payload,
-                                    strict=True,
-                                )
+                            manual = manual_elements.get(program)
+                            if manual is not None:
+                                elements = manual
+                                meta = manual_meta.get(program, {})
                             else:
-                                elements, _, meta = compile_program_to_basis(
-                                    program,
-                                    spec,
-                                    device,
-                                    strict=False,
-                                )
+                                per_payload = payload_map.get(program)
+                                if per_payload is not None:
+                                    elements, _, meta = compile_program_to_basis(
+                                        program,
+                                        spec,
+                                        device,
+                                        param_payload=per_payload,
+                                        strict=True,
+                                    )
+                                else:
+                                    elements, _, meta = compile_program_to_basis(
+                                        program,
+                                        spec,
+                                        device,
+                                        strict=False,
+                                    )
                         except Exception:
                             _count_preflight("compiled_failed")
                             raise
@@ -1872,6 +2162,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         n_terms = int(len(elements))
                         frac_complex = float(complex_count) / max(1, n_terms)
                         complex_counts.append(complex_count)
+                        dcim_stats = _dcim_stats(elements)
+                        dcim_terms = int(dcim_stats.get("dcim_terms", 0))
+                        complex_present = bool(complex_count > 0 or dcim_terms > 0)
+                        imag_max = _max_abs_imag_depth(elements, device=device) if preflight_enabled or dcim_diversity else 0.0
+                        imag_bucket = log10_bucket(imag_max) if imag_max > 0.0 else "0"
+                        candidate_signatures[idx] = _candidate_signature(dcim_stats, imag_bucket)
+                        gen_candidates_total += 1
+                        if complex_present:
+                            gen_complex_candidates += 1
+                            _count_preflight("complex_candidates")
+                        if dcim_terms > 0:
+                            gen_dcim_candidates += 1
+                            _count_preflight("dcim_candidates")
+                        if preflight_counters is not None:
+                            _count_preflight("dcim_pole_terms", int(dcim_stats.get("dcim_poles", 0)))
+                            _count_preflight("dcim_branch_terms", int(dcim_stats.get("dcim_branches", 0)))
+                            _count_preflight("dcim_block_terms", int(dcim_stats.get("dcim_blocks", 0)))
+                        if preflight_enabled:
+                            _update_hist(dcim_pole_hist, dcim_stats.get("dcim_poles", 0))
+                            _update_hist(dcim_block_hist, dcim_stats.get("dcim_blocks", 0))
+                            if imag_max > 0.0 and math.isfinite(imag_max):
+                                _update_hist(max_imag_hist, log10_bucket(imag_max))
                         if is_layered and not (complex_count >= 2 or frac_complex >= 0.25):
                             _count_preflight("complex_guard_failed")
                             fast_scores.append(float("inf"))
@@ -1884,6 +2196,24 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
+                        if is_layered and layered_exclusion_radius > 0.0:
+                            if _violates_interface_exclusion(
+                                elements,
+                                interface_planes,
+                                layered_exclusion_radius,
+                                device=device,
+                            ):
+                                _count_preflight("interface_exclusion_reject")
+                                fast_scores.append(float("inf"))
+                                fast_metrics.append(
+                                    {
+                                        "interface_exclusion_reject": True,
+                                        "complex_count": int(complex_count),
+                                        "frac_complex": float(frac_complex),
+                                    }
+                                )
+                                n_terms_list.append(n_terms)
+                                continue
                         try:
                             A_train = assemble_basis_matrix(elements, X_train)
                             A_hold = assemble_basis_matrix(elements, X_hold)
@@ -1944,6 +2274,27 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             n_terms_list.append(n_terms)
                             continue
 
+                        cond_ratio = float("nan")
+                        if preflight_enabled or fast_proxy_cond_weight > 0.0 or fast_proxy_cond_max > 0.0:
+                            cond_ratio = condition_ratio(A_train)
+                            if preflight_enabled and math.isfinite(cond_ratio):
+                                _update_hist(cond_ratio_hist, log10_bucket(cond_ratio))
+                            if fast_proxy_cond_max > 0.0 and (
+                                not math.isfinite(cond_ratio) or cond_ratio > fast_proxy_cond_max
+                            ):
+                                _count_preflight("fast_proxy_condition_reject")
+                                fast_scores.append(float("inf"))
+                                fast_metrics.append(
+                                    {
+                                        "condition_reject": True,
+                                        "cond_ratio": cond_ratio,
+                                        "complex_count": int(complex_count),
+                                        "frac_complex": float(frac_complex),
+                                    }
+                                )
+                                n_terms_list.append(n_terms)
+                                continue
+
                         weights = _fast_weights(
                             A_train,
                             V_train,
@@ -1996,6 +2347,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
+                        max_abs_weight = float(torch.max(torch.abs(weights)).item()) if weights.numel() > 0 else 0.0
+                        if preflight_enabled and math.isfinite(max_abs_weight):
+                            _update_hist(max_weight_hist, log10_bucket(max_abs_weight))
                         pred_hold_corr = A_hold.matmul(weights)
                         pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                         if preflight_counters is not None:
@@ -2093,8 +2447,92 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
+                        fast_far_ratio = float("nan")
+                        fast_iface_jump = float("nan")
+                        fast_far_penalty = 0.0
+                        fast_iface_penalty = 0.0
+                        cond_penalty = 0.0
+                        speed_proxy = _speed_proxy(
+                            n_terms,
+                            dcim_terms,
+                            int(dcim_stats.get("dcim_blocks", 0)),
+                            dcim_term_cost=fast_proxy_dcim_term_cost,
+                            dcim_block_cost=fast_proxy_dcim_block_cost,
+                        )
+                        if fast_proxy_cond_weight > 0.0 and math.isfinite(cond_ratio):
+                            cond_penalty = max(0.0, cond_ratio - fast_proxy_cond_target)
+                        if fast_proxy_enabled and is_layered and (
+                            fast_proxy_far_weight > 0.0
+                            or fast_proxy_interface_weight > 0.0
+                            or fast_proxy_fail_hard
+                        ):
+                            system = ImageSystem(elements, weights)
+
+                            def _fast_eval(pts: torch.Tensor) -> torch.Tensor:
+                                out = system.potential(pts)
+                                if use_ref:
+                                    out = out + compute_layered_reference_potential(
+                                        spec,
+                                        pts,
+                                        device=pts.device,
+                                        dtype=pts.dtype,
+                                    )
+                                return out
+
+                            if fast_proxy_far_weight > 0.0 or fast_proxy_fail_hard:
+                                fast_far_ratio = far_field_ratio(
+                                    _fast_eval, fast_proxy_near_pts, fast_proxy_far_pts
+                                )
+                                if math.isfinite(fast_far_ratio):
+                                    fast_far_penalty = max(0.0, fast_far_ratio - fast_proxy_far_target)
+                                if fast_proxy_fail_hard and math.isfinite(fast_far_ratio) and (
+                                    fast_far_ratio > fast_proxy_far_max
+                                ):
+                                    _count_preflight("fast_proxy_far_reject")
+                                    fast_scores.append(float("inf"))
+                                    fast_metrics.append(
+                                        {
+                                            "fast_proxy_far_reject": True,
+                                            "fast_proxy_far_ratio": fast_far_ratio,
+                                            "complex_count": int(complex_count),
+                                            "frac_complex": float(frac_complex),
+                                        }
+                                    )
+                                    n_terms_list.append(n_terms)
+                                    continue
+                            if fast_proxy_interface_weight > 0.0 or fast_proxy_fail_hard:
+                                fast_iface_jump = interface_jump(
+                                    _fast_eval, fast_proxy_iface_up, fast_proxy_iface_dn
+                                )
+                                iface_limit = fast_proxy_interface_max
+                                if iface_limit <= 0.0:
+                                    iface_limit = float(verify_plan.thresholds.get("bc_continuity", 0.0))
+                                if math.isfinite(fast_iface_jump) and iface_limit > 0.0:
+                                    fast_iface_penalty = max(0.0, fast_iface_jump - iface_limit)
+                                if fast_proxy_fail_hard and fast_proxy_interface_max > 0.0 and math.isfinite(fast_iface_jump):
+                                    if fast_iface_jump > fast_proxy_interface_max:
+                                        _count_preflight("fast_proxy_interface_reject")
+                                        fast_scores.append(float("inf"))
+                                        fast_metrics.append(
+                                            {
+                                                "fast_proxy_interface_reject": True,
+                                                "fast_proxy_interface_jump": fast_iface_jump,
+                                                "complex_count": int(complex_count),
+                                                "frac_complex": float(frac_complex),
+                                            }
+                                        )
+                                        n_terms_list.append(n_terms)
+                                        continue
                         comp = _complexity(program, elements)
                         score = w_bc * holdout_vals["mean_bc"] + w_pde * holdout_vals["mean_in"] + w_complexity * comp["n_terms"]
+                        if fast_proxy_speed_weight > 0.0:
+                            score = score + fast_proxy_speed_weight * speed_proxy
+                        if fast_proxy_far_weight > 0.0:
+                            score = score + fast_proxy_far_weight * fast_far_penalty
+                        if fast_proxy_interface_weight > 0.0:
+                            score = score + fast_proxy_interface_weight * fast_iface_penalty
+                        if fast_proxy_cond_weight > 0.0:
+                            score = score + fast_proxy_cond_weight * cond_penalty
                         if not _finite(score):
                             _count_preflight("holdout_nonfinite_candidate_count")
                             _log_holdout_nonfinite(
@@ -2126,8 +2564,19 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "program_hash": meta.get("program_hash"),
                                 "complex_count": int(complex_count),
                                 "frac_complex": float(frac_complex),
+                                "manual_candidate": bool(meta.get("manual_candidate", False)),
+                                "cond_ratio": cond_ratio,
+                                "speed_proxy": speed_proxy,
+                                "fast_proxy_far_ratio": fast_far_ratio,
+                                "fast_proxy_interface_jump": fast_iface_jump,
                             }
                         )
+
+                gen_fraction_complex = 0.0
+                gen_fraction_dcim = 0.0
+                if gen_candidates_total > 0:
+                    gen_fraction_complex = float(gen_complex_candidates) / float(gen_candidates_total)
+                    gen_fraction_dcim = float(gen_dcim_candidates) / float(gen_candidates_total)
 
                 if gen == 0 and programs:
                     # Small CPU-side histogram for control logic; avoids GPU-only complexity.
@@ -2181,22 +2630,26 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     )
                     for idx in list(top_fast_idx):
                         program = programs[idx]
-                        if payload is not None:
-                            per_payload = payload.for_program(idx)
-                            elements, _, _ = compile_program_to_basis(
-                                program,
-                                spec,
-                                device,
-                                param_payload=per_payload,
-                                strict=True,
-                            )
+                        manual = manual_elements.get(program)
+                        if manual is not None:
+                            elements = manual
                         else:
-                            elements, _, _ = compile_program_to_basis(
-                                program,
-                                spec,
-                                device,
-                                strict=False,
-                            )
+                            per_payload = payload_map.get(program)
+                            if per_payload is not None:
+                                elements, _, _ = compile_program_to_basis(
+                                    program,
+                                    spec,
+                                    device,
+                                    param_payload=per_payload,
+                                    strict=True,
+                                )
+                            else:
+                                elements, _, _ = compile_program_to_basis(
+                                    program,
+                                    spec,
+                                    device,
+                                    strict=False,
+                                )
                         if not elements:
                             continue
                         A_train = assemble_basis_matrix(elements, X_train)
@@ -2313,6 +2766,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 fast_scores[i],
                             ),
                         )[: max(1, min(topK_fast, len(top_fast_idx)))]
+                if dcim_diversity and is_layered and top_fast_idx:
+                    top_fast_idx = _diversity_select(top_fast_idx, candidate_signatures, topK_fast)
                 if cache_hold_matrices and hold_cache:
                     keep = set(top_fast_idx)
                     hold_cache = {idx: mat for idx, mat in hold_cache.items() if idx in keep}
@@ -2334,6 +2789,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         raise RuntimeError(f"DCIM block baseline failed: {exc}") from exc
 
                     if dcim_elements:
+                        if preflight_enabled:
+                            dcim_stats = _dcim_stats(dcim_elements)
+                            _update_hist(dcim_pole_hist, dcim_stats.get("dcim_poles", 0))
+                            _update_hist(dcim_block_hist, dcim_stats.get("dcim_blocks", 0))
+                            imag_max = _max_abs_imag_depth(dcim_elements, device=device)
+                            if imag_max > 0.0 and math.isfinite(imag_max):
+                                _update_hist(max_imag_hist, log10_bucket(imag_max))
                         dcim_nodes = [
                             AddPrimitiveBlock(
                                 family_name="dcim_block_baseline",
@@ -2669,22 +3131,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         complex_count = int(complex_counts[idx]) if idx < len(complex_counts) else 0
                         if not (complex_count >= 2 or (complex_count / n_terms) >= 0.25):
                             continue
-                    if payload is not None:
-                        per_payload = payload.for_program(idx)
-                        elements, group_ids, meta = compile_program_to_basis(
-                            program,
-                            spec,
-                            device,
-                            param_payload=per_payload,
-                            strict=True,
-                        )
+                    manual = manual_elements.get(program)
+                    if manual is not None:
+                        elements = manual
+                        group_ids = None
+                        meta = manual_meta.get(program, {})
                     else:
-                        elements, group_ids, meta = compile_program_to_basis(
-                            program,
-                            spec,
-                            device,
-                            strict=False,
-                        )
+                        per_payload = payload_map.get(program)
+                        if per_payload is not None:
+                            elements, group_ids, meta = compile_program_to_basis(
+                                program,
+                                spec,
+                                device,
+                                param_payload=per_payload,
+                                strict=True,
+                            )
+                        else:
+                            elements, group_ids, meta = compile_program_to_basis(
+                                program,
+                                spec,
+                                device,
+                                strict=False,
+                            )
                     if not elements:
                         continue
 
@@ -3542,6 +4010,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     entry = {"gen": int(gen), "counters": gen_counters.as_dict()}
                     if holdout_stats:
                         entry["holdout"] = dict(holdout_stats)
+                    entry["fraction_complex_candidates"] = float(gen_fraction_complex)
+                    entry["fraction_dcim_candidates"] = float(gen_fraction_dcim)
                     per_gen_preflight.append(entry)
                     print(
                         "PREFLIGHT "
@@ -3551,6 +4021,20 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         f"fast_scored={gen_counters.fast_scored} "
                         f"verified_written={gen_counters.verified_written}"
                     )
+                if is_layered and preflight_enabled and gen_candidates_total > 0:
+                    if gen_fraction_complex < 0.30:
+                        low_complex_streak += 1
+                    else:
+                        low_complex_streak = 0
+                    if gen_fraction_dcim < 0.30:
+                        low_dcim_streak += 1
+                    else:
+                        low_dcim_streak = 0
+                    if low_complex_streak >= 3 or low_dcim_streak >= 3:
+                        raise RuntimeError(
+                            "DCIM/complex fraction below 0.30 for 3 consecutive generations; "
+                            "inspect candidate emission and preflight counters."
+                        )
 
                 if ramp_check:
                     improved = False
@@ -3822,6 +4306,15 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
             "per_gen": per_gen_preflight,
         }
+        candidate_total = max(1, int(preflight_counters.compiled_ok))
+        extra["fraction_complex_candidates"] = float(preflight_counters.complex_candidates) / float(candidate_total)
+        extra["fraction_dcim_candidates"] = float(preflight_counters.dcim_candidates) / float(candidate_total)
+        extra["dcim_pole_count_hist"] = dict(sorted(dcim_pole_hist.items(), key=lambda x: x[0]))
+        extra["dcim_block_count_hist"] = dict(sorted(dcim_block_hist.items(), key=lambda x: x[0]))
+        extra["max_abs_imag_depth_hist"] = dict(sorted(max_imag_hist.items(), key=lambda x: x[0]))
+        extra["max_abs_weight_hist"] = dict(sorted(max_weight_hist.items(), key=lambda x: x[0]))
+        extra["condition_ratio_hist"] = dict(sorted(cond_ratio_hist.items(), key=lambda x: x[0]))
+        extra["baseline_speed_backend_name"] = baseline_backend_name or "unknown"
         if weights_reject_reasons:
             extra["weights_reject_reasons"] = sorted(weights_reject_reasons)
         if holdout_reject_reasons:

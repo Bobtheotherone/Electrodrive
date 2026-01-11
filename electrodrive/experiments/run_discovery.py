@@ -592,28 +592,50 @@ def _fast_weights(
     reg: float,
     *,
     normalize: bool = True,
+    max_abs_A: Optional[float] = None,
+    max_abs_b: Optional[float] = None,
+    fp64_threshold: float = 1e6,
 ) -> torch.Tensor:
     if A.numel() == 0:
         return torch.zeros((0,), device=A.device, dtype=A.dtype)
     k = A.shape[1]
     if k == 0:
         return torch.zeros((0,), device=A.device, dtype=A.dtype)
-    if normalize:
-        A_scaled, col_norms = _scale_columns(A)
+    use_fp64 = False
+    if max_abs_b is None:
+        max_abs_b = _tensor_absmax(b)
+    if max_abs_b > fp64_threshold:
+        use_fp64 = True
+    if not use_fp64:
+        if max_abs_A is None:
+            max_abs_A = _tensor_absmax(A)
+        if max_abs_A > fp64_threshold:
+            use_fp64 = True
+    if use_fp64 and A.dtype != torch.float64:
+        A_work = A.to(dtype=torch.float64)
+        b_work = b.to(dtype=torch.float64)
     else:
-        A_scaled = A
-        col_norms = torch.ones((k,), device=A.device, dtype=A.dtype)
+        A_work = A
+        b_work = b
+    if normalize:
+        A_scaled, col_norms = _scale_columns(A_work)
+    else:
+        A_scaled = A_work
+        col_norms = torch.ones((k,), device=A_work.device, dtype=A_work.dtype)
     ata = A_scaled.transpose(0, 1).matmul(A_scaled)
-    ata = ata + reg * torch.eye(k, device=A.device, dtype=A.dtype)
-    atb = A_scaled.transpose(0, 1).matmul(b)
+    ata = ata + reg * torch.eye(k, device=A_work.device, dtype=A_work.dtype)
+    atb = A_scaled.transpose(0, 1).matmul(b_work)
     try:
         w_scaled = torch.linalg.solve(ata, atb)
     except RuntimeError:
         try:
-            w_scaled = torch.linalg.lstsq(A_scaled, b).solution
+            w_scaled = torch.linalg.lstsq(A_scaled, b_work).solution
         except RuntimeError:
             return torch.zeros((k,), device=A.device, dtype=A.dtype)
-    return w_scaled / col_norms
+    weights = w_scaled / col_norms
+    if use_fp64 and weights.dtype != A.dtype:
+        weights = weights.to(dtype=A.dtype)
+    return weights
 
 
 def _scale_columns(A: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2344,6 +2366,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             V_train,
                             reg=float(solver_cfg.get("reg_l1", 1e-3)),
                             normalize=bool(solver_cfg.get("fast_column_normalize", True)),
+                            max_abs_b=v_train_absmax,
                         )
                         weights_nonfinite = 0
                         if preflight_counters is not None:
@@ -2698,7 +2721,12 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             continue
                         A_train = assemble_basis_matrix(elements, X_train)
                         assert_cuda_tensor(A_train, "A_train_proxy")
-                        weights = _fast_weights(A_train, V_train, reg=float(solver_cfg.get("reg_l1", 1e-3)))
+                        weights = _fast_weights(
+                            A_train,
+                            V_train,
+                            reg=float(solver_cfg.get("reg_l1", 1e-3)),
+                            max_abs_b=v_train_absmax,
+                        )
                         if weights.numel() == 0:
                             continue
                         system = ImageSystem(elements, weights)

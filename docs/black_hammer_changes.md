@@ -184,3 +184,10 @@
 - why: reduce out-of-distribution long programs that trigger nonfinite weights during pilot discovery.
 - reproduce:
   - `python -m electrodrive.experiments.run_discovery --config configs/stage9/discovery_stage9_pilot.yaml`
+
+## Phase 9.5: FP64 fallback for fast weights under extreme targets
+- change: `run_discovery._fast_weights` now switches to float64 solves when `max(|V_train|)` or `max(|A_train|)` exceeds `1e6`, then casts weights back to the original dtype; added overflow guard test.
+- why: prevent `weights_nonfinite` when extreme V_train values overflow FP32 normal equations during Stage 9 discovery.
+- reproduce:
+  - `pytest -q tests/test_fast_weights_stability.py -vv -rs --maxfail=1`
+- validate: overflow guard test passes and weights remain finite under extreme scaling.

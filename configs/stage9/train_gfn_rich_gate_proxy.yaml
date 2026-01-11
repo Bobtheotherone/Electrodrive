@@ -1,0 +1,72 @@
+seed: 123
+output_path: "artifacts/stage9_gfn_rich/gfn_ckpt.pt"
+spec_dim: 16
+steps: 200
+batch_size: 16
+lr: 1e-3
+max_length: 10
+min_length_for_stop: 3
+
+grammar:
+  families: ["layered_complex", "baseline"]
+  motifs: []
+  approx_types: ["pade", "zeta"]
+  interface_id_choices: [0, 1]
+  pole_count_choices: [1, 2, 4]
+  branch_budget_choices: [1, 2, 3]
+  primitive_schema_ids: [3]
+  dcim_schema_ids: [3]
+  conjugate_ref_choices: [0, 1]
+  base_pole_budget: 2
+  branch_cut_budget: 2
+
+spec_extra:
+  allow_real_primitives: false
+
+spec:
+  domain:
+    bbox: [[-1, -1, -2], [1, 1, 2]]
+  dielectrics:
+    - {name: "region1", epsilon: 1.0, z_min: 0.5, z_max: 2.0}
+    - {name: "slab", epsilon: 4.0, z_min: 0.0, z_max: 0.5}
+    - {name: "region3", epsilon: 1.0, z_min: -2.0, z_max: 0.0}
+  charges:
+    - {type: "point", q: 1.0, pos: [0.0, 0.0, 0.2]}
+  BCs: "dielectric_interfaces"
+
+reward:
+  type: "gate_proxy"
+  n_points: 128
+  ratio_boundary: 0.5
+  reg_l2: 1e-3
+  logR_clip: [-20.0, 20.0]
+  gateA_n_interior: 64
+  gateA_exclusion_radius: 5e-2
+  gateA_interface_band: 1e-2
+  gateA_fd_h: 2e-2
+  gateA_prefer_autograd: false
+  gateA_fd_max_samples: 64
+  gateA_cap: 1e6
+  gateA_linf_tol: 5e-3
+  gateB_n_xy: 64
+  interface_delta: 1e-2
+  gateC_n_dir: 64
+  near_radii: [0.125, 0.5]
+  far_radii: [10.0, 20.0]
+  gateD_n_points: 64
+  stability_delta: 1e-2
+  use_reference_potential: true
+  param_fallback: true
+  fallback_latent_dim: 4
+  fallback_schema_id: 3
+  dcim_term_cost: 1.5
+  dcim_block_cost: 2.5
+  weights:
+    gateA: 1.0
+    gateB: 1.0
+    gateC: 1.0
+    gateD: 1.0
+    speed: 0.05
+    complexity: 0.02
+    dcim_bonus: 0.1
+    complex_bonus: 0.1

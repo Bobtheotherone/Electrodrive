@@ -5,8 +5,8 @@ import torch
 
 from electrodrive.flows.schemas import SCHEMA_REAL_POINT
 from electrodrive.flows.types import ParamPayload
-from electrodrive.gfn.dsl import AddPrimitiveBlock, Program
-from electrodrive.gfn.dsl.tokenize import TOKEN_MAP, tokenize_program
+from electrodrive.gfn.dsl import AddPrimitiveBlock, Grammar, Program
+from electrodrive.gfn.dsl.tokenize import tokenize_program
 from electrodrive.gfn.integration import compile_program_to_basis
 from electrodrive.utils.device import ensure_cuda_available_or_skip
 
@@ -22,8 +22,9 @@ def test_schema_id_persists_in_canonical_bytes() -> None:
             ),
         )
     )
-    tokens = tokenize_program(program, max_len=4, device=torch.device("cpu"))
-    assert int(tokens[0].item()) == TOKEN_MAP["add_primitive"]
+    grammar = Grammar(primitive_schema_ids=(SCHEMA_REAL_POINT,))
+    tokens = tokenize_program(program, max_len=4, device=torch.device("cpu"), grammar=grammar)
+    assert int(tokens[0].item()) == grammar.action_to_token(program.nodes[0])
 
     payload = json.loads(program.canonical_bytes.decode("utf-8"))
     assert payload[0]["schema_id"] == SCHEMA_REAL_POINT

@@ -1,0 +1,126 @@
+seed: 0
+run:
+  tag: black_hammer_push
+  generations: 8
+  population_B: 4096
+  topK_fast: 4096
+  topk_mid: 2048
+  topk_final: 2048
+  fixed_spec: true
+  use_dcim_block: true
+  dcim_block_max: 1
+  use_hi_oracle: false
+  ramp_check: false
+  allow_not_ready: true
+  ramp_patience_gens: 6
+  ramp_min_rel_improvement: 0.05
+  score_microbatch: 32
+  cache_hold_matrices: true
+  refine_enabled: true
+  refine_steps: 12
+  refine_lr: 5e-2
+  refine_opt: adam
+  refine_max_terms: 32
+  refine_targets: holdout
+  preflight_mode: lite
+  layered_sampling: true
+  use_reference_potential: true
+  use_gate_proxies: true
+  layered_prefer_dcim: true
+  layered_allow_real_primitives: false
+  layered_stability_delta: 0.01
+  layered_exclusion_radius: 0.05
+  layered_interface_delta: 0.01
+  layered_interface_band: 0.01
+  layered_complex_boost:
+    enabled: false
+    programs: 0
+    blocks_min: 2
+    blocks_max: 4
+    poles_min: 2
+    poles_max: 8
+    branches_min: 1
+    branches_max: 3
+    complex_terms_min: 2
+    complex_terms_max: 6
+    anchor_terms: 1
+    xy_jitter: 0.05
+    imag_min_scale: 1e-3
+    imag_max_scale: 8.0
+    log_cluster_std: 0.6
+  fast_proxy:
+    enabled: true
+    n_far: 24
+    n_interface: 24
+    near_radius: 0.5
+    far_radius: 12.0
+    far_weight: 0.15
+    interface_weight: 0.2
+    cond_weight: 0.05
+    speed_weight: 0.02
+    dcim_term_cost: 1.5
+    dcim_block_cost: 2.5
+    far_target: 0.4
+    far_max_ratio: 4.0
+    cond_target: 5e3
+    cond_max: 2e6
+    fail_hard: false
+  dcim_diversity: true
+points:
+  bc_train: 2048
+  bc_holdout: 1024
+  interior_train: 2048
+  interior_holdout: 1024
+reward:
+  w_bc: 1.0
+  w_pde: 0.5
+  w_complexity: 0.02
+  w_latency: 0.1
+  w_stability: 0.1
+  stability_perturb_sigma: 1e-3
+model:
+  dtype: bf16
+  compile: false
+  use_tf32: true
+  geom_encoder:
+    name: current
+    hidden_dim: 256
+    layers: 6
+  structure_policy:
+    name: gflownet
+    max_steps: 48
+    replay_size: 200000
+  param_sampler:
+    name: flow
+    steps: 4
+    solver: euler
+    temperature: 1.0
+    dtype: bf16
+solver:
+  name: differentiable_lasso
+  max_iters: 24
+  tol: 1e-6
+  reg_l1: 1e-3
+  fast_column_normalize: true
+oracle:
+  fast:
+    name: f1
+    dtype: fp32
+  mid:
+    name: f1
+    dtype: fp32
+spec:
+  family: layered_3layer
+  eps_range:
+  - 1.0
+  - 80.0
+  thickness_range:
+  - 0.02
+  - 1.0
+  source_height_range:
+  - 0.001
+  - 2.0
+  domain_scale: 1.0
+paths:
+  gfn_checkpoint: artifacts/stage9_gfn_rich/gfn_ckpt.pt
+  flow_checkpoint: artifacts/step10_gfn_flow_smoke/flow_ckpt.pt

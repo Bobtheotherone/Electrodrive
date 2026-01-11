@@ -1,5 +1,10 @@
 """Reward decomposition and normalization routines."""
 
+from electrodrive.gfn.reward.gate_proxy_reward import (
+    GateProxyRewardComputer,
+    GateProxyRewardConfig,
+    GateProxyRewardWeights,
+)
 from electrodrive.gfn.reward.reward import (
     RewardComputer,
     RewardConfig,
@@ -10,6 +15,9 @@ from electrodrive.gfn.reward.reward import (
 )
 
 __all__ = [
+    "GateProxyRewardComputer",
+    "GateProxyRewardConfig",
+    "GateProxyRewardWeights",
     "RewardComputer",
     "RewardConfig",
     "RewardNormalizer",

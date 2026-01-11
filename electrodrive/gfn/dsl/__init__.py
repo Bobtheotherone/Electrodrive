@@ -20,7 +20,7 @@ from electrodrive.gfn.dsl.nodes import (
     StopProgram,
 )
 from electrodrive.gfn.dsl.program import Program
-from electrodrive.gfn.dsl.tokenize import TOKEN_MAP, tokenize_program
+from electrodrive.gfn.dsl.tokenize import PAD_TOKEN_ID, TOKEN_MAP, tokenize_program
 
 __all__ = [
     "Action",
@@ -34,6 +34,7 @@ __all__ = [
     "Program",
     "StopProgram",
     "canonicalize_value",
+    "PAD_TOKEN_ID",
     "TOKEN_MAP",
     "tokenize_program",
 ]

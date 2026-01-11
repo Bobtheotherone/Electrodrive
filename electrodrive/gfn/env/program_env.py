@@ -53,6 +53,7 @@ class ElectrodriveProgramEnv:
         self.torch_gen = (
             torch.Generator(device=self.device) if self.device.type == "cuda" else torch.Generator()
         )
+        self.token_vocab_size = self.grammar.token_vocab_size()
 
         self.actions: Tuple[Action, ...] = self.grammar.enumerate_actions()
         self.action_to_index: dict[tuple, int] = {}
@@ -387,7 +388,7 @@ class ElectrodriveProgramEnv:
         return True
 
     def _tokenize_program(self, program: Program) -> torch.Tensor:
-        return tokenize_program(program, max_len=self.max_length, device=self.device)
+        return tokenize_program(program, max_len=self.max_length, device=self.device, grammar=self.grammar)
 
     @staticmethod
     def _infer_spec_hash(spec: object) -> str:

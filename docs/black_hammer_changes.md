@@ -123,3 +123,39 @@
   - `pytest -q tests/test_complex_pair_real_cuda.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_dcim_block_eval_shape.py -vv -rs --maxfail=1`
 - validate: preflight reports nontrivial complex/DCIM fractions, fast proxy metrics are finite, and CUDA-only tests pass.
+
+## Phase 6: GFN expressivity audit (root causes)
+- grammar defaults enumerate only baseline/connector/pade with single interface_id=0 and fixed pole/branch budgets, so the discrete action space is effectively 1-choice per block.
+- grammar schema_ids are empty by default, so add_primitive emits no schema_id and cannot represent complex-depth primitives when real primitives are disallowed.
+- branch-cut enumeration only uses approx_types[0], collapsing discrete branch types into a single token.
+- action masking ignores spec_meta.n_dielectrics, so interface_id actions are not filtered for layered specs with fewer interfaces.
+- tokenization collapses all nodes to type-only tokens (add_pole/add_branch_cut/etc.), losing interface_id/schema_id/budget/family distinctions.
+- GFN checkpoints load only families/motifs/approx_types/budgets; schema_ids and expanded grammar choices are dropped on load.
+- action_vocab/token mapping is not persisted, so tokenization cannot stay stable across checkpoint reloads.
+
+## Phase 6.1: GFN generator expressivity fixes
+- change: expanded Grammar with interface/budget/schema choices, interface-aware masking, and conjugate ref options to unlock rich DCIM/complex action space.
+- change: tokenization now maps discrete action args (interface_id/schema_id/budget/etc.) via grammar action vocab; policy token embeddings sized from vocab.
+- change: checkpoints persist full grammar fields plus action_vocab mapping; loader restores schema ids and warns when vocab is missing.
+- change: complex-only primitives supported end-to-end (env gating + schema_id metadata + compile path); group_info now records interface_id/schema_id/n_poles/budget/approx_type.
+- change: structural fingerprint/novelty includes DCIM families, complex-depth families, interface/schema stats, and DCIM arg summaries.
+- change: added `electrodrive/gfn/train/run_train.py` minimal training entrypoint and CUDA smoke test for rich program sampling.
+- reproduce:
+  - `pytest -q tests/test_grammar_rich_action_space.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_tokenize_distinguishes_discrete_args.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_checkpoint_grammar_roundtrip.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_complex_only_primitives_allowed.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_structural_features_dcim_complex.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_train_and_sample_rich_programs_smoke.py -vv -rs --maxfail=1`
+- train (example): `python -m electrodrive.gfn.train.run_train --config <yaml>`
+
+## Phase 9: Gate-proxy reward + Stage 9 tooling
+- change: added gate-proxy reward computer for GFN training using Gate A-D proxies, speed proxy, and DCIM/complex bonuses with finite clamps.
+- change: `run_train.py` now supports `reward.type: gate_proxy` plus Stage 9 rich-grammar training config.
+- change: added Stage 9 discovery patch script, GFN sample inspector, and verifier analysis script (histograms + near-miss report).
+- reproduce:
+  - `pytest -q tests/test_gate_proxy_reward_finite.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_gate_proxy_reward_prefers_better_proxy.py -vv -rs --maxfail=1`
+  - `python -m electrodrive.gfn.train.run_train --config configs/stage9/train_gfn_rich_gate_proxy.yaml`
+  - `python tools/stage9/patch_discovery_config.py --input configs/discovery_black_hammer_push.yaml --output configs/stage9/discovery_stage9_push.yaml`
+  - `python tools/stage9/analyze_verifier_results.py <RUN_DIR>`

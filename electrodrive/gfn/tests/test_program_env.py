@@ -113,7 +113,7 @@ def test_batch_step_and_tokens_on_device() -> None:
     assert all(ns.ast_token_ids is not None for ns in next_states)
     assert all(ns.ast_token_ids.device.type == get_default_device().type for ns in next_states)
 
-    state_tokens = base_state.to_token_sequence(max_len=env.max_length)
+    state_tokens = base_state.to_token_sequence(max_len=env.max_length, grammar=env.grammar)
     env_tokens = env._tokenize_program(base_state.program)
     assert torch.equal(state_tokens, env_tokens)
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Any, List, Mapping, Optional, Sequence
 
 import torch
 
 from electrodrive.gfn.dsl import Grammar
+from electrodrive.gfn.dsl.action import Action, ActionToken
 from electrodrive.gfn.env import ElectrodriveProgramEnv, PartialProgramState, SpecMetadata
 from electrodrive.gfn.integration.compile import compile_program_to_basis
 from electrodrive.gfn.policy import LogZNet, PolicyNet, PolicyNetConfig, action_factor_sizes_from_table, build_action_factor_table
@@ -28,7 +30,7 @@ class GFlowNetCheckpoint:
     grammar: Grammar
     max_length: int
     min_length_for_stop: int
-    action_vocab: Optional[Mapping[str, int]] = None
+    action_vocab: Optional[Mapping[ActionToken, int]] = None
 
 
 class GFlowNetProgramGenerator(BasisGenerator):
@@ -72,9 +74,14 @@ class GFlowNetProgramGenerator(BasisGenerator):
         self.factor_table = build_action_factor_table(self.env, device=self.device)
         factor_sizes = action_factor_sizes_from_table(self.factor_table)
         if payload.action_vocab is not None:
-            _validate_action_vocab(payload.action_vocab, self.factor_table.vocab_sizes)
+            _validate_action_vocab(payload.action_vocab, self.grammar)
 
-        self.policy = PolicyNet(policy_config, factor_sizes, device=self.device)
+        self.policy = PolicyNet(
+            policy_config,
+            factor_sizes,
+            device=self.device,
+            token_vocab_size=self.env.token_vocab_size,
+        )
         self.policy.load_state_dict(payload.policy_state)
         self.policy.eval()
 
@@ -201,8 +208,15 @@ class GFlowNetProgramGenerator(BasisGenerator):
             families=tuple(grammar_cfg.get("families", Grammar().families)),
             motifs=tuple(grammar_cfg.get("motifs", Grammar().motifs)),
             approx_types=tuple(grammar_cfg.get("approx_types", Grammar().approx_types)),
+            schema_ids=tuple(grammar_cfg.get("schema_ids", Grammar().schema_ids)),
             base_pole_budget=int(grammar_cfg.get("base_pole_budget", Grammar().base_pole_budget)),
             branch_cut_budget=int(grammar_cfg.get("branch_cut_budget", Grammar().branch_cut_budget)),
+            interface_id_choices=tuple(grammar_cfg.get("interface_id_choices", (0,))),
+            pole_count_choices=tuple(grammar_cfg.get("pole_count_choices", ())),
+            branch_budget_choices=tuple(grammar_cfg.get("branch_budget_choices", ())),
+            primitive_schema_ids=_coerce_optional_tuple(grammar_cfg.get("primitive_schema_ids", None)),
+            dcim_schema_ids=_coerce_optional_tuple(grammar_cfg.get("dcim_schema_ids", None)),
+            conjugate_ref_choices=tuple(grammar_cfg.get("conjugate_ref_choices", (0,))),
         )
         max_length = int(grammar_cfg.get("max_length", policy_config.max_seq_len))
         min_length_for_stop = int(grammar_cfg.get("min_length_for_stop", 1))
@@ -211,8 +225,14 @@ class GFlowNetProgramGenerator(BasisGenerator):
                 "Checkpoint policy_config.max_seq_len does not match grammar max_length "
                 f"({policy_config.max_seq_len} != {max_length})."
             )
+        if getattr(policy_config, "token_vocab_size", 0) <= 0:
+            policy_config = replace(policy_config, token_vocab_size=grammar.token_vocab_size())
 
-        action_vocab = payload.get("action_vocab", None)
+        action_vocab = _parse_action_vocab(payload.get("action_vocab"))
+        if action_vocab is None:
+            _logger.warning("Checkpoint missing action_vocab; reconstructing from grammar.")
+        else:
+            object.__setattr__(grammar, "_cached_action_vocab", action_vocab)
         return GFlowNetCheckpoint(
             policy_state=payload["policy_state"],
             logz_state=payload["logz_state"],
@@ -248,15 +268,50 @@ def _spec_metadata_from_spec(
     )
 
 
-def _validate_action_vocab(expected: Mapping[str, int], actual: Mapping[str, int]) -> None:
-    for key, val in expected.items():
-        if key not in actual:
-            raise ValueError(f"Checkpoint action vocab missing key '{key}'")
-        if int(actual[key]) != int(val):
-            raise ValueError(
-                "Checkpoint action vocab mismatch for "
-                f"{key}: expected {val}, got {actual[key]}"
-            )
+def _parse_action_vocab(raw: object) -> Optional[Mapping[ActionToken, int]]:
+    if raw is None:
+        return None
+    if isinstance(raw, Mapping):
+        if not raw:
+            return None
+        sample_key = next(iter(raw.keys()))
+        if isinstance(sample_key, tuple):
+            coerced = {_coerce_action_token(key): int(val) for key, val in raw.items()}
+            return coerced
+        return None
+    if isinstance(raw, (list, tuple)):
+        tokens: List[ActionToken] = []
+        for entry in raw:
+            if isinstance(entry, Mapping):
+                action = Action(**entry)
+                tokens.append(action.to_token())
+            else:
+                tokens.append(_coerce_action_token(entry))
+        return {token: idx + 1 for idx, token in enumerate(tokens)}
+    return None
+
+
+def _coerce_action_token(raw: object) -> ActionToken:
+    if isinstance(raw, tuple):
+        return tuple(_coerce_action_token(x) if isinstance(x, (list, tuple)) else x for x in raw)  # type: ignore[return-value]
+    if isinstance(raw, list):
+        return tuple(_coerce_action_token(x) if isinstance(x, (list, tuple)) else x for x in raw)  # type: ignore[return-value]
+    raise TypeError("Action token must be a tuple or list")
+
+
+def _coerce_optional_tuple(value: object) -> Optional[tuple[int, ...]]:
+    if value is None:
+        return None
+    return tuple(int(v) for v in value)
+
+
+def _validate_action_vocab(action_vocab: Mapping[ActionToken, int], grammar: Grammar) -> None:
+    expected = {action.to_token(): idx + 1 for idx, action in enumerate(grammar.enumerate_actions())}
+    if expected != dict(action_vocab):
+        raise ValueError("Checkpoint action_vocab does not match the current grammar ordering.")
+
+
+_logger = logging.getLogger(__name__)
 
 
 __all__ = ["GFlowNetProgramGenerator"]

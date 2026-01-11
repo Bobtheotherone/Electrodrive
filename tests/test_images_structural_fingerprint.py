@@ -39,12 +39,19 @@ def test_structural_fingerprint_schema_and_defaults():
         "three_layer_slab",
         "three_layer_tail",
         "three_layer_diffusion",
+        "dcim_pole",
+        "dcim_branch",
+        "dcim_block",
+        "layered_complex",
+        "complex_depth_point",
     }
     assert fp["families"]["axis_point"]["count"] == 1
     assert fp["families"]["three_layer_slab"]["count"] == 1
     assert fp["ladder"]["three_layer_slab"]["b"] != 0.0
     assert "symmetry" in fp
     assert "axis_weight_l1_fraction" in fp
+    assert "discrete_ids" in fp
+    assert "dcim_args" in fp
     assert abs(fp["axis_weight_l1_fraction"] - (0.5 / 1.5)) < 1e-6
 
 

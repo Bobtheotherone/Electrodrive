@@ -15,6 +15,18 @@ from electrodrive.images.basis import PointChargeBasis, annotate_group_info
 _LIBRARY_CACHE: List[Dict[str, Any]] = []
 _FLATTEN_CACHE: List[torch.Tensor] = []
 _WEIGHT_VEC: torch.Tensor = torch.tensor([], dtype=torch.float64)
+_NOVELTY_FAMILY_ORDER = [
+    "axis_point",
+    "three_layer_mirror",
+    "three_layer_slab",
+    "three_layer_tail",
+    "three_layer_diffusion",
+    "dcim_pole",
+    "dcim_branch",
+    "dcim_block",
+    "layered_complex",
+    "complex_depth_point",
+]
 
 
 def _load_library_configs_from_docs() -> List[Tuple[CanonicalSpec, ImageSystem]]:
@@ -123,14 +135,7 @@ def _flatten_fingerprint(fp: Dict[str, Any]) -> torch.Tensor:
     families = fp.get("families", {})
     ladder = fp.get("ladder", {})
     vec: List[float] = []
-    order = [
-        "axis_point",
-        "three_layer_mirror",
-        "three_layer_slab",
-        "three_layer_tail",
-        "three_layer_diffusion",
-    ]
-    for fam in order:
+    for fam in _NOVELTY_FAMILY_ORDER:
         fstats = families.get(fam, {})
         vec.extend(
             [
@@ -150,6 +155,26 @@ def _flatten_fingerprint(fp: Dict[str, Any]) -> torch.Tensor:
     vec.append(float(sym.get("asymmetry_metric", 0.0)))
     vec.append(float(fp.get("axis_weight_l1_fraction", 0.0)))
     vec.append(float(fp.get("nonaxis_weight_l1_fraction", 0.0)))
+    discrete_ids = fp.get("discrete_ids", {})
+    for key in ("interface_id", "schema_id"):
+        stats = discrete_ids.get(key, {})
+        vec.extend(
+            [
+                float(stats.get("count", 0.0)),
+                float(stats.get("min", 0.0)),
+                float(stats.get("max", 0.0)),
+                float(stats.get("mean", 0.0)),
+            ]
+        )
+    dcim_args = fp.get("dcim_args", {})
+    vec.extend(
+        [
+            float(dcim_args.get("pole_count_sum", 0.0)),
+            float(dcim_args.get("pole_count_max", 0.0)),
+            float(dcim_args.get("branch_budget_sum", 0.0)),
+            float(dcim_args.get("branch_budget_max", 0.0)),
+        ]
+    )
     return torch.tensor(vec, dtype=torch.float64)
 
 
@@ -166,7 +191,14 @@ def _weight_vector(dim: int) -> torch.Tensor:
             w[idx] = 3.0
         if idx % 10 in {5, 6}:  # depth range
             w[idx] = 2.0
-    w[-4:] = torch.tensor([1.5, 1.5, 2.0, 2.0], dtype=torch.float64)
+    tail = 4
+    base = len(_NOVELTY_FAMILY_ORDER) * 10 + tail
+    extra = dim - base
+    w[-tail:] = torch.tensor([1.5, 1.5, 2.0, 2.0], dtype=torch.float64)
+    if extra >= 12:
+        start = dim - tail - 12
+        w[start : start + 8] = 2.0
+        w[start + 8 : start + 12] = 2.0
     _WEIGHT_VEC = w
     return w
 

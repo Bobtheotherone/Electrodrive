@@ -359,6 +359,22 @@ def _element_from_params(
         family_name=family_name,
         motif_index=motif_index,
     )
+    info = getattr(elem, "_group_info", None)
+    if isinstance(info, dict):
+        if isinstance(node, AddPrimitiveBlock):
+            if node.schema_id is not None:
+                info["schema_id"] = int(node.schema_id)
+        if isinstance(node, AddPoleBlock):
+            info["interface_id"] = int(node.interface_id)
+            info["n_poles"] = int(node.n_poles)
+            if node.schema_id is not None:
+                info["schema_id"] = int(node.schema_id)
+        if isinstance(node, AddBranchCutBlock):
+            info["interface_id"] = int(node.interface_id)
+            info["budget"] = int(node.budget)
+            info["approx_type"] = str(node.approx_type)
+            if node.schema_id is not None:
+                info["schema_id"] = int(node.schema_id)
     return elem
 
 

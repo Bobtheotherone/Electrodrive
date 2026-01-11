@@ -9,10 +9,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from electrodrive.gfn.dsl import TOKEN_MAP
 from electrodrive.gfn.env import ElectrodriveProgramEnv, PartialProgramState
 from electrodrive.gfn.dsl.action import Action
-from electrodrive.gfn.dsl.tokenize import tokenize_program
+from electrodrive.gfn.dsl.tokenize import PAD_TOKEN_ID, TOKEN_MAP, tokenize_program
 from electrodrive.utils.device import get_default_device
 
 
@@ -99,6 +98,7 @@ class PolicyNetConfig:
     hidden_dim: int = 128
     dropout: float = 0.0
     max_seq_len: int = 64
+    token_vocab_size: int = 0
 
 
 class PolicyNet(nn.Module):
@@ -110,15 +110,20 @@ class PolicyNet(nn.Module):
         factor_sizes: ActionFactorSizes,
         *,
         device: Optional[torch.device] = None,
+        token_vocab_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.factor_sizes = factor_sizes
         self.device = device or get_default_device()
-        self.pad_token_id = int(TOKEN_MAP["pad"])
-        token_vocab_size = int(max(TOKEN_MAP.values())) + 1
+        self.pad_token_id = int(PAD_TOKEN_ID)
+        vocab_override = int(token_vocab_size or 0)
+        config_vocab = int(getattr(config, "token_vocab_size", 0))
+        token_vocab = vocab_override if vocab_override > 0 else config_vocab
+        if token_vocab <= 0:
+            token_vocab = int(max(TOKEN_MAP.values())) + 1
 
-        self.token_embed = nn.Embedding(token_vocab_size, config.token_embed_dim)
+        self.token_embed = nn.Embedding(token_vocab, config.token_embed_dim)
         self.state_proj = nn.Linear(config.token_embed_dim, config.hidden_dim)
         self.spec_proj = nn.Linear(config.spec_dim, config.hidden_dim)
         self.shared = nn.Sequential(
@@ -303,7 +308,7 @@ def _stack_state_tokens(
     for state in states:
         token_ids = state.ast_token_ids
         if token_ids is None:
-            token_ids = tokenize_program(state.program, max_len=max_len, device=device)
+            token_ids = tokenize_program(state.program, max_len=max_len, device=device, grammar=env.grammar)
         if token_ids.device != device:
             token_ids = token_ids.to(device)
         tokens.append(token_ids)

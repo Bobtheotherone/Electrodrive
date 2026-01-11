@@ -155,10 +155,10 @@ class PartialProgramState:
         params = getattr(self, "__dataclass_params__", None)
         return bool(params and params.frozen)
 
-    def to_token_sequence(self, max_len: int = 64) -> torch.Tensor:
+    def to_token_sequence(self, max_len: int = 64, *, grammar: Optional[object] = None) -> torch.Tensor:
         """Encode the AST into a fixed-length token sequence on the default device."""
         device = get_default_device()
-        return tokenize_program(self.program, max_len=max_len, device=device)
+        return tokenize_program(self.program, max_len=max_len, device=device, grammar=grammar)
 
 
 __all__ = ["PartialProgramState", "SpecMetadata"]

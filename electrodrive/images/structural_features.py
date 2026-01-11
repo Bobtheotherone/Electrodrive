@@ -15,6 +15,11 @@ _FAMILY_ORDER: List[str] = [
     "three_layer_slab",
     "three_layer_tail",
     "three_layer_diffusion",
+    "dcim_pole",
+    "dcim_branch",
+    "dcim_block",
+    "layered_complex",
+    "complex_depth_point",
 ]
 _LADDER_FAMS = {"three_layer_slab", "three_layer_tail"}
 
@@ -22,8 +27,14 @@ _LADDER_FAMS = {"three_layer_slab", "three_layer_tail"}
 def _family_name(elem: Any) -> str:
     info = getattr(elem, "_group_info", None)
     if isinstance(info, dict) and info.get("family_name"):
-        return str(info["family_name"])
-    return getattr(elem, "type", "unknown")
+        family = str(info["family_name"])
+    else:
+        family = getattr(elem, "type", "unknown")
+    if family.startswith("dcim_block"):
+        return "dcim_block"
+    if family == "dcim_branch_cut":
+        return "dcim_branch"
+    return str(family)
 
 
 def _position(elem: Any) -> Tuple[float, float, float] | None:
@@ -55,6 +66,18 @@ def _family_stats(z_norms: List[float], weights: List[float]) -> Dict[str, float
         "z_norm_std": float(z.std(unbiased=False).item()),
         "z_norm_min": float(z.min().item()),
         "z_norm_max": float(z.max().item()),
+    }
+
+
+def _id_stats(values: List[int]) -> Dict[str, float]:
+    if not values:
+        return {"count": 0.0, "min": 0.0, "max": 0.0, "mean": 0.0}
+    vals = torch.tensor(values, dtype=torch.float64)
+    return {
+        "count": float(len(values)),
+        "min": float(vals.min().item()),
+        "max": float(vals.max().item()),
+        "mean": float(vals.mean().item()),
     }
 
 
@@ -116,11 +139,43 @@ def structural_fingerprint(system: ImageSystem, spec: CanonicalSpec) -> Dict[str
 
     per_family_z: Dict[str, List[float]] = {fam: [] for fam in _FAMILY_ORDER}
     per_family_w: Dict[str, List[float]] = {fam: [] for fam in _FAMILY_ORDER}
+    interface_ids: List[int] = []
+    schema_ids: List[int] = []
+    pole_counts: List[int] = []
+    branch_budgets: List[int] = []
 
     for elem, w in zip(system.elements, system.weights.detach().cpu()):
         fam = _family_name(elem)
         if fam not in families:
             continue
+        info = getattr(elem, "_group_info", None)
+        if isinstance(info, dict):
+            interface_id = info.get("interface_id")
+            if interface_id is not None:
+                try:
+                    interface_ids.append(int(interface_id))
+                except Exception:
+                    pass
+            schema_id = info.get("schema_id")
+            if schema_id is not None:
+                try:
+                    schema_ids.append(int(schema_id))
+                except Exception:
+                    pass
+            if fam == "dcim_pole":
+                n_poles = info.get("n_poles")
+                if n_poles is not None:
+                    try:
+                        pole_counts.append(int(n_poles))
+                    except Exception:
+                        pass
+            if fam == "dcim_branch":
+                budget = info.get("budget")
+                if budget is not None:
+                    try:
+                        branch_budgets.append(int(budget))
+                    except Exception:
+                        pass
         pos = _position(elem)
         z_norm = 0.0
         if pos is not None:
@@ -171,4 +226,14 @@ def structural_fingerprint(system: ImageSystem, spec: CanonicalSpec) -> Dict[str
         },
         "axis_weight_l1_fraction": axis_frac,
         "nonaxis_weight_l1_fraction": nonaxis_frac,
+        "discrete_ids": {
+            "interface_id": _id_stats(interface_ids),
+            "schema_id": _id_stats(schema_ids),
+        },
+        "dcim_args": {
+            "pole_count_sum": float(sum(pole_counts)),
+            "pole_count_max": float(max(pole_counts)) if pole_counts else 0.0,
+            "branch_budget_sum": float(sum(branch_budgets)),
+            "branch_budget_max": float(max(branch_budgets)) if branch_budgets else 0.0,
+        },
     }

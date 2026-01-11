@@ -43,7 +43,7 @@ def _write_gfn_checkpoint(path: Path, *, spec_dim: int) -> None:
     env = ElectrodriveProgramEnv(max_length=policy_cfg.max_seq_len, min_length_for_stop=1, device=device)
     factor_table = build_action_factor_table(env, device=device)
     factor_sizes = action_factor_sizes_from_table(factor_table)
-    policy = PolicyNet(policy_cfg, factor_sizes, device=device)
+    policy = PolicyNet(policy_cfg, factor_sizes, device=device, token_vocab_size=env.token_vocab_size)
     logz = LogZNet(policy_cfg.spec_dim, device=device)
     payload = {
         "policy_state": policy.state_dict(),
@@ -54,16 +54,25 @@ def _write_gfn_checkpoint(path: Path, *, spec_dim: int) -> None:
             "hidden_dim": policy_cfg.hidden_dim,
             "dropout": policy_cfg.dropout,
             "max_seq_len": policy_cfg.max_seq_len,
+            "token_vocab_size": env.token_vocab_size,
         },
         "grammar": {
             "families": env.grammar.families,
             "motifs": env.grammar.motifs,
             "approx_types": env.grammar.approx_types,
+            "schema_ids": env.grammar.schema_ids,
             "base_pole_budget": env.grammar.base_pole_budget,
             "branch_cut_budget": env.grammar.branch_cut_budget,
+            "interface_id_choices": env.grammar.interface_id_choices,
+            "pole_count_choices": env.grammar.pole_count_choices,
+            "branch_budget_choices": env.grammar.branch_budget_choices,
+            "primitive_schema_ids": env.grammar.primitive_schema_ids,
+            "dcim_schema_ids": env.grammar.dcim_schema_ids,
+            "conjugate_ref_choices": env.grammar.conjugate_ref_choices,
             "max_length": policy_cfg.max_seq_len,
             "min_length_for_stop": 1,
         },
+        "action_vocab": env.grammar.action_vocab(),
     }
     torch.save(payload, path)
 

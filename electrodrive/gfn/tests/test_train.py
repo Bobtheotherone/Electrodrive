@@ -49,7 +49,7 @@ def test_train_step_updates_and_replay_sanitized() -> None:
     table = build_action_factor_table(env, device=device)
     sizes = action_factor_sizes_from_table(table)
     policy_cfg = PolicyNetConfig(spec_dim=spec_embedding.numel(), max_seq_len=env.max_length)
-    policy = PolicyNet(policy_cfg, sizes, device=device)
+    policy = PolicyNet(policy_cfg, sizes, device=device, token_vocab_size=env.token_vocab_size)
     logz = LogZNet(spec_dim=spec_embedding.numel(), device=device)
 
     optimizer = torch.optim.Adam(list(policy.parameters()) + list(logz.parameters()), lr=1e-3)

@@ -21,7 +21,12 @@ def test_policy_sampling_respects_masks() -> None:
     env = ElectrodriveProgramEnv(max_length=1, min_length_for_stop=1, device=device)
     table = build_action_factor_table(env, device=device)
     sizes = action_factor_sizes_from_table(table)
-    policy = PolicyNet(PolicyNetConfig(spec_dim=8, max_seq_len=env.max_length), sizes, device=device)
+    policy = PolicyNet(
+        PolicyNetConfig(spec_dim=8, max_seq_len=env.max_length),
+        sizes,
+        device=device,
+        token_vocab_size=env.token_vocab_size,
+    )
 
     spec_meta = SpecMetadata(geom_type="plane", n_dielectrics=1, bc_type="dirichlet")
     state0 = env.reset("spec0", spec_meta)

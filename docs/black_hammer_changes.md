@@ -198,3 +198,12 @@
 - reproduce:
   - `pytest -q tests/test_oracle_target_resample.py -vv -rs --maxfail=1`
 - validate: resampling test passes and Stage 9 pilots no longer emit `weights_nonfinite` first offenders.
+
+## Phase 10: Run logging + preflight heartbeat
+- change: `run_discovery` now logs to `<RUN_DIR>/run.log` and writes an initial preflight heartbeat plus per-generation updates with fully populated `per_gen` entries.
+- change: added `run.diversity_guard` (default true) to allow smoke tests to bypass the diversity guard without altering default runs.
+- change: `Program` hashing now uses canonical bytes so motif-arg programs are hashable; added regression test.
+- reproduce:
+  - `pytest -q tests/test_stage10_run_logging_preflight_smoke.py -vv -rs --maxfail=1`
+  - `pytest -q electrodrive/gfn/tests/test_canonicalization.py -vv -rs --maxfail=1`
+- validate: `run.log` and `preflight.json` exist in the run directory and per-gen entries are fully formed.

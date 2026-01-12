@@ -25,6 +25,12 @@ def test_program_hash_stability() -> None:
     assert digest_1 == digest_2
 
 
+def test_program_hashable_with_motif_args() -> None:
+    program = Program(nodes=(AddMotifBlock(motif_type="connector", args={"a": 1}),))
+    mapping = {program: "ok"}
+    assert mapping[program] == "ok"
+
+
 def test_ordered_sequence_in_mapping_is_preserved_by_default() -> None:
     node_ordered = AddMotifBlock(motif_type="connector", args={"path": [3, 1, 2]})
     node_sorted = AddMotifBlock(motif_type="connector", args={"path": [1, 2, 3]})

@@ -32,6 +32,9 @@ class Program:
         """Compute a stable hash for this program given a spec hash."""
         return hash_program(spec_hash, self.canonical_bytes)
 
+    def __hash__(self) -> int:
+        return hash(self.canonical_bytes)
+
     def to_list(self) -> list[Node]:
         """Return a mutable list copy of the nodes."""
         return list(self.nodes)

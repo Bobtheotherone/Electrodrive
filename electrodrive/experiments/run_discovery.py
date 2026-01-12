@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import time
@@ -90,6 +91,35 @@ class _NullLogger:
 
     def error(self, *args: Any, **kwargs: Any) -> None:
         pass
+
+
+def _configure_run_logger(run_dir: Path) -> logging.Logger:
+    logger = logging.getLogger(f"run_discovery.{run_dir.name}")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = logging.FileHandler(run_dir / "run.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+def _format_preflight_summary(counters: RunCounters) -> str:
+    return (
+        "PREFLIGHT summary:"
+        f" sampled={counters.sampled_programs_total}"
+        f" compiled_ok={counters.compiled_ok}"
+        f" empty_basis={counters.compiled_empty_basis}"
+        f" compiled_failed={counters.compiled_failed}"
+        f" solved_ok={counters.solved_ok}"
+        f" fast_scored={counters.fast_scored}"
+        f" verified_written={counters.verified_written}"
+    )
 
 
 @dataclass
@@ -1330,6 +1360,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     preflight_lite = preflight_mode == "lite"
     preflight_out = str(run_cfg.get("preflight_out", "preflight.json")).strip() or "preflight.json"
     run_dir = _make_run_dir(tag)
+    run_logger = _configure_run_logger(run_dir)
+    run_logger.info("RUN START tag=%s preflight_mode=%s", tag, preflight_mode)
     dcim_cache_path = run_dir / "artifacts" / "dcim_cache.jsonl"
 
     write_json(run_dir / "env.json", _env_report())
@@ -1539,6 +1571,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     fast_proxy_cond_max = float(fast_proxy_cfg.get("cond_max", 0.0))
     fast_proxy_fail_hard = bool(fast_proxy_cfg.get("fail_hard", False))
     dcim_diversity = bool(run_cfg.get("dcim_diversity", False))
+    diversity_guard = bool(run_cfg.get("diversity_guard", True))
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
     refine_steps = int(run_cfg.get("refine_steps", 12))
     refine_lr = float(run_cfg.get("refine_lr", 5e-2))
@@ -1589,8 +1622,18 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     verify_plan.oracle_budget["allow_cpu_fallback"] = False
     ramp_abort = False
     config_hash = sha256_json(cfg)
+    def _init_preflight_entry(gen_idx: int) -> Dict[str, Any]:
+        return {
+            "gen": int(gen_idx),
+            "counters": RunCounters().as_dict(),
+            "fraction_complex_candidates": 0.0,
+            "fraction_dcim_candidates": 0.0,
+        }
+
     preflight_counters = RunCounters() if preflight_enabled else None
     per_gen_preflight: List[Dict[str, Any]] = []
+    if preflight_enabled:
+        per_gen_preflight = [_init_preflight_entry(gen_idx) for gen_idx in range(generations)]
     gen_counters: Optional[RunCounters] = None
     first_offender_written = False
     v_train_snapshot_written = False
@@ -1606,6 +1649,53 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     cond_ratio_hist: Dict[str, int] = {}
     low_dcim_streak = 0
     low_complex_streak = 0
+
+    def _build_preflight_extra() -> Dict[str, Any]:
+        assert preflight_counters is not None
+        device_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
+        device_cap = (
+            ".".join(str(v) for v in torch.cuda.get_device_capability(device))
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        nonfinite_total = max(1, preflight_counters.nonfinite_pred_total)
+        extra = {
+            "timestamp": utc_now_iso(),
+            "tag": tag,
+            "config_hash": config_hash,
+            "git_sha": git_sha(),
+            "device_name": device_name,
+            "device_capability": device_cap,
+            "preflight_mode": preflight_mode,
+            "preflight_out": preflight_out,
+            "train_target_abs_max": float(train_target_abs_max),
+            "train_target_resample_attempts": int(train_target_resample_attempts),
+            "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
+            "per_gen": per_gen_preflight,
+        }
+        candidate_total = max(1, int(preflight_counters.compiled_ok))
+        extra["fraction_complex_candidates"] = float(preflight_counters.complex_candidates) / float(candidate_total)
+        extra["fraction_dcim_candidates"] = float(preflight_counters.dcim_candidates) / float(candidate_total)
+        extra["dcim_pole_count_hist"] = dict(sorted(dcim_pole_hist.items(), key=lambda x: x[0]))
+        extra["dcim_block_count_hist"] = dict(sorted(dcim_block_hist.items(), key=lambda x: x[0]))
+        extra["max_abs_imag_depth_hist"] = dict(sorted(max_imag_hist.items(), key=lambda x: x[0]))
+        extra["max_abs_weight_hist"] = dict(sorted(max_weight_hist.items(), key=lambda x: x[0]))
+        extra["condition_ratio_hist"] = dict(sorted(cond_ratio_hist.items(), key=lambda x: x[0]))
+        extra["baseline_speed_backend_name"] = baseline_backend_name or "unknown"
+        if weights_reject_reasons:
+            extra["weights_reject_reasons"] = sorted(weights_reject_reasons)
+        if holdout_reject_reasons:
+            extra["holdout_reject_reasons"] = sorted(holdout_reject_reasons)
+        return extra
+
+    def _write_preflight_snapshot() -> None:
+        if preflight_counters is None:
+            return
+        write_preflight_report(run_dir, preflight_counters, _build_preflight_extra())
+
+    if preflight_enabled:
+        _write_preflight_snapshot()
+        run_logger.info("PREFLIGHT heartbeat initialized: %s", preflight_out)
 
     def _count_preflight(key: str, n: int = 1) -> None:
         if preflight_counters is None:
@@ -1744,17 +1834,18 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         }
         if holdout_stats:
             stats.update(holdout_stats)
-        print(
-            "NONFINITE HOLDOUT:"
-            f" gen={gen_idx}"
-            f" idx={program_idx}"
-            f" reason={reason}"
-            f" pred_in_nonfinite={stats['pred_in_nonfinite_count']}"
-            f" oracle_in_nonfinite={stats['oracle_in_nonfinite_count']}"
-            f" diff_in_nonfinite={stats['diff_in_nonfinite_count']}"
-            f" lap_nonfinite={stats['lap_nonfinite_count']}"
-            f" denom_in={stats['denom_in']:.3e}"
-            f" denom_lap={stats['denom_lap']:.3e}"
+        run_logger.warning(
+            "NONFINITE HOLDOUT: gen=%s idx=%s reason=%s pred_in_nonfinite=%s oracle_in_nonfinite=%s "
+            "diff_in_nonfinite=%s lap_nonfinite=%s denom_in=%.3e denom_lap=%.3e",
+            gen_idx,
+            program_idx,
+            reason,
+            stats["pred_in_nonfinite_count"],
+            stats["oracle_in_nonfinite_count"],
+            stats["diff_in_nonfinite_count"],
+            stats["lap_nonfinite_count"],
+            stats["denom_in"],
+            stats["denom_lap"],
         )
         _maybe_write_first_offender(
             gen_idx=gen_idx,
@@ -2797,7 +2888,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     gen_fraction_complex = float(gen_complex_candidates) / float(gen_candidates_total)
                     gen_fraction_dcim = float(gen_dcim_candidates) / float(gen_candidates_total)
 
-                if gen == 0 and programs:
+                if diversity_guard and gen == 0 and programs:
                     # Small CPU-side histogram for control logic; avoids GPU-only complexity.
                     short_terms = sum(1 for n in n_terms_list if n <= 2)
                     short_len = sum(1 for n in program_lengths if n <= 3)
@@ -2817,7 +2908,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             f"program_len_hist={_hist(program_lengths)}, "
                             f"n_terms_hist={_hist(n_terms_list)}"
                         )
-                        print(msg)
+                        run_logger.error("%s", msg)
                         raise RuntimeError(msg)
                     if is_layered:
                         zero_complex = sum(1 for c in complex_counts if c == 0)
@@ -2827,7 +2918,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "Complex-image guard failed: z_imag stayed zero; "
                                 f"compiler mapping or point eval not active (zero_complex={frac_zero:.2%})."
                             )
-                            print(msg)
+                            run_logger.error("%s", msg)
                             raise RuntimeError(msg)
 
                 top_fast_idx = _select_topk(fast_scores, topK_fast)
@@ -4236,15 +4327,19 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         entry["holdout"] = dict(holdout_stats)
                     entry["fraction_complex_candidates"] = float(gen_fraction_complex)
                     entry["fraction_dcim_candidates"] = float(gen_fraction_dcim)
-                    per_gen_preflight.append(entry)
-                    print(
-                        "PREFLIGHT "
-                        f"gen={gen} "
-                        f"compiled_ok={gen_counters.compiled_ok} "
-                        f"solved_ok={gen_counters.solved_ok} "
-                        f"fast_scored={gen_counters.fast_scored} "
-                        f"verified_written={gen_counters.verified_written}"
+                    if gen < len(per_gen_preflight):
+                        per_gen_preflight[gen] = entry
+                    else:
+                        per_gen_preflight.append(entry)
+                    run_logger.info(
+                        "PREFLIGHT gen=%s compiled_ok=%s solved_ok=%s fast_scored=%s verified_written=%s",
+                        gen,
+                        gen_counters.compiled_ok,
+                        gen_counters.solved_ok,
+                        gen_counters.fast_scored,
+                        gen_counters.verified_written,
                     )
+                    _write_preflight_snapshot()
                 if is_layered and preflight_enabled and gen_candidates_total > 0:
                     if gen_fraction_complex < 0.30:
                         low_complex_streak += 1
@@ -4287,7 +4382,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         and (ramp_best_rel_bc is not None or ramp_best_rel_lap is not None)
                         and gen - last_improve_gen >= ramp_patience
                     ):
-                        print("RAMP ABORT: not improving")
+                        run_logger.warning("RAMP ABORT: not improving")
                         ramp_abort = True
                         if should_early_exit(allow_not_ready, ramp_abort):
                             break
@@ -4358,20 +4453,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         lap_abs = float(lap_metrics.get("lap_mean_abs_holdout", lap_metrics.get("mean_pde_err_holdout", float("nan"))))
         lap_rel = float(lap_metrics.get("rel_lap_holdout", float("nan")))
         best_lap_rel = lap_rel
-        print(
-            "RUN SUMMARY:"
-            f" best_bc_abs={bc_abs:.3e}"
-            f" best_bc_rel={bc_rel:.3e}"
-            f" best_in_abs={in_abs:.3e}"
-            f" best_in_rel={in_rel:.3e}"
-            f" best_lap_abs={lap_abs:.3e}"
-            f" best_lap_rel={lap_rel:.3e}"
+        run_logger.info(
+            "RUN SUMMARY: best_bc_abs=%.3e best_bc_rel=%.3e best_in_abs=%.3e best_in_rel=%.3e "
+            "best_lap_abs=%.3e best_lap_rel=%.3e",
+            bc_abs,
+            bc_rel,
+            in_abs,
+            in_rel,
+            lap_abs,
+            lap_rel,
         )
     else:
-        print("RUN SUMMARY: no candidates evaluated")
+        run_logger.info("RUN SUMMARY: no candidates evaluated")
 
-    print(f"RUN DIR: {run_dir}")
-    print(f"ENV JSON: {run_dir / 'env.json'}")
+    run_logger.info("RUN DIR: %s", run_dir)
+    run_logger.info("ENV JSON: %s", run_dir / "env.json")
 
     def _metric_float(metrics: Dict[str, Any], key: str, fallback: str | None = None) -> float:
         if key in metrics:
@@ -4391,7 +4487,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             return rel if rel == rel else float("inf")
 
         top_records = sorted(best_records, key=_sort_rel)[:5]
-        print("TOP 5 CANDIDATES (by rel_bc):")
+        run_logger.info("TOP 5 CANDIDATES (by rel_bc):")
         for idx, rec in enumerate(top_records, start=1):
             metrics = rec.get("metrics", {})
             mean_bc = _metric_float(metrics, "mid_bc_mean_abs", "mean_bc_err_holdout")
@@ -4402,33 +4498,44 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             complex_count = int(metrics.get("complex_count", 0) or 0)
             n_terms = int(metrics.get("n_terms", metrics.get("complexity_terms", 0)) or 0)
             dcim_marker = " [DCIM_BASELINE]" if metrics.get("is_dcim_block_baseline") else ""
-            print(
-                f"{idx:02d} mean_bc={mean_bc:.3e} rel_bc={rel_bc:.3e} "
-                f"mean_in={mean_in:.3e} rel_in={rel_in:.3e} rel_lap={rel_lap:.3e} "
-                f"complex_count={complex_count} n_terms={n_terms}{dcim_marker}"
+            run_logger.info(
+                "%02d mean_bc=%.3e rel_bc=%.3e mean_in=%.3e rel_in=%.3e rel_lap=%.3e "
+                "complex_count=%s n_terms=%s%s",
+                idx,
+                mean_bc,
+                rel_bc,
+                mean_in,
+                rel_in,
+                rel_lap,
+                complex_count,
+                n_terms,
+                dcim_marker,
             )
     else:
-        print("TOP 5 CANDIDATES: none")
+        run_logger.info("TOP 5 CANDIDATES: none")
 
     if best_rel_elements:
         hist = _element_type_hist(best_rel_elements)
         hist_str = ", ".join(f"{k}: {v}" for k, v in hist.items())
         dcim_present = bool(best_rel_metrics and best_rel_metrics.get("is_dcim_block_baseline"))
         dcim_present = dcim_present or _has_dcim_block(best_rel_elements)
-        print(f"BEST ELEMENT TYPES: {hist_str} | dcim_block_present={dcim_present}")
+        run_logger.info("BEST ELEMENT TYPES: %s | dcim_block_present=%s", hist_str, dcim_present)
     else:
-        print("BEST ELEMENT TYPES: none")
+        run_logger.info("BEST ELEMENT TYPES: none")
 
     dcim_used_as_best = _dcim_used_as_best(best_rel_metrics, best_rel_elements)
     if best_dcim_rel_bc is None and best_dcim_rel_lap is None and best_dcim_score is None:
-        print("DCIM BASELINE BEST: unavailable")
+        run_logger.info("DCIM BASELINE BEST: unavailable")
     else:
         dcim_rel_bc = best_dcim_rel_bc if best_dcim_rel_bc is not None else float("nan")
         dcim_rel_lap = best_dcim_rel_lap if best_dcim_rel_lap is not None else float("nan")
         dcim_score = best_dcim_score if best_dcim_score is not None else float("nan")
-        print(
-            f"DCIM BASELINE BEST: rel_bc={dcim_rel_bc:.3e} rel_lap={dcim_rel_lap:.3e} "
-            f"score={dcim_score:.3e} used_as_best={dcim_used_as_best}"
+        run_logger.info(
+            "DCIM BASELINE BEST: rel_bc=%.3e rel_lap=%.3e score=%.3e used_as_best=%s",
+            dcim_rel_bc,
+            dcim_rel_lap,
+            dcim_score,
+            dcim_used_as_best,
         )
 
     def _first_finite(vals: Sequence[float]) -> float:
@@ -4471,19 +4578,19 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             spec_hash_report = unique_hashes[-1]
     if fixed_spec:
         status = "constant" if spec_hash_constant else "varied"
-        print(f"SPEC HASH: {spec_hash_report} ({status})")
+        run_logger.info("SPEC HASH: %s (%s)", spec_hash_report, status)
     else:
-        print(f"SPEC HASH: {spec_hash_report}")
-    print(
-        "RAMP SIGNAL:"
-        f" improved_bc={improved_bc}"
-        f" improved_lap={improved_lap}"
-        f" best_bc_rel={best_bc_rel:.3e}"
-        f" best_lap_rel={best_lap_rel:.3e}"
-        f" ready={ready}"
+        run_logger.info("SPEC HASH: %s", spec_hash_report)
+    run_logger.info(
+        "RAMP SIGNAL: improved_bc=%s improved_lap=%s best_bc_rel=%.3e best_lap_rel=%.3e ready=%s",
+        improved_bc,
+        improved_lap,
+        best_bc_rel,
+        best_lap_rel,
+        ready,
     )
     if ready:
-        print("READY for monster run")
+        run_logger.info("READY for monster run")
     else:
         limiter = None
         if per_gen_empty_frac and per_gen_empty_frac[-1] >= 0.5:
@@ -4494,9 +4601,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             limiter = "rel_bc above threshold"
         else:
             limiter = "timing too slow"
-        print(f"NOT READY: {limiter}")
+        run_logger.info("NOT READY: %s", limiter)
     if refine_enabled:
-        print(f"REFINE IMPROVED: {refine_improved_total}/{refine_attempted_total}")
+        run_logger.info("REFINE IMPROVED: %s/%s", refine_improved_total, refine_attempted_total)
         if refine_improved_total > 0:
             ref_bc = (
                 best_refined_rel_bc
@@ -4508,57 +4615,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 if best_refined_rel_lap is not None
                 else float("nan")
             )
-            print(f"REFINE BEST REL: rel_bc={ref_bc:.3e} rel_lap={ref_lap:.3e}")
+            run_logger.info("REFINE BEST REL: rel_bc=%.3e rel_lap=%.3e", ref_bc, ref_lap)
 
     if preflight_counters is not None:
-        device_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu"
-        device_cap = (
-            ".".join(str(v) for v in torch.cuda.get_device_capability(device))
-            if torch.cuda.is_available()
-            else "cpu"
-        )
-        nonfinite_total = max(1, preflight_counters.nonfinite_pred_total)
-        extra = {
-            "timestamp": utc_now_iso(),
-            "tag": tag,
-            "config_hash": config_hash,
-            "git_sha": git_sha(),
-            "device_name": device_name,
-            "device_capability": device_cap,
-            "preflight_mode": preflight_mode,
-            "preflight_out": preflight_out,
-            "train_target_abs_max": float(train_target_abs_max),
-            "train_target_resample_attempts": int(train_target_resample_attempts),
-            "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
-            "per_gen": per_gen_preflight,
-        }
-        candidate_total = max(1, int(preflight_counters.compiled_ok))
-        extra["fraction_complex_candidates"] = float(preflight_counters.complex_candidates) / float(candidate_total)
-        extra["fraction_dcim_candidates"] = float(preflight_counters.dcim_candidates) / float(candidate_total)
-        extra["dcim_pole_count_hist"] = dict(sorted(dcim_pole_hist.items(), key=lambda x: x[0]))
-        extra["dcim_block_count_hist"] = dict(sorted(dcim_block_hist.items(), key=lambda x: x[0]))
-        extra["max_abs_imag_depth_hist"] = dict(sorted(max_imag_hist.items(), key=lambda x: x[0]))
-        extra["max_abs_weight_hist"] = dict(sorted(max_weight_hist.items(), key=lambda x: x[0]))
-        extra["condition_ratio_hist"] = dict(sorted(cond_ratio_hist.items(), key=lambda x: x[0]))
-        extra["baseline_speed_backend_name"] = baseline_backend_name or "unknown"
-        if weights_reject_reasons:
-            extra["weights_reject_reasons"] = sorted(weights_reject_reasons)
-        if holdout_reject_reasons:
-            extra["holdout_reject_reasons"] = sorted(holdout_reject_reasons)
-        write_preflight_report(run_dir, preflight_counters, extra)
+        _write_preflight_snapshot()
         summarize_to_stdout(preflight_counters)
+        run_logger.info("%s", _format_preflight_summary(preflight_counters))
 
     if should_early_exit(allow_not_ready, ramp_abort):
         return 3
 
     if sanity_threshold is not None:
         if best_mean_bc is None or best_mean_bc > sanity_threshold:
-            print(
-                f"Sanity FAIL: best mean BC holdout {best_mean_bc} exceeds threshold {sanity_threshold}."
+            run_logger.info(
+                "Sanity FAIL: best mean BC holdout %s exceeds threshold %s.",
+                best_mean_bc,
+                sanity_threshold,
             )
             return 2
-        print(
-            f"Sanity PASS: best mean BC holdout {best_mean_bc} within threshold {sanity_threshold}."
+        run_logger.info(
+            "Sanity PASS: best mean BC holdout %s within threshold %s.",
+            best_mean_bc,
+            sanity_threshold,
         )
 
     return 0

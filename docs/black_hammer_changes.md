@@ -207,3 +207,11 @@
   - `pytest -q tests/test_stage10_run_logging_preflight_smoke.py -vv -rs --maxfail=1`
   - `pytest -q electrodrive/gfn/tests/test_canonicalization.py -vv -rs --maxfail=1`
 - validate: `run.log` and `preflight.json` exist in the run directory and per-gen entries are fully formed.
+
+## Phase 10.1: Interface constraints in layered weight solve
+- change: added optional interface continuity constraints for layered solves (phi continuity and epsilon-weighted normal derivative) with GPU evaluation; enabled via `run.layered_enforce_interface_constraints`.
+- change: new knobs `run.layered_interface_constraint_weight` and `run.layered_interface_constraint_points` to tune interface constraint strength and sampling density.
+- why: Gate B triage showed catastrophic displacement discontinuities (1e9–1e10) even when reference +/- toggles, indicating interface physics was not enforced during weight fit.
+- reproduce:
+  - `pytest -q tests/test_stage10_interface_constraints_gateB_proxy.py -vv -rs --maxfail=1`
+- validate: Gate B proxy displacement jump decreases on the layered fixture when interface constraints are enabled.

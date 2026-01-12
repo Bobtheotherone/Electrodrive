@@ -385,6 +385,199 @@ def _sample_points_layered(
     return bc_points, interior
 
 
+def _interface_eps_pairs(spec: CanonicalSpec) -> List[Tuple[float, float, float]]:
+    dielectrics = getattr(spec, "dielectrics", None) or []
+    interfaces: List[Tuple[float, float, float]] = []
+    for layer in dielectrics:
+        if "z_max" not in layer:
+            continue
+        z_int = float(layer["z_max"])
+        eps_below = float(layer.get("epsilon", layer.get("eps", 1.0)))
+        for other in dielectrics:
+            if "z_min" not in other:
+                continue
+            z_lower = float(other["z_min"])
+            if abs(z_lower - z_int) < 1e-6:
+                eps_above = float(other.get("epsilon", other.get("eps", 1.0)))
+                interfaces.append((z_int, eps_above, eps_below))
+                break
+    return interfaces
+
+
+def _assemble_basis_normal_derivative(
+    elements: Sequence[ImageBasisElement],
+    points: torch.Tensor,
+    normal: torch.Tensor,
+) -> torch.Tensor:
+    if points.numel() == 0 or not elements:
+        return torch.empty((points.shape[0], 0), device=points.device, dtype=points.dtype)
+    cols: List[torch.Tensor] = []
+    normal = normal.to(device=points.device, dtype=points.dtype)
+    for elem in elements:
+        pts = points.detach().clone().requires_grad_(True)
+        vals = elem.potential(pts)
+        grad = torch.autograd.grad(vals, pts, grad_outputs=torch.ones_like(vals), create_graph=False)[0]
+        cols.append(torch.sum(grad * normal, dim=1))
+    return torch.stack(cols, dim=1)
+
+
+def _reference_normal_derivative(
+    spec: CanonicalSpec,
+    points: torch.Tensor,
+    normal: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    pts = points.detach().clone().to(device=device, dtype=dtype).requires_grad_(True)
+    vals = compute_layered_reference_potential(spec, pts, device=device, dtype=dtype)
+    grad = torch.autograd.grad(vals, pts, grad_outputs=torch.ones_like(vals), create_graph=False)[0]
+    return torch.sum(grad * normal.to(device=device, dtype=dtype), dim=1).detach()
+
+
+def _build_interface_constraint_data(
+    spec: CanonicalSpec,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+    domain_scale: float,
+    interface_delta: float,
+    points_per_interface: int,
+    weight: float,
+    use_ref: bool,
+) -> Optional[Dict[str, object]]:
+    if points_per_interface <= 0 or weight <= 0.0:
+        return None
+    z_planes = parse_layered_interfaces(spec)
+    if not z_planes:
+        return None
+    eps_pairs = _interface_eps_pairs(spec)
+    if not eps_pairs:
+        return None
+    eps_map = {z: (eps_up, eps_dn) for z, eps_up, eps_dn in eps_pairs}
+    pts_up, pts_dn = sample_layered_interface_pairs(
+        spec,
+        points_per_interface,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        delta=interface_delta,
+        domain_scale=domain_scale,
+    )
+    if pts_up.numel() == 0:
+        return None
+
+    eps_up_list: List[float] = []
+    eps_dn_list: List[float] = []
+    for z_val in z_planes:
+        eps_up, eps_dn = eps_map.get(z_val, (1.0, 1.0))
+        eps_up_list.append(float(eps_up))
+        eps_dn_list.append(float(eps_dn))
+    eps_up_vec = torch.repeat_interleave(
+        torch.tensor(eps_up_list, device=device, dtype=dtype),
+        points_per_interface,
+    )
+    eps_dn_vec = torch.repeat_interleave(
+        torch.tensor(eps_dn_list, device=device, dtype=dtype),
+        points_per_interface,
+    )
+    n = min(pts_up.shape[0], eps_up_vec.shape[0])
+    pts_up = pts_up[:n]
+    pts_dn = pts_dn[:n]
+    eps_up_vec = eps_up_vec[:n]
+    eps_dn_vec = eps_dn_vec[:n]
+
+    ref_phi = torch.zeros(n, device=device, dtype=dtype)
+    ref_d = torch.zeros(n, device=device, dtype=dtype)
+    if use_ref:
+        ref_dtype = torch.float64
+        ref_up = compute_layered_reference_potential(
+            spec,
+            pts_up.to(dtype=ref_dtype),
+            device=device,
+            dtype=ref_dtype,
+        )
+        ref_dn = compute_layered_reference_potential(
+            spec,
+            pts_dn.to(dtype=ref_dtype),
+            device=device,
+            dtype=ref_dtype,
+        )
+        ref_phi = (-(ref_up - ref_dn)).to(dtype=dtype)
+        normal = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=ref_dtype)
+        dref_up = _reference_normal_derivative(
+            spec,
+            pts_up,
+            normal,
+            device=device,
+            dtype=ref_dtype,
+        )
+        dref_dn = _reference_normal_derivative(
+            spec,
+            pts_dn,
+            normal,
+            device=device,
+            dtype=ref_dtype,
+        )
+        eps_up_ref = eps_up_vec.to(dtype=ref_dtype)
+        eps_dn_ref = eps_dn_vec.to(dtype=ref_dtype)
+        ref_d = (-(eps_up_ref * dref_up - eps_dn_ref * dref_dn)).to(dtype=dtype)
+
+    return {
+        "pts_up": pts_up,
+        "pts_dn": pts_dn,
+        "eps_up": eps_up_vec,
+        "eps_dn": eps_dn_vec,
+        "ref_phi": ref_phi,
+        "ref_d": ref_d,
+        "weight": float(weight),
+    }
+
+
+def _apply_interface_constraints(
+    *,
+    A_train: torch.Tensor,
+    V_train: torch.Tensor,
+    is_boundary: Optional[torch.Tensor],
+    elements: Sequence[ImageBasisElement],
+    constraint_data: Optional[Dict[str, object]],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    if constraint_data is None or not elements:
+        return A_train, V_train, is_boundary
+    pts_up = constraint_data["pts_up"]
+    pts_dn = constraint_data["pts_dn"]
+    if pts_up.numel() == 0 or pts_dn.numel() == 0:
+        return A_train, V_train, is_boundary
+
+    A_up = assemble_basis_matrix(elements, pts_up)
+    A_dn = assemble_basis_matrix(elements, pts_dn)
+    A_phi = A_up - A_dn
+    V_phi = constraint_data["ref_phi"].to(dtype=V_train.dtype)
+
+    normal = torch.tensor([0.0, 0.0, 1.0], device=pts_up.device, dtype=pts_up.dtype)
+    dA_up = _assemble_basis_normal_derivative(elements, pts_up, normal)
+    dA_dn = _assemble_basis_normal_derivative(elements, pts_dn, normal)
+    eps_up = constraint_data["eps_up"].to(dtype=dA_up.dtype).view(-1, 1)
+    eps_dn = constraint_data["eps_dn"].to(dtype=dA_dn.dtype).view(-1, 1)
+    A_d = eps_up * dA_up - eps_dn * dA_dn
+    V_d = constraint_data["ref_d"].to(dtype=V_train.dtype)
+
+    A_constraints = torch.cat([A_phi, A_d], dim=0)
+    V_constraints = torch.cat([V_phi, V_d], dim=0)
+    weight = float(constraint_data.get("weight", 1.0))
+    if weight != 1.0:
+        A_constraints = A_constraints * weight
+        V_constraints = V_constraints * weight
+
+    A_train = torch.cat([A_train, A_constraints], dim=0)
+    V_train = torch.cat([V_train, V_constraints], dim=0)
+    if is_boundary is not None:
+        extra = torch.zeros(V_constraints.shape[0], device=is_boundary.device, dtype=torch.bool)
+        is_boundary = torch.cat([is_boundary, extra], dim=0)
+    return A_train, V_train, is_boundary
+
+
 def _sample_interior_points(
     spec: CanonicalSpec,
     *,
@@ -1572,6 +1765,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     fast_proxy_fail_hard = bool(fast_proxy_cfg.get("fail_hard", False))
     dcim_diversity = bool(run_cfg.get("dcim_diversity", False))
     diversity_guard = bool(run_cfg.get("diversity_guard", True))
+    layered_enforce_interface_constraints = bool(run_cfg.get("layered_enforce_interface_constraints", False))
+    layered_interface_constraint_weight = float(run_cfg.get("layered_interface_constraint_weight", 1.0))
+    if not math.isfinite(layered_interface_constraint_weight) or layered_interface_constraint_weight <= 0.0:
+        layered_interface_constraint_weight = 0.0
+    layered_interface_constraint_points = int(run_cfg.get("layered_interface_constraint_points", 64))
+    if layered_interface_constraint_points < 0:
+        layered_interface_constraint_points = 0
     refine_enabled = bool(run_cfg.get("refine_enabled", False))
     refine_steps = int(run_cfg.get("refine_steps", 12))
     refine_lr = float(run_cfg.get("refine_lr", 5e-2))
@@ -2260,6 +2460,19 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                      torch.zeros(interior_train.shape[0], device=device, dtype=torch.bool)],
                     dim=0,
                 )
+                interface_constraint_data = None
+                if layered_enforce_interface_constraints and is_layered:
+                    interface_constraint_data = _build_interface_constraint_data(
+                        spec,
+                        device=device,
+                        dtype=X_train.dtype,
+                        seed=seed_gen + 53,
+                        domain_scale=domain_scale,
+                        interface_delta=layered_interface_delta,
+                        points_per_interface=layered_interface_constraint_points,
+                        weight=layered_interface_constraint_weight,
+                        use_ref=use_ref,
+                    )
                 X_hold = torch.cat([bc_hold, interior_hold], dim=0)
                 V_hold = torch.cat([V_bc_hold, V_in_hold], dim=0)
                 V_hold_mid = torch.cat([V_bc_hold_mid, V_in_hold_mid], dim=0)
@@ -2290,6 +2503,14 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 v_train_nan_to_num_applied = False
                 v_train_clamp_applied = False
                 v_train_reference_subtracted = bool(use_ref)
+                v_train_fit_absmax = v_train_absmax
+                if interface_constraint_data is not None:
+                    weight = float(interface_constraint_data.get("weight", 1.0))
+                    ref_phi = interface_constraint_data.get("ref_phi")
+                    ref_d = interface_constraint_data.get("ref_d")
+                    v_constraints_absmax = max(_tensor_absmax(ref_phi), _tensor_absmax(ref_d))
+                    if math.isfinite(v_constraints_absmax):
+                        v_train_fit_absmax = max(v_train_fit_absmax, weight * v_constraints_absmax)
 
                 fast_proxy_near_pts = torch.empty((0, 3), device=device, dtype=torch.float32)
                 fast_proxy_far_pts = torch.empty((0, 3), device=device, dtype=torch.float32)
@@ -2516,11 +2737,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         _count_preflight("assembled_ok")
                         assert_cuda_tensor(A_train, "A_train_fast")
                         assert_cuda_tensor(A_hold, "A_hold_fast")
+                        V_train_fit = V_train
+                        is_boundary_fit = is_boundary
+                        if interface_constraint_data is not None:
+                            A_train, V_train_fit, is_boundary_fit = _apply_interface_constraints(
+                                A_train=A_train,
+                                V_train=V_train_fit,
+                                is_boundary=is_boundary_fit,
+                                elements=elements,
+                                constraint_data=interface_constraint_data,
+                            )
                         if v_train_explosion and not v_train_snapshot_written:
                             payload = build_vtrain_explosion_snapshot(
                                 spec,
                                 X_train,
-                                V_train,
+                                V_train_fit,
                                 A_train,
                                 layered_reference_enabled=use_ref,
                                 reference_subtracted_for_fit=v_train_reference_subtracted,
@@ -2567,7 +2798,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 program=program,
                                 elements=elements,
                                 A_train=A_train,
-                                V_train=V_train,
+                                V_train=V_train_fit,
                                 weights=None,
                                 pred_hold=None,
                                 reason=reason,
@@ -2606,10 +2837,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                         weights = _fast_weights(
                             A_train,
-                            V_train,
+                            V_train_fit,
                             reg=float(solver_cfg.get("reg_l1", 1e-3)),
                             normalize=bool(solver_cfg.get("fast_column_normalize", True)),
-                            max_abs_b=v_train_absmax,
+                            max_abs_b=v_train_fit_absmax,
                         )
                         weights_nonfinite = 0
                         if preflight_counters is not None:
@@ -2642,7 +2873,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 program=program,
                                 elements=elements,
                                 A_train=A_train,
-                                V_train=V_train,
+                                V_train=V_train_fit,
                                 weights=weights,
                                 pred_hold=None,
                                 reason="weights_nonfinite",
@@ -2673,7 +2904,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     program=program,
                                     elements=elements,
                                     A_train=A_train,
-                                    V_train=V_train,
+                                    V_train=V_train_fit,
                                     weights=weights,
                                     pred_hold=pred_hold,
                                     reason="pred_nonfinite",
@@ -2695,7 +2926,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 program=program,
                                 elements=elements,
                                 A_train=A_train,
-                                V_train=V_train,
+                                V_train=V_train_fit,
                                 weights=weights,
                                 pred_hold=pred_hold,
                                 reason="pred_nonfinite",
@@ -2732,7 +2963,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 program=program,
                                 elements=elements,
                                 A_train=A_train,
-                                V_train=V_train,
+                                V_train=V_train_fit,
                                 weights=weights,
                                 pred_hold=pred_hold,
                                 V_hold=V_hold,
@@ -2851,7 +3082,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 program=program,
                                 elements=elements,
                                 A_train=A_train,
-                                V_train=V_train,
+                                V_train=V_train_fit,
                                 weights=weights,
                                 pred_hold=pred_hold,
                                 V_hold=V_hold,
@@ -2964,11 +3195,20 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             continue
                         A_train = assemble_basis_matrix(elements, X_train)
                         assert_cuda_tensor(A_train, "A_train_proxy")
+                        V_train_fit = V_train
+                        if interface_constraint_data is not None:
+                            A_train, V_train_fit, _ = _apply_interface_constraints(
+                                A_train=A_train,
+                                V_train=V_train_fit,
+                                is_boundary=is_boundary,
+                                elements=elements,
+                                constraint_data=interface_constraint_data,
+                            )
                         weights = _fast_weights(
                             A_train,
-                            V_train,
+                            V_train_fit,
                             reg=float(solver_cfg.get("reg_l1", 1e-3)),
-                            max_abs_b=v_train_absmax,
+                            max_abs_b=v_train_fit_absmax,
                         )
                         if weights.numel() == 0:
                             continue
@@ -3125,6 +3365,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         assert_cuda_tensor(X_train, "X_train")
                         A_train_dcim = assemble_basis_matrix(dcim_elements, X_train)
                         assert_cuda_tensor(A_train_dcim, "A_train_dcim")
+                        V_train_fit = V_train
+                        is_boundary_fit = is_boundary
+                        if interface_constraint_data is not None:
+                            A_train_dcim, V_train_fit, is_boundary_fit = _apply_interface_constraints(
+                                A_train=A_train_dcim,
+                                V_train=V_train_fit,
+                                is_boundary=is_boundary_fit,
+                                elements=dcim_elements,
+                                constraint_data=interface_constraint_data,
+                            )
                         A_train_scaled, col_norms = _scale_columns(A_train_dcim)
                         start = torch.cuda.Event(enable_timing=True)
                         end = torch.cuda.Event(enable_timing=True)
@@ -3132,8 +3382,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         weights_scaled, _ = solve_sparse(
                             A_train_scaled,
                             X_train,
-                            V_train,
-                            is_boundary,
+                            V_train_fit,
+                            is_boundary_fit,
                             _NullLogger(),
                             reg_l1=float(solver_cfg.get("reg_l1", 1e-3)),
                             solver=solver_mode,
@@ -3153,7 +3403,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     program=dcim_program,
                                     elements=dcim_elements,
                                     A_train=A_train_dcim,
-                                    V_train=V_train,
+                                    V_train=V_train_fit,
                                     weights=weights,
                                     pred_hold=None,
                                     reason=reason,
@@ -3255,7 +3505,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     program=dcim_program,
                                     elements=dcim_elements,
                                     A_train=A_train_dcim,
-                                    V_train=V_train,
+                                    V_train=V_train_fit,
                                     weights=weights,
                                     pred_hold=pred_hold,
                                     V_hold=V_hold,
@@ -3404,7 +3654,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     program=dcim_program,
                                     elements=dcim_elements,
                                     A_train=A_train_dcim,
-                                    V_train=V_train,
+                                    V_train=V_train_fit,
                                     weights=weights,
                                     pred_hold=pred_hold,
                                     V_hold=V_hold,
@@ -3474,6 +3724,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     assert_cuda_tensor(X_train, "X_train")
                     A_train = assemble_basis_matrix(elements, X_train)
                     assert_cuda_tensor(A_train, "A_train_fit")
+                    V_train_fit = V_train
+                    is_boundary_fit = is_boundary
+                    if interface_constraint_data is not None:
+                        A_train, V_train_fit, is_boundary_fit = _apply_interface_constraints(
+                            A_train=A_train,
+                            V_train=V_train_fit,
+                            is_boundary=is_boundary_fit,
+                            elements=elements,
+                            constraint_data=interface_constraint_data,
+                        )
                     A_train_scaled, col_norms = _scale_columns(A_train)
                     start = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
@@ -3481,8 +3741,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     weights_scaled, _ = solve_sparse(
                         A_train_scaled,
                         X_train,
-                        V_train,
-                        is_boundary,
+                        V_train_fit,
+                        is_boundary_fit,
                         _NullLogger(),
                         reg_l1=float(solver_cfg.get("reg_l1", 1e-3)),
                         solver=solver_mode,
@@ -3503,7 +3763,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             program=program,
                             elements=elements,
                             A_train=A_train,
-                            V_train=V_train,
+                            V_train=V_train_fit,
                             weights=weights,
                             pred_hold=None,
                             reason=reason,
@@ -3605,7 +3865,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             program=program,
                             elements=elements,
                             A_train=A_train,
-                            V_train=V_train,
+                            V_train=V_train_fit,
                             weights=weights,
                             pred_hold=pred_hold,
                             V_hold=V_hold,
@@ -3682,7 +3942,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             program=program,
                             elements=elements,
                             A_train=A_train,
-                            V_train=V_train,
+                            V_train=V_train_fit,
                             weights=weights,
                             pred_hold=pred_hold,
                             V_hold=V_hold,
@@ -4031,6 +4291,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                         A_refine = assemble_basis_matrix(refine_elements, refine_X)
                         assert_cuda_tensor(A_refine, "A_refine")
+                        refine_V_fit = refine_V
+                        refine_is_boundary_fit = refine_is_boundary
+                        if interface_constraint_data is not None:
+                            A_refine, refine_V_fit, refine_is_boundary_fit = _apply_interface_constraints(
+                                A_train=A_refine,
+                                V_train=refine_V_fit,
+                                is_boundary=refine_is_boundary_fit,
+                                elements=refine_elements,
+                                constraint_data=interface_constraint_data,
+                            )
                         A_refine_scaled, col_norms = _scale_columns(A_refine)
                         start = torch.cuda.Event(enable_timing=True)
                         end = torch.cuda.Event(enable_timing=True)
@@ -4038,8 +4308,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         weights_scaled, _ = solve_sparse(
                             A_refine_scaled,
                             refine_X,
-                            refine_V,
-                            refine_is_boundary,
+                            refine_V_fit,
+                            refine_is_boundary_fit,
                             _NullLogger(),
                             reg_l1=float(solver_cfg.get("reg_l1", 1e-3)),
                             solver=solver_mode,
@@ -4060,7 +4330,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 program=cand["program"],
                                 elements=refine_elements,
                                 A_train=A_refine,
-                                V_train=refine_V,
+                                V_train=refine_V_fit,
                                 weights=refined_weights,
                                 pred_hold=None,
                                 reason=reason,

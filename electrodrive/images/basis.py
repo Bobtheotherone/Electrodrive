@@ -173,6 +173,22 @@ class PointChargeBasis(ImageBasisElement):
             except Exception:
                 use_complex = False
         self._use_complex = use_complex
+        self._component = "real"
+        component_raw = params.get("component")
+        if component_raw is not None:
+            component_val = None
+            try:
+                if torch.is_tensor(component_raw):
+                    component_val = float(component_raw.detach().item())
+                elif isinstance(component_raw, (int, float)):
+                    component_val = float(component_raw)
+            except Exception:
+                component_val = None
+            if component_val is None:
+                if isinstance(component_raw, str) and component_raw.strip().lower().startswith("imag"):
+                    self._component = "imag"
+            elif component_val >= 0.5:
+                self._component = "imag"
         super().__init__(type_name, params)
 
     def potential(self, targets: torch.Tensor) -> torch.Tensor:
@@ -193,10 +209,13 @@ class PointChargeBasis(ImageBasisElement):
         pos_f = pos.to(device=targets.device, dtype=complex_real_dtype)
         delta = tgt - pos_f
         dx, dy, dz = delta[:, 0], delta[:, 1], delta[:, 2]
-        dz_complex = torch.complex(dz, z_imag.expand_as(dz))
+        dz_complex = torch.complex(dz, -z_imag.expand_as(dz))
         r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
         inv_r = 1.0 / torch.sqrt(r2_complex)
-        phi = (2.0 * inv_r.real).to(dtype=targets.dtype)
+        if self._component == "imag":
+            phi = (-2.0 * inv_r.imag).to(dtype=targets.dtype)
+        else:
+            phi = (2.0 * inv_r.real).to(dtype=targets.dtype)
         return K_E * phi
 
 

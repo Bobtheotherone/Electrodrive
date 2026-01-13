@@ -39,6 +39,7 @@ from electrodrive.images.basis import (
     ImageBasisElement,
     PointChargeBasis,
 )
+from electrodrive.images.basis_dcim import DCIMBlockBasis
 from electrodrive.images.geo_encoder import GeoEncoder
 from electrodrive.images.learned_generator import SimpleGeoEncoder
 from electrodrive.images.search import ImageSystem, assemble_basis_matrix, solve_sparse
@@ -753,8 +754,12 @@ def _count_complex_terms(
 ) -> int:
     if not elements:
         return 0
+    dcim_terms = 0
     z_vals: List[torch.Tensor] = []
     for elem in elements:
+        if isinstance(elem, DCIMBlockBasis):
+            dcim_terms += 1
+            continue
         z_imag = elem.params.get("z_imag")
         if z_imag is None:
             continue
@@ -766,10 +771,329 @@ def _count_complex_terms(
             except Exception:
                 continue
         z_vals.append(z)
-    if not z_vals:
-        return 0
-    z_stack = torch.stack(z_vals)
-    return int((z_stack.abs() > thresh).sum().item())
+    complex_terms = 0
+    if z_vals:
+        z_stack = torch.stack(z_vals)
+        complex_terms = int((z_stack.abs() > thresh).sum().item())
+    return int(complex_terms + dcim_terms)
+
+
+def _dcim_block_key(block: object) -> int:
+    return id(block)
+
+
+def _collect_dcim_stats(
+    elements: Sequence[ImageBasisElement],
+    *,
+    device: torch.device,
+    imag_thresh: float = 1e-6,
+) -> Dict[str, Any]:
+    block_map: Dict[int, Any] = {}
+    max_abs_imag = 0.0
+    max_abs_imag_dcim = 0.0
+    dcim_term_count = 0
+    complex_term_count = 0
+
+    for elem in elements:
+        if isinstance(elem, DCIMBlockBasis):
+            dcim_term_count += 1
+            block = elem.block
+            block_map[_dcim_block_key(block)] = block
+            continue
+        if isinstance(elem, (DCIMPoleImageBasis, DCIMBranchCutImageBasis)):
+            dcim_term_count += 1
+        z_imag = elem.params.get("z_imag")
+        if z_imag is None:
+            continue
+        if torch.is_tensor(z_imag):
+            z = z_imag.to(device=device).view(())
+        else:
+            try:
+                z = torch.tensor(float(z_imag), device=device)
+            except Exception:
+                continue
+        z_abs = float(z.abs().item())
+        if z_abs > imag_thresh:
+            complex_term_count += 1
+            if z_abs > max_abs_imag:
+                max_abs_imag = z_abs
+
+    dcim_block_count = 0
+    dcim_pole_count = 0
+    dcim_image_count = 0
+    for block in block_map.values():
+        dcim_block_count += 1
+        try:
+            dcim_pole_count += len(getattr(block, "poles", ()) or ())
+        except Exception:
+            pass
+        try:
+            images = getattr(block, "images", ()) or ()
+            dcim_image_count += len(images)
+            for img in images:
+                try:
+                    depth_im = abs(complex(getattr(img, "depth", 0.0)).imag)
+                except Exception:
+                    depth_im = 0.0
+                if depth_im > max_abs_imag_dcim:
+                    max_abs_imag_dcim = depth_im
+        except Exception:
+            pass
+
+    if max_abs_imag_dcim > max_abs_imag:
+        max_abs_imag = max_abs_imag_dcim
+
+    return {
+        "complex_term_count": int(complex_term_count),
+        "dcim_term_count": int(dcim_term_count),
+        "dcim_block_count": int(dcim_block_count),
+        "dcim_pole_count": int(dcim_pole_count),
+        "dcim_image_count": int(dcim_image_count),
+        "max_abs_imag": float(max_abs_imag),
+        "max_abs_imag_dcim": float(max_abs_imag_dcim),
+    }
+
+
+def _hist_inc(hist: Dict[str, int], key: str, n: int = 1) -> None:
+    hist[key] = int(hist.get(key, 0)) + int(n)
+
+
+def _block_count_bin(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count == 1:
+        return "1"
+    if count == 2:
+        return "2"
+    return "3+"
+
+
+def _pole_count_bin(count: int) -> str:
+    if count <= 0:
+        return "0"
+    if count == 1:
+        return "1"
+    if count <= 3:
+        return "2-3"
+    if count <= 7:
+        return "4-7"
+    return "8+"
+
+
+def _imag_ratio_bin(value: float, scale: float) -> str:
+    if not math.isfinite(value):
+        return "nan"
+    denom = max(scale, 1e-9)
+    ratio = value / denom
+    if ratio <= 1e-4:
+        return "<1e-4"
+    if ratio <= 1e-2:
+        return "1e-4-1e-2"
+    if ratio <= 1e-1:
+        return "1e-2-1e-1"
+    if ratio <= 1.0:
+        return "1e-1-1"
+    if ratio <= 10.0:
+        return "1-10"
+    return ">10"
+
+
+def _weight_mag_bin(value: float) -> str:
+    if not math.isfinite(value):
+        return "nan"
+    if value <= 0.0:
+        return "0"
+    logv = math.log10(value)
+    if logv < -6:
+        return "<1e-6"
+    if logv < -4:
+        return "1e-6-1e-4"
+    if logv < -2:
+        return "1e-4-1e-2"
+    if logv < 0:
+        return "1e-2-1"
+    if logv < 2:
+        return "1-1e2"
+    return ">1e2"
+
+
+def _cond_ratio_bin(value: float) -> str:
+    if not math.isfinite(value):
+        return "nan"
+    if value <= 1e2:
+        return "<=1e2"
+    if value <= 1e4:
+        return "1e2-1e4"
+    if value <= 1e6:
+        return "1e4-1e6"
+    if value <= 1e8:
+        return "1e6-1e8"
+    return ">1e8"
+
+
+def _speed_proxy(comp_terms: int, dcim_stats: Dict[str, Any]) -> float:
+    return float(
+        comp_terms
+        + 4 * int(dcim_stats.get("dcim_block_count", 0))
+        + 2 * int(dcim_stats.get("dcim_pole_count", 0))
+        + int(dcim_stats.get("dcim_image_count", 0))
+    )
+
+
+def _dcim_signature(dcim_stats: Dict[str, Any], *, imag_scale: float) -> Tuple[str, str, str]:
+    return (
+        _block_count_bin(int(dcim_stats.get("dcim_block_count", 0))),
+        _pole_count_bin(int(dcim_stats.get("dcim_pole_count", 0))),
+        _imag_ratio_bin(float(dcim_stats.get("max_abs_imag", 0.0)), imag_scale),
+    )
+
+
+def _coerce_float_list(raw: Any, default: Sequence[float]) -> List[float]:
+    if isinstance(raw, (list, tuple)):
+        out: List[float] = []
+        for val in raw:
+            try:
+                out.append(float(val))
+            except Exception:
+                continue
+        if out:
+            return out
+    return [float(x) for x in default]
+
+
+def _coerce_int_list(raw: Any, default: Sequence[int]) -> List[int]:
+    if isinstance(raw, (list, tuple)):
+        out: List[int] = []
+        for val in raw:
+            try:
+                out.append(int(val))
+            except Exception:
+                continue
+        if out:
+            return out
+    return [int(x) for x in default]
+
+
+def _clamp_z_away_from_planes(z_val: float, planes: Sequence[float], radius: float) -> float:
+    z_out = float(z_val)
+    for plane in planes:
+        if abs(z_out - plane) < radius:
+            z_out = plane + radius if z_out >= plane else plane - radius
+    return float(z_out)
+
+
+def _expand_complex_poles(
+    elements: Sequence[ImageBasisElement],
+    *,
+    device: torch.device,
+    imag_thresh: float,
+    pole_expand_max: int,
+    pole_imag_scales: Sequence[float],
+    pole_depth_steps: Sequence[int],
+    interface_planes: Sequence[float],
+    exclusion_radius: float,
+) -> List[ImageBasisElement]:
+    if pole_expand_max <= 1:
+        return list(elements)
+    out: List[ImageBasisElement] = []
+    for elem in elements:
+        out.append(elem)
+        if not isinstance(elem, (DCIMPoleImageBasis, DCIMBranchCutImageBasis)):
+            continue
+        if not bool(getattr(elem, "_use_complex", False)):
+            continue
+        z_imag = elem.params.get("z_imag")
+        if z_imag is None:
+            continue
+        if torch.is_tensor(z_imag):
+            z_base = float(z_imag.abs().item())
+        else:
+            try:
+                z_base = abs(float(z_imag))
+            except Exception:
+                continue
+        if z_base <= imag_thresh:
+            continue
+        pos = elem.params.get("position")
+        if pos is None:
+            continue
+        pos_t = pos.to(device=device, dtype=pos.dtype).view(3)
+        added = 0
+        for idx, scale_raw in enumerate(pole_imag_scales):
+            if added >= pole_expand_max - 1:
+                break
+            scale = float(scale_raw)
+            if abs(scale - 1.0) < 1e-6:
+                continue
+            z_imag_new = torch.tensor(z_base * scale, device=device, dtype=pos_t.dtype)
+            z_real_new = float(pos_t[2].item())
+            if pole_depth_steps:
+                step = float(pole_depth_steps[idx % len(pole_depth_steps)])
+                z_real_new = float(pos_t[2].item() - 2.0 * step)
+            z_real_new = _clamp_z_away_from_planes(z_real_new, interface_planes, exclusion_radius)
+            pos_new = pos_t.clone()
+            pos_new[2] = torch.tensor(z_real_new, device=device, dtype=pos_t.dtype)
+            params = dict(elem.params)
+            params["position"] = pos_new
+            params["z_imag"] = z_imag_new
+            new_elem = elem.__class__(params)
+            info = getattr(elem, "_group_info", None)
+            if isinstance(info, dict):
+                info_new = dict(info)
+                info_new["motif_index"] = int(info_new.get("motif_index", 0)) + idx
+                setattr(new_elem, "_group_info", info_new)
+            out.append(new_elem)
+            added += 1
+    return out
+
+
+def _expand_conjugate_components(
+    elements: Sequence[ImageBasisElement],
+    *,
+    device: torch.device,
+    imag_thresh: float,
+) -> List[ImageBasisElement]:
+    out: List[ImageBasisElement] = []
+    for elem in elements:
+        if not isinstance(elem, (DCIMPoleImageBasis, DCIMBranchCutImageBasis)):
+            out.append(elem)
+            continue
+        if not bool(getattr(elem, "_use_complex", False)):
+            out.append(elem)
+            continue
+        if elem.params.get("component") is not None:
+            out.append(elem)
+            continue
+        z_imag = elem.params.get("z_imag")
+        if z_imag is None:
+            out.append(elem)
+            continue
+        if torch.is_tensor(z_imag):
+            z_abs = float(z_imag.abs().item())
+        else:
+            try:
+                z_abs = abs(float(z_imag))
+            except Exception:
+                z_abs = 0.0
+        if z_abs <= imag_thresh:
+            out.append(elem)
+            continue
+        base_params = dict(elem.params)
+        params_real = dict(base_params)
+        params_imag = dict(base_params)
+        params_real["component"] = torch.tensor(0.0, device=device, dtype=base_params["position"].dtype)
+        params_imag["component"] = torch.tensor(1.0, device=device, dtype=base_params["position"].dtype)
+        real_elem = elem.__class__(params_real)
+        imag_elem = elem.__class__(params_imag)
+        info = getattr(elem, "_group_info", None)
+        if isinstance(info, dict):
+            setattr(real_elem, "_group_info", dict(info))
+            info_imag = dict(info)
+            info_imag["component"] = "imag"
+            setattr(imag_elem, "_group_info", info_imag)
+        out.append(real_elem)
+        out.append(imag_elem)
+    return out
 
 
 def _perturb_elements(
@@ -833,6 +1157,8 @@ def _build_dcim_block_elements(
     device: torch.device,
     max_blocks: int,
     cache_path: Path,
+    cfg_values: Optional[Dict[str, Any]] = None,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
 ) -> List[ImageBasisElement]:
     missing: List[str] = []
     dielectrics = getattr(spec, "dielectrics", None) or []
@@ -880,23 +1206,30 @@ def _build_dcim_block_elements(
     z_src = float(pos0[2])
     q_src = float(point_charges[0].get("charge", point_charges[0].get("q", 1.0)))
 
+    cfg_kwargs: Dict[str, Any] = {
+        "k_min": 0.05,
+        "k_mid": 2.0,
+        "k_max": 6.0,
+        "n_low": 64,
+        "n_mid": 64,
+        "n_high": 0,
+        "log_low": False,
+        "log_high": False,
+        "vf_enabled": False,
+        "vf_for_images": False,
+        "exp_fit_enabled": True,
+        "exp_fit_requires_uniform_grid": True,
+        "exp_N": 6,
+        "spectral_tol": 0.3,
+        "spatial_tol": 0.2,
+        "sample_points": [(0.3, 0.6), (0.5, 1.0), (0.2, 0.6)],
+    }
+    if cfg_values:
+        cfg_kwargs.update(cfg_values)
+    if cfg_overrides:
+        cfg_kwargs.update(cfg_overrides)
     cfg = DCIMCompilerConfig(
-        k_min=0.05,
-        k_mid=2.0,
-        k_max=6.0,
-        n_low=64,
-        n_mid=64,
-        n_high=0,
-        log_low=False,
-        log_high=False,
-        vf_enabled=False,
-        vf_for_images=False,
-        exp_fit_enabled=True,
-        exp_fit_requires_uniform_grid=True,
-        exp_N=6,
-        spectral_tol=0.3,
-        spatial_tol=0.2,
-        sample_points=[(0.3, 0.6), (0.5, 1.0), (0.2, 0.6)],
+        **cfg_kwargs,
         cache_enabled=True,
         cache_path=cache_path,
         device=dev,
@@ -923,6 +1256,96 @@ def _build_dcim_block_elements(
     if max_blocks <= 0:
         return []
     return elems[:max_blocks]
+
+
+def _dcim_variant_overrides(
+    spec: CanonicalSpec,
+    *,
+    base_exp_N: int,
+    base_k_min: float,
+    base_k_mid: float,
+    base_k_max: float,
+    base_log_low: bool,
+    base_log_high: bool,
+    max_variants: int,
+) -> List[Dict[str, Any]]:
+    eps_ratio = 1.0
+    layers = getattr(spec, "dielectrics", None) or []
+    if len(layers) >= 3:
+        try:
+            eps1 = float(layers[0].get("epsilon", layers[0].get("eps", 1.0)))
+            eps2 = float(layers[1].get("epsilon", layers[1].get("eps", 1.0)))
+            if eps1 > 0:
+                eps_ratio = max(eps2 / eps1, 1e-3)
+        except Exception:
+            eps_ratio = 1.0
+
+    material_scale = max(1.0, math.sqrt(abs(eps_ratio)))
+    k_scales = (0.6, 1.0, 1.8)
+    exp_factors = (1, 2, 3)
+    log_patterns = (
+        (base_log_low, base_log_high),
+        (True, False),
+        (False, True),
+    )
+
+    overrides: List[Dict[str, Any]] = []
+    for idx in range(max(1, max_variants)):
+        k_scale = k_scales[idx % len(k_scales)] * material_scale
+        exp_n = max(2, int(base_exp_N * exp_factors[idx % len(exp_factors)]))
+        exp_n = min(exp_n, 64)
+        log_low, log_high = log_patterns[idx % len(log_patterns)]
+        overrides.append(
+            {
+                "k_min": float(base_k_min * k_scale),
+                "k_mid": float(base_k_mid * k_scale),
+                "k_max": float(base_k_max * k_scale),
+                "exp_N": exp_n,
+                "log_low": bool(log_low),
+                "log_high": bool(log_high),
+            }
+        )
+    return overrides[:max_variants]
+
+
+def _build_dcim_block_variants(
+    spec: CanonicalSpec,
+    *,
+    device: torch.device,
+    max_blocks: int,
+    cache_path: Path,
+    cfg_values: Optional[Dict[str, Any]] = None,
+    max_variants: int,
+    base_exp_N: int,
+    base_k_min: float,
+    base_k_mid: float,
+    base_k_max: float,
+    base_log_low: bool,
+    base_log_high: bool,
+) -> List[List[ImageBasisElement]]:
+    variants = _dcim_variant_overrides(
+        spec,
+        base_exp_N=base_exp_N,
+        base_k_min=base_k_min,
+        base_k_mid=base_k_mid,
+        base_k_max=base_k_max,
+        base_log_low=base_log_low,
+        base_log_high=base_log_high,
+        max_variants=max_variants,
+    )
+    blocks: List[List[ImageBasisElement]] = []
+    for overrides in variants:
+        elems = _build_dcim_block_elements(
+            spec,
+            device=device,
+            max_blocks=max_blocks,
+            cache_path=cache_path,
+            cfg_values=cfg_values,
+            cfg_overrides=overrides,
+        )
+        if elems:
+            blocks.append(elems)
+    return blocks
 
 
 def _program_to_json(program: Any) -> List[Dict[str, Any]]:
@@ -1178,6 +1601,8 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     w_complexity = float(reward_cfg.get("w_complexity", 0.05))
     w_latency = float(reward_cfg.get("w_latency", 0.25))
     w_stability = float(reward_cfg.get("w_stability", 0.25))
+    w_speed_proxy = float(reward_cfg.get("w_speed_proxy", 0.0))
+    w_diversity = float(reward_cfg.get("w_diversity", 0.0))
     stability_sigma = float(reward_cfg.get("stability_perturb_sigma", 1e-3))
 
     points_cfg = cfg.get("points", {}) if isinstance(cfg.get("points", {}), dict) else {}
@@ -1214,6 +1639,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     if dcim_block_max < 0:
         dcim_block_max = 0
     dcim_block_weight = float(run_cfg.get("dcim_block_weight", 1.0))
+    dcim_block_variants = int(run_cfg.get("dcim_block_variants", 1))
+    if dcim_block_variants < 1:
+        dcim_block_variants = 1
+    dcim_block_combo_max = int(run_cfg.get("dcim_block_combo_max", 1))
+    if dcim_block_combo_max < 1:
+        dcim_block_combo_max = 1
+    dcim_exp_N = int(run_cfg.get("dcim_exp_N", 6))
+    dcim_k_min = float(run_cfg.get("dcim_k_min", 0.05))
+    dcim_k_mid = float(run_cfg.get("dcim_k_mid", 2.0))
+    dcim_k_max = float(run_cfg.get("dcim_k_max", 6.0))
+    dcim_log_low = bool(run_cfg.get("dcim_log_low", False))
+    dcim_log_high = bool(run_cfg.get("dcim_log_high", False))
+    pole_expand_max = int(run_cfg.get("pole_expand_max", 1))
+    pole_imag_scales_raw = _coerce_float_list(run_cfg.get("pole_imag_scales", None), [0.5, 1.0, 2.0, 4.0])
+    pole_depth_steps_raw = _coerce_int_list(run_cfg.get("pole_depth_steps", None), [0, 1, 2, 4])
+    pole_prune_min_weight = float(run_cfg.get("pole_prune_min_weight", 0.0))
+    complex_imag_thresh = float(run_cfg.get("complex_imag_thresh", 1e-6))
+    dcim_guard_min_fraction = float(run_cfg.get("dcim_guard_min_fraction", 0.30))
+    dcim_guard_patience = int(run_cfg.get("dcim_guard_patience", 3))
+    conditioning_max_ratio = float(run_cfg.get("conditioning_max_ratio", 0.0))
+    if conditioning_max_ratio <= 0.0:
+        conditioning_max_ratio = float("inf")
     ramp_check = bool(run_cfg.get("ramp_check", False))
     allow_not_ready = bool(run_cfg.get("allow_not_ready", False))
     ramp_patience = int(run_cfg.get("ramp_patience_gens", 3))
@@ -1280,7 +1727,9 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     best_dcim_rel_bc: Optional[float] = None
     best_dcim_rel_lap: Optional[float] = None
     best_dcim_score: Optional[float] = None
-    dcim_block_cache: Dict[str, List[ImageBasisElement]] = {}
+    dcim_block_cache: Dict[str, List[List[ImageBasisElement]]] = {}
+    dcim_guard_streak = 0
+    complex_guard_streak = 0
 
     verifier = Verifier(out_root=run_dir / "artifacts" / "certificates")
     verify_plan = VerificationPlan()
@@ -1298,6 +1747,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
     holdout_stats: Dict[str, Any] = {}
     weights_reject_reasons: set[str] = set()
     holdout_reject_reasons: set[str] = set()
+    agg_hist: Dict[str, Dict[str, int]] = {
+        "dcim_block_count_hist": {},
+        "dcim_pole_count_hist": {},
+        "max_abs_imag_depth_hist": {},
+        "weight_magnitude_hist": {},
+        "condition_ratio_hist": {},
+    }
 
     def _count_preflight(key: str, n: int = 1) -> None:
         if preflight_counters is None:
@@ -1472,8 +1928,16 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
         start_gen = time.perf_counter()
         if preflight_enabled:
             gen_counters = RunCounters()
+            gen_hist: Optional[Dict[str, Dict[str, int]]] = {
+                "dcim_block_count_hist": {},
+                "dcim_pole_count_hist": {},
+                "max_abs_imag_depth_hist": {},
+                "weight_magnitude_hist": {},
+                "condition_ratio_hist": {},
+            }
         else:
             gen_counters = None
+            gen_hist = None
         if fixed_spec and fixed_spec_obj is not None:
             spec = fixed_spec_obj
         else:
@@ -1492,6 +1956,43 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             spec,
             extra_overrides={"allow_real_primitives": allow_real_primitives},
         )
+        imag_scale = float(domain_scale)
+        interface_planes: List[float] = []
+        eps_ratio = 1.0
+        if is_layered:
+            slab_h = None
+            layers = getattr(spec, "dielectrics", None) or []
+            if len(layers) >= 2:
+                try:
+                    eps1 = float(layers[0].get("epsilon", layers[0].get("eps", 1.0)))
+                    eps2 = float(layers[1].get("epsilon", layers[1].get("eps", 1.0)))
+                    if eps1 > 0:
+                        eps_ratio = max(eps2 / eps1, 1e-3)
+                except Exception:
+                    eps_ratio = 1.0
+            for layer in layers:
+                z_min = layer.get("z_min")
+                z_max = layer.get("z_max")
+                if z_min is None or z_max is None:
+                    continue
+                try:
+                    z_min_f = float(z_min)
+                    z_max_f = float(z_max)
+                except Exception:
+                    continue
+                h = abs(z_max_f - z_min_f)
+                if h <= 0.0:
+                    continue
+                if slab_h is None or h < slab_h:
+                    slab_h = h
+            if slab_h is not None:
+                imag_scale = float(slab_h)
+            interface_planes = parse_layered_interfaces(spec)
+        pole_imag_scales = [s * max(1.0, math.log1p(abs(eps_ratio))) for s in pole_imag_scales_raw]
+        pole_depth_steps = pole_depth_steps_raw
+        if is_layered and slab_h is not None:
+            pole_depth_steps = [float(step) * float(slab_h) for step in pole_depth_steps_raw]
+        pole_expand_max_eff = pole_expand_max if is_layered else 1
 
         torch.cuda.synchronize()
         retry = True
@@ -1835,6 +2336,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 fast_metrics: List[Dict[str, Any]] = []
                 n_terms_list: List[int] = []
                 complex_counts: List[int] = []
+                dcim_stats_list: List[Dict[str, Any]] = []
                 hold_cache: Dict[int, torch.Tensor] = {} if cache_hold_matrices else {}
                 for start in range(0, len(programs), score_microbatch):
                     end = min(len(programs), start + score_microbatch)
@@ -1857,21 +2359,99 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     device,
                                     strict=False,
                                 )
+                            elements = _expand_complex_poles(
+                                elements,
+                                device=device,
+                                imag_thresh=complex_imag_thresh,
+                                pole_expand_max=pole_expand_max_eff,
+                                pole_imag_scales=pole_imag_scales,
+                                pole_depth_steps=pole_depth_steps,
+                                interface_planes=interface_planes,
+                                exclusion_radius=layered_exclusion_radius if is_layered else 0.0,
+                            )
+                            elements = _expand_conjugate_components(
+                                elements,
+                                device=device,
+                                imag_thresh=complex_imag_thresh,
+                            )
                         except Exception:
                             _count_preflight("compiled_failed")
                             raise
                         if not elements:
                             _count_preflight("compiled_empty_basis")
                             fast_scores.append(float("inf"))
-                            fast_metrics.append({"empty": True, "complex_count": 0, "frac_complex": 0.0})
+                            fast_metrics.append(
+                                {
+                                    "empty": True,
+                                    "complex_count": 0,
+                                    "frac_complex": 0.0,
+                                    "dcim_block_count": 0,
+                                    "dcim_pole_count": 0,
+                                    "dcim_image_count": 0,
+                                    "max_abs_imag": 0.0,
+                                }
+                            )
                             n_terms_list.append(0)
                             complex_counts.append(0)
+                            dcim_stats_list.append(
+                                {
+                                    "dcim_block_count": 0,
+                                    "dcim_pole_count": 0,
+                                    "dcim_image_count": 0,
+                                    "dcim_term_count": 0,
+                                    "max_abs_imag": 0.0,
+                                }
+                            )
                             continue
                         _count_preflight("compiled_ok")
-                        complex_count = _count_complex_terms(elements, device=device)
+                        complex_count = _count_complex_terms(
+                            elements,
+                            device=device,
+                            thresh=complex_imag_thresh,
+                        )
+                        dcim_stats = _collect_dcim_stats(
+                            elements,
+                            device=device,
+                            imag_thresh=complex_imag_thresh,
+                        )
+                        if gen_hist is not None:
+                            _hist_inc(
+                                gen_hist["dcim_block_count_hist"],
+                                _block_count_bin(dcim_stats["dcim_block_count"]),
+                            )
+                            _hist_inc(
+                                gen_hist["dcim_pole_count_hist"],
+                                _pole_count_bin(dcim_stats["dcim_pole_count"]),
+                            )
+                            _hist_inc(
+                                gen_hist["max_abs_imag_depth_hist"],
+                                _imag_ratio_bin(dcim_stats["max_abs_imag"], imag_scale),
+                            )
+                            _hist_inc(
+                                agg_hist["dcim_block_count_hist"],
+                                _block_count_bin(dcim_stats["dcim_block_count"]),
+                            )
+                            _hist_inc(
+                                agg_hist["dcim_pole_count_hist"],
+                                _pole_count_bin(dcim_stats["dcim_pole_count"]),
+                            )
+                            _hist_inc(
+                                agg_hist["max_abs_imag_depth_hist"],
+                                _imag_ratio_bin(dcim_stats["max_abs_imag"], imag_scale),
+                            )
                         n_terms = int(len(elements))
                         frac_complex = float(complex_count) / max(1, n_terms)
                         complex_counts.append(complex_count)
+                        dcim_stats_list.append(dcim_stats)
+                        _count_preflight("candidates_total")
+                        if complex_count > 0 or dcim_stats["dcim_term_count"] > 0:
+                            _count_preflight("complex_candidates_total")
+                        if dcim_stats["dcim_term_count"] > 0 or dcim_stats["dcim_block_count"] > 0:
+                            _count_preflight("dcim_candidates_total")
+                        _count_preflight("complex_terms_total", complex_count)
+                        _count_preflight("dcim_blocks_total", dcim_stats["dcim_block_count"])
+                        _count_preflight("dcim_poles_total", dcim_stats["dcim_pole_count"])
+                        _count_preflight("dcim_images_total", dcim_stats["dcim_image_count"])
                         if is_layered and not (complex_count >= 2 or frac_complex >= 0.25):
                             _count_preflight("complex_guard_failed")
                             fast_scores.append(float("inf"))
@@ -1880,6 +2460,10 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                     "complex_guard_fail": True,
                                     "complex_count": int(complex_count),
                                     "frac_complex": float(frac_complex),
+                                    "dcim_block_count": int(dcim_stats["dcim_block_count"]),
+                                    "dcim_pole_count": int(dcim_stats["dcim_pole_count"]),
+                                    "dcim_image_count": int(dcim_stats["dcim_image_count"]),
+                                    "max_abs_imag": float(dcim_stats["max_abs_imag"]),
                                 }
                             )
                             n_terms_list.append(n_terms)
@@ -1893,6 +2477,28 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         _count_preflight("assembled_ok")
                         assert_cuda_tensor(A_train, "A_train_fast")
                         assert_cuda_tensor(A_hold, "A_hold_fast")
+                        col_norms = torch.linalg.norm(A_train, dim=0).clamp_min(1e-12)
+                        cond_ratio = float((torch.max(col_norms) / torch.min(col_norms)).item())
+                        if gen_hist is not None:
+                            _hist_inc(gen_hist["condition_ratio_hist"], _cond_ratio_bin(cond_ratio))
+                            _hist_inc(agg_hist["condition_ratio_hist"], _cond_ratio_bin(cond_ratio))
+                        if cond_ratio > conditioning_max_ratio:
+                            _count_preflight("solved_failed")
+                            fast_scores.append(float("inf"))
+                            fast_metrics.append(
+                                {
+                                    "conditioning_guard_fail": True,
+                                    "conditioning_ratio": cond_ratio,
+                                    "complex_count": int(complex_count),
+                                    "frac_complex": float(frac_complex),
+                                    "dcim_block_count": int(dcim_stats["dcim_block_count"]),
+                                    "dcim_pole_count": int(dcim_stats["dcim_pole_count"]),
+                                    "dcim_image_count": int(dcim_stats["dcim_image_count"]),
+                                    "max_abs_imag": float(dcim_stats["max_abs_imag"]),
+                                }
+                            )
+                            n_terms_list.append(n_terms)
+                            continue
                         if cache_hold_matrices:
                             hold_cache[idx] = A_hold
                         a_train_nonfinite = 0
@@ -1996,6 +2602,24 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             )
                             n_terms_list.append(n_terms)
                             continue
+                        max_abs_weight = float(torch.max(torch.abs(weights)).item()) if weights.numel() else 0.0
+                        if gen_hist is not None:
+                            _hist_inc(gen_hist["weight_magnitude_hist"], _weight_mag_bin(max_abs_weight))
+                            _hist_inc(agg_hist["weight_magnitude_hist"], _weight_mag_bin(max_abs_weight))
+                        pruned_terms = 0
+                        if pole_prune_min_weight > 0.0 and max_abs_weight > 0.0:
+                            threshold = pole_prune_min_weight * max_abs_weight
+                            keep_flags: List[bool] = []
+                            w_abs = torch.abs(weights)
+                            for j, elem in enumerate(elements):
+                                if isinstance(elem, (DCIMPoleImageBasis, DCIMBranchCutImageBasis)):
+                                    keep_flags.append(bool(float(w_abs[j].item()) >= threshold))
+                                else:
+                                    keep_flags.append(True)
+                            keep_mask = torch.tensor(keep_flags, device=weights.device)
+                            if not bool(keep_mask.all().item()):
+                                pruned_terms = int(torch.count_nonzero(~keep_mask).item())
+                                weights = weights * keep_mask.to(dtype=weights.dtype)
                         pred_hold_corr = A_hold.matmul(weights)
                         pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
                         if preflight_counters is not None:
@@ -2094,7 +2718,13 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             n_terms_list.append(n_terms)
                             continue
                         comp = _complexity(program, elements)
-                        score = w_bc * holdout_vals["mean_bc"] + w_pde * holdout_vals["mean_in"] + w_complexity * comp["n_terms"]
+                        speed_proxy = _speed_proxy(comp["n_terms"], dcim_stats)
+                        score = (
+                            w_bc * holdout_vals["mean_bc"]
+                            + w_pde * holdout_vals["mean_in"]
+                            + w_complexity * comp["n_terms"]
+                            + w_speed_proxy * speed_proxy
+                        )
                         if not _finite(score):
                             _count_preflight("holdout_nonfinite_candidate_count")
                             _log_holdout_nonfinite(
@@ -2126,6 +2756,14 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 "program_hash": meta.get("program_hash"),
                                 "complex_count": int(complex_count),
                                 "frac_complex": float(frac_complex),
+                                "speed_proxy": float(speed_proxy),
+                                "dcim_block_count": int(dcim_stats["dcim_block_count"]),
+                                "dcim_pole_count": int(dcim_stats["dcim_pole_count"]),
+                                "dcim_image_count": int(dcim_stats["dcim_image_count"]),
+                                "max_abs_imag": float(dcim_stats["max_abs_imag"]),
+                                "max_abs_weight": float(max_abs_weight),
+                                "conditioning_ratio": float(cond_ratio),
+                                "pruned_terms": int(pruned_terms),
                             }
                         )
 
@@ -2162,6 +2800,24 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             print(msg)
                             raise RuntimeError(msg)
 
+                if w_diversity > 0.0 and dcim_stats_list:
+                    sig_counts: Dict[Tuple[str, str, str], int] = {}
+                    sigs: List[Tuple[str, str, str]] = []
+                    for stats in dcim_stats_list:
+                        sig = _dcim_signature(stats, imag_scale=imag_scale)
+                        sigs.append(sig)
+                        sig_counts[sig] = sig_counts.get(sig, 0) + 1
+                    for i, sig in enumerate(sigs):
+                        stats = dcim_stats_list[i]
+                        if stats.get("dcim_term_count", 0) <= 0 and stats.get("complex_term_count", 0) <= 0:
+                            continue
+                        penalty = w_diversity * float(max(0, sig_counts.get(sig, 0) - 1))
+                        if i < len(fast_scores) and math.isfinite(float(fast_scores[i])):
+                            fast_scores[i] = float(fast_scores[i] + penalty)
+                        if i < len(fast_metrics):
+                            fast_metrics[i]["diversity_penalty"] = float(penalty)
+                            fast_metrics[i]["dcim_signature"] = [str(s) for s in sig]
+
                 top_fast_idx = _select_topk(fast_scores, topK_fast)
                 proxy_metrics_by_idx: Dict[int, Dict[str, Any]] = {}
                 if use_gate_proxies and is_layered and top_fast_idx:
@@ -2197,6 +2853,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                                 device,
                                 strict=False,
                             )
+                        elements = _expand_complex_poles(
+                            elements,
+                            device=device,
+                            imag_thresh=complex_imag_thresh,
+                            pole_expand_max=pole_expand_max_eff,
+                            pole_imag_scales=pole_imag_scales,
+                            pole_depth_steps=pole_depth_steps,
+                            interface_planes=interface_planes,
+                            exclusion_radius=layered_exclusion_radius if is_layered else 0.0,
+                        )
+                        elements = _expand_conjugate_components(
+                            elements,
+                            device=device,
+                            imag_thresh=complex_imag_thresh,
+                        )
                         if not elements:
                             continue
                         A_train = assemble_basis_matrix(elements, X_train)
@@ -2321,347 +2992,398 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                 if use_dcim_block and is_layered and dcim_block_max > 0:
                     try:
                         if spec_hash in dcim_block_cache:
-                            dcim_elements = dcim_block_cache[spec_hash]
+                            dcim_blocks = dcim_block_cache[spec_hash]
                         else:
-                            dcim_elements = _build_dcim_block_elements(
+                            dcim_cfg_values = {
+                                "k_min": dcim_k_min,
+                                "k_mid": dcim_k_mid,
+                                "k_max": dcim_k_max,
+                                "exp_N": dcim_exp_N,
+                                "log_low": dcim_log_low,
+                                "log_high": dcim_log_high,
+                            }
+                            dcim_blocks = _build_dcim_block_variants(
                                 spec,
                                 device=device,
                                 max_blocks=dcim_block_max,
                                 cache_path=dcim_cache_path,
+                                cfg_values=dcim_cfg_values,
+                                max_variants=dcim_block_variants,
+                                base_exp_N=dcim_exp_N,
+                                base_k_min=dcim_k_min,
+                                base_k_mid=dcim_k_mid,
+                                base_k_max=dcim_k_max,
+                                base_log_low=dcim_log_low,
+                                base_log_high=dcim_log_high,
                             )
-                            dcim_block_cache[spec_hash] = dcim_elements
+                            dcim_block_cache[spec_hash] = dcim_blocks
                     except Exception as exc:
                         raise RuntimeError(f"DCIM block baseline failed: {exc}") from exc
 
-                    if dcim_elements:
-                        dcim_nodes = [
-                            AddPrimitiveBlock(
-                                family_name="dcim_block_baseline",
-                                conductor_id=0,
-                                motif_id=idx,
-                            )
-                            for idx in range(len(dcim_elements))
-                        ]
-                        dcim_nodes.append(StopProgram())
-                        dcim_program = Program(nodes=tuple(dcim_nodes))
+                    if dcim_blocks:
+                        dcim_candidates: List[Tuple[str, List[ImageBasisElement], List[int]]] = []
+                        for block_idx, elems in enumerate(dcim_blocks):
+                            dcim_candidates.append((f"dcim_block_variant_{block_idx}", elems, [block_idx]))
 
-                        assert_cuda_tensor(X_train, "X_train")
-                        A_train_dcim = assemble_basis_matrix(dcim_elements, X_train)
-                        assert_cuda_tensor(A_train_dcim, "A_train_dcim")
-                        A_train_scaled, col_norms = _scale_columns(A_train_dcim)
-                        start = torch.cuda.Event(enable_timing=True)
-                        end = torch.cuda.Event(enable_timing=True)
-                        start.record()
-                        weights_scaled, _ = solve_sparse(
-                            A_train_scaled,
-                            X_train,
-                            V_train,
-                            is_boundary,
-                            _NullLogger(),
-                            reg_l1=float(solver_cfg.get("reg_l1", 1e-3)),
-                            solver=solver_mode,
-                            max_iter=int(solver_cfg.get("max_iters", 64)),
-                            tol=float(solver_cfg.get("tol", 1e-6)),
-                            lambda_group=float(solver_cfg.get("lambda_group", 0.0)),
-                            normalize_columns=False,
-                        )
-                        weights = weights_scaled / col_norms
-                        if weights.numel() > 0:
-                            assert_cuda_tensor(weights, "weights_dcim")
-                            weights_ok, reason = _validate_weights(weights)
-                            if not weights_ok:
-                                _reject_invalid_weights(
-                                    gen_idx=gen,
-                                    program_idx=-1,
-                                    program=dcim_program,
-                                    elements=dcim_elements,
-                                    A_train=A_train_dcim,
-                                    V_train=V_train,
-                                    weights=weights,
-                                    pred_hold=None,
-                                    reason=reason,
+                        if dcim_block_combo_max >= 2 and len(dcim_blocks) >= 2:
+                            base = dcim_blocks[0]
+                            combo_limit = min(len(dcim_blocks) - 1, dcim_block_combo_max - 1)
+                            for idx in range(1, combo_limit + 1):
+                                combined = base + dcim_blocks[idx]
+                                dcim_candidates.append((f"dcim_block_combo_{idx}", combined, [0, idx]))
+                        if dcim_block_combo_max >= 3 and len(dcim_blocks) >= 3:
+                            combined = dcim_blocks[0] + dcim_blocks[1] + dcim_blocks[2]
+                            dcim_candidates.append(("dcim_block_combo_3", combined, [0, 1, 2]))
+
+                        for dcim_tag, dcim_elements, dcim_variant_ids in dcim_candidates:
+                            dcim_nodes = [
+                                AddPrimitiveBlock(
+                                    family_name=dcim_tag,
+                                    conductor_id=0,
+                                    motif_id=idx,
                                 )
-                                weights = weights[:0]
-                        if weights.numel() > 0:
-                            end.record()
-                            torch.cuda.synchronize()
-                            t_solve_ms = float(start.elapsed_time(end))
+                                for idx in range(len(dcim_elements))
+                            ]
+                            dcim_nodes.append(StopProgram())
+                            dcim_program = Program(nodes=tuple(dcim_nodes))
 
-                            system = ImageSystem(dcim_elements, weights)
-
-                            A_hold_dcim = assemble_basis_matrix(dcim_elements, X_hold)
-                            assert_cuda_tensor(A_hold_dcim, "A_hold_dcim")
-                            pred_hold_corr = A_hold_dcim.matmul(weights)
-                            pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
-                            bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
-                            in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
-                            mean_bc = _mean_safe(bc_err)
-                            mean_in = _mean_safe(in_err)
-                            max_bc = float(torch.max(bc_err).item()) if bc_err.numel() else 0.0
-                            max_in = float(torch.max(in_err).item()) if in_err.numel() else 0.0
-
-                            mid_bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold_mid[is_boundary_hold])
-                            mid_in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                            mean_bc_mid = _mean_safe(mid_bc_err)
-                            mean_in_mid = _mean_safe(mid_in_err)
-                            rel_bc = mean_bc_mid / max(oracle_bc_mean_abs, 1e-12)
-                            rel_in = mean_in_mid / max(oracle_in_mean_abs, 1e-12)
-
-                            def _eval_fn(pts: torch.Tensor) -> torch.Tensor:
-                                assert_cuda_tensor(pts, "candidate_eval_points")
-                                out = system.potential(pts)
-                                if use_ref:
-                                    out = out + compute_layered_reference_potential(
-                                        spec,
-                                        pts,
-                                        device=pts.device,
-                                        dtype=pts.dtype,
+                            assert_cuda_tensor(X_train, "X_train")
+                            A_train_dcim = assemble_basis_matrix(dcim_elements, X_train)
+                            assert_cuda_tensor(A_train_dcim, "A_train_dcim")
+                            A_train_scaled, col_norms = _scale_columns(A_train_dcim)
+                            cond_ratio = float((torch.max(col_norms) / torch.min(col_norms)).item())
+                            if cond_ratio > conditioning_max_ratio:
+                                _count_preflight("solved_failed")
+                                continue
+                            start = torch.cuda.Event(enable_timing=True)
+                            end = torch.cuda.Event(enable_timing=True)
+                            start.record()
+                            weights_scaled, _ = solve_sparse(
+                                A_train_scaled,
+                                X_train,
+                                V_train,
+                                is_boundary,
+                                _NullLogger(),
+                                reg_l1=float(solver_cfg.get("reg_l1", 1e-3)),
+                                solver=solver_mode,
+                                max_iter=int(solver_cfg.get("max_iters", 64)),
+                                tol=float(solver_cfg.get("tol", 1e-6)),
+                                lambda_group=float(solver_cfg.get("lambda_group", 0.0)),
+                                normalize_columns=False,
+                            )
+                            weights = weights_scaled / col_norms
+                            if weights.numel() > 0:
+                                assert_cuda_tensor(weights, "weights_dcim")
+                                weights_ok, reason = _validate_weights(weights)
+                                if not weights_ok:
+                                    _reject_invalid_weights(
+                                        gen_idx=gen,
+                                        program_idx=-1,
+                                        program=dcim_program,
+                                        elements=dcim_elements,
+                                        A_train=A_train_dcim,
+                                        V_train=V_train,
+                                        weights=weights,
+                                        pred_hold=None,
+                                        reason=reason,
                                     )
-                                assert_cuda_tensor(out, "candidate_eval_out")
-                                return out
+                                    weights = weights[:0]
+                            if weights.numel() > 0:
+                                end.record()
+                                torch.cuda.synchronize()
+                                t_solve_ms = float(start.elapsed_time(end))
 
-                            lap = _laplacian_fd(_eval_fn, interior_hold, h=1e-2)
-                            lap_abs = torch.abs(lap)
-                            lap_mean = _mean_safe(lap_abs)
-                            lap_max = float(torch.max(lap_abs).item()) if lap_abs.numel() else 0.0
-                            rel_lap = lap_mean / lap_denom
+                                system = ImageSystem(dcim_elements, weights)
 
-                            eval_ms = _timed_cuda(_eval_fn, interior_hold, warmup=1, repeat=3)
+                                A_hold_dcim = assemble_basis_matrix(dcim_elements, X_hold)
+                                assert_cuda_tensor(A_hold_dcim, "A_hold_dcim")
+                                pred_hold_corr = A_hold_dcim.matmul(weights)
+                                pred_hold = _add_reference(pred_hold_corr, V_ref_hold)
+                                bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold[is_boundary_hold])
+                                in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold[~is_boundary_hold])
+                                mean_bc = _mean_safe(bc_err)
+                                mean_in = _mean_safe(in_err)
+                                max_bc = float(torch.max(bc_err).item()) if bc_err.numel() else 0.0
+                                max_in = float(torch.max(in_err).item()) if in_err.numel() else 0.0
 
-                            perturbed = _perturb_elements(dcim_elements, stability_sigma, device=device)
-                            stability_ratio = float("nan")
-                            if perturbed is not None:
-                                A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
-                                assert_cuda_tensor(A_hold_pert, "A_hold_dcim_pert")
-                                pert_pred_corr = A_hold_pert.matmul(weights)
-                                pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
-                                base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
-                                pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
-                                pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
-                                pert_err = w_bc * _mean_safe(pert_bc) + w_pde * _mean_safe(pert_in)
-                                stability_ratio = float(pert_err / max(base_err, 1e-8))
-                            if not math.isfinite(stability_ratio):
-                                stability_ratio = 1.0
+                                mid_bc_err = torch.abs(pred_hold[is_boundary_hold] - V_hold_mid[is_boundary_hold])
+                                mid_in_err = torch.abs(pred_hold[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
+                                mean_bc_mid = _mean_safe(mid_bc_err)
+                                mean_in_mid = _mean_safe(mid_in_err)
+                                rel_bc = mean_bc_mid / max(oracle_bc_mean_abs, 1e-12)
+                                rel_in = mean_in_mid / max(oracle_in_mean_abs, 1e-12)
 
-                            holdout_ok, holdout_vals, holdout_nonfinite = _sanitize_metric_block(
-                                {
-                                    "mean_bc": mean_bc,
-                                    "mean_in": mean_in,
-                                    "max_bc": max_bc,
-                                    "max_in": max_in,
-                                    "mean_bc_mid": mean_bc_mid,
-                                    "mean_in_mid": mean_in_mid,
-                                    "rel_bc": rel_bc,
-                                    "rel_in": rel_in,
-                                },
-                                fail_value=HOLDOUT_FAIL_VALUE,
-                            )
-                            lap_ok, lap_vals, lap_nonfinite = _sanitize_metric_block(
-                                {"lap_mean": lap_mean, "lap_max": lap_max, "rel_lap": rel_lap},
-                                fail_value=HOLDOUT_FAIL_VALUE,
-                            )
-                            holdout_nonfinite_fields = holdout_nonfinite + lap_nonfinite + holdout_partition_flags
-                            holdout_nonfinite_flag = bool(holdout_nonfinite_fields)
-                            if holdout_nonfinite_flag:
-                                _count_preflight("holdout_nonfinite_candidate_count")
-                                _count_preflight("dcim_baseline_nonfinite_count")
-                                if {"mean_in", "mean_in_mid", "rel_in", "max_in"} & set(holdout_nonfinite):
-                                    _count_preflight("interior_metric_nonfinite_count")
-                                if lap_nonfinite:
-                                    _count_preflight("lap_metric_nonfinite_count")
-                                reason = "holdout_nonfinite_dcim"
-                                if holdout_partition_flags:
-                                    reason = "holdout_partition_empty"
-                                _log_holdout_nonfinite(
-                                    gen_idx=gen,
-                                    program_idx=-1,
-                                    program=dcim_program,
-                                    elements=dcim_elements,
-                                    A_train=A_train_dcim,
-                                    V_train=V_train,
-                                    weights=weights,
-                                    pred_hold=pred_hold,
-                                    V_hold=V_hold,
-                                    V_hold_mid=V_hold_mid,
-                                    is_boundary_hold=is_boundary_hold,
-                                    lap=lap,
-                                    denom_in=oracle_in_mean_abs,
-                                    denom_lap=lap_denom,
-                                    reason=reason,
+                                def _eval_fn(pts: torch.Tensor) -> torch.Tensor:
+                                    assert_cuda_tensor(pts, "candidate_eval_points")
+                                    out = system.potential(pts)
+                                    if use_ref:
+                                        out = out + compute_layered_reference_potential(
+                                            spec,
+                                            pts,
+                                            device=pts.device,
+                                            dtype=pts.dtype,
+                                        )
+                                    assert_cuda_tensor(out, "candidate_eval_out")
+                                    return out
+
+                                lap = _laplacian_fd(_eval_fn, interior_hold, h=1e-2)
+                                lap_abs = torch.abs(lap)
+                                lap_mean = _mean_safe(lap_abs)
+                                lap_max = float(torch.max(lap_abs).item()) if lap_abs.numel() else 0.0
+                                rel_lap = lap_mean / lap_denom
+
+                                eval_ms = _timed_cuda(_eval_fn, interior_hold, warmup=1, repeat=3)
+
+                                perturbed = _perturb_elements(dcim_elements, stability_sigma, device=device)
+                                stability_ratio = float("nan")
+                                if perturbed is not None:
+                                    A_hold_pert = assemble_basis_matrix(perturbed, X_hold)
+                                    assert_cuda_tensor(A_hold_pert, "A_hold_dcim_pert")
+                                    pert_pred_corr = A_hold_pert.matmul(weights)
+                                    pert_pred = _add_reference(pert_pred_corr, V_ref_hold)
+                                    base_err = w_bc * mean_bc_mid + w_pde * mean_in_mid
+                                    pert_bc = torch.abs(pert_pred[is_boundary_hold] - V_hold_mid[is_boundary_hold])
+                                    pert_in = torch.abs(pert_pred[~is_boundary_hold] - V_hold_mid[~is_boundary_hold])
+                                    pert_err = w_bc * _mean_safe(pert_bc) + w_pde * _mean_safe(pert_in)
+                                    stability_ratio = float(pert_err / max(base_err, 1e-8))
+                                if not math.isfinite(stability_ratio):
+                                    stability_ratio = 1.0
+
+                                holdout_ok, holdout_vals, holdout_nonfinite = _sanitize_metric_block(
+                                    {
+                                        "mean_bc": mean_bc,
+                                        "mean_in": mean_in,
+                                        "max_bc": max_bc,
+                                        "max_in": max_in,
+                                        "mean_bc_mid": mean_bc_mid,
+                                        "mean_in_mid": mean_in_mid,
+                                        "rel_bc": rel_bc,
+                                        "rel_in": rel_in,
+                                    },
+                                    fail_value=HOLDOUT_FAIL_VALUE,
                                 )
-
-                            mean_bc = holdout_vals["mean_bc"]
-                            mean_in = holdout_vals["mean_in"]
-                            max_bc = holdout_vals["max_bc"]
-                            max_in = holdout_vals["max_in"]
-                            mean_bc_mid = holdout_vals["mean_bc_mid"]
-                            mean_in_mid = holdout_vals["mean_in_mid"]
-                            rel_bc = holdout_vals["rel_bc"]
-                            rel_in = holdout_vals["rel_in"]
-                            lap_mean = lap_vals["lap_mean"]
-                            lap_max = lap_vals["lap_max"]
-                            rel_lap = lap_vals["rel_lap"]
-
-                            eval_time_us = float(eval_ms * 1000.0) if _finite(eval_ms) else float(HOLDOUT_FAIL_VALUE)
-                            solve_time_us = float(t_solve_ms * 1000.0) if _finite(t_solve_ms) else float(HOLDOUT_FAIL_VALUE)
-                            if _finite(eval_ms) and _finite(t_solve_ms):
-                                total_time_us = float((eval_ms + t_solve_ms) * 1000.0)
-                            else:
-                                total_time_us = float(HOLDOUT_FAIL_VALUE)
-
-                            comp = _complexity(dcim_program, dcim_elements)
-                            complex_count = _count_complex_terms(dcim_elements, device=device)
-                            metrics = {
-                                "max_bc_err_holdout": max_bc,
-                                "mean_bc_err_holdout": mean_bc,
-                                "max_pde_err_holdout": lap_max,
-                                "mean_pde_err_holdout": lap_mean,
-                                "mid_bc_mean_abs": mean_bc_mid,
-                                "mid_pde_mean_abs": mean_in_mid,
-                                "rel_bc_err_holdout": float(rel_bc),
-                                "rel_pde_err_holdout": float(rel_in),
-                                "lap_mean_abs_holdout": float(lap_mean),
-                                "rel_lap_holdout": float(rel_lap),
-                                "oracle_bc_mean_abs_holdout": float(oracle_bc_mean_abs),
-                                "oracle_in_mean_abs_holdout": float(oracle_in_mean_abs),
-                                "stability_ratio": stability_ratio,
-                                "eval_time_us": eval_time_us,
-                                "solve_time_us": solve_time_us,
-                                "total_time_us": total_time_us,
-                                "complexity_terms": comp["n_terms"],
-                                "complexity_nodes": comp["n_nodes"],
-                                "n_terms": comp["n_terms"],
-                                "complex_count": int(complex_count),
-                                "is_dcim_block_baseline": True,
-                                "dcim_block_weight": float(dcim_block_weight),
-                                "candidate_name": "dcim_block_baseline",
-                            }
-                            if holdout_nonfinite_flag:
-                                metrics["holdout_nonfinite"] = True
-                                metrics["holdout_nonfinite_fields"] = holdout_nonfinite_fields
-                            if use_gate_proxies and is_layered:
-                                proxy_pts = build_proxy_stability_points(
-                                    bc_hold,
-                                    interior_hold,
-                                    int(verify_plan.samples.get("D_points", 128)),
+                                lap_ok, lap_vals, lap_nonfinite = _sanitize_metric_block(
+                                    {"lap_mean": lap_mean, "lap_max": lap_max, "rel_lap": rel_lap},
+                                    fail_value=HOLDOUT_FAIL_VALUE,
                                 )
-                                proxy_metrics = {}
-                                if use_gateA_proxy:
+                                holdout_nonfinite_fields = holdout_nonfinite + lap_nonfinite + holdout_partition_flags
+                                holdout_nonfinite_flag = bool(holdout_nonfinite_fields)
+                                if holdout_nonfinite_flag:
+                                    _count_preflight("holdout_nonfinite_candidate_count")
+                                    _count_preflight("dcim_baseline_nonfinite_count")
+                                    if {"mean_in", "mean_in_mid", "rel_in", "max_in"} & set(holdout_nonfinite):
+                                        _count_preflight("interior_metric_nonfinite_count")
+                                    if lap_nonfinite:
+                                        _count_preflight("lap_metric_nonfinite_count")
+                                    reason = "holdout_nonfinite_dcim"
+                                    if holdout_partition_flags:
+                                        reason = "holdout_partition_empty"
+                                    _log_holdout_nonfinite(
+                                        gen_idx=gen,
+                                        program_idx=-1,
+                                        program=dcim_program,
+                                        elements=dcim_elements,
+                                        A_train=A_train_dcim,
+                                        V_train=V_train,
+                                        weights=weights,
+                                        pred_hold=pred_hold,
+                                        V_hold=V_hold,
+                                        V_hold_mid=V_hold_mid,
+                                        is_boundary_hold=is_boundary_hold,
+                                        lap=lap,
+                                        denom_in=oracle_in_mean_abs,
+                                        denom_lap=lap_denom,
+                                        reason=reason,
+                                    )
+
+                                mean_bc = holdout_vals["mean_bc"]
+                                mean_in = holdout_vals["mean_in"]
+                                max_bc = holdout_vals["max_bc"]
+                                max_in = holdout_vals["max_in"]
+                                mean_bc_mid = holdout_vals["mean_bc_mid"]
+                                mean_in_mid = holdout_vals["mean_in_mid"]
+                                rel_bc = holdout_vals["rel_bc"]
+                                rel_in = holdout_vals["rel_in"]
+                                lap_mean = lap_vals["lap_mean"]
+                                lap_max = lap_vals["lap_max"]
+                                rel_lap = lap_vals["rel_lap"]
+
+                                eval_time_us = float(eval_ms * 1000.0) if _finite(eval_ms) else float(HOLDOUT_FAIL_VALUE)
+                                solve_time_us = float(t_solve_ms * 1000.0) if _finite(t_solve_ms) else float(HOLDOUT_FAIL_VALUE)
+                                if _finite(eval_ms) and _finite(t_solve_ms):
+                                    total_time_us = float((eval_ms + t_solve_ms) * 1000.0)
+                                else:
+                                    total_time_us = float(HOLDOUT_FAIL_VALUE)
+
+                                comp = _complexity(dcim_program, dcim_elements)
+                                complex_count = _count_complex_terms(dcim_elements, device=device)
+                                dcim_stats = _collect_dcim_stats(
+                                    dcim_elements,
+                                    device=device,
+                                    imag_thresh=complex_imag_thresh,
+                                )
+                                max_abs_weight = float(torch.max(torch.abs(weights)).item()) if weights.numel() else 0.0
+                                metrics = {
+                                    "max_bc_err_holdout": max_bc,
+                                    "mean_bc_err_holdout": mean_bc,
+                                    "max_pde_err_holdout": lap_max,
+                                    "mean_pde_err_holdout": lap_mean,
+                                    "mid_bc_mean_abs": mean_bc_mid,
+                                    "mid_pde_mean_abs": mean_in_mid,
+                                    "rel_bc_err_holdout": float(rel_bc),
+                                    "rel_pde_err_holdout": float(rel_in),
+                                    "lap_mean_abs_holdout": float(lap_mean),
+                                    "rel_lap_holdout": float(rel_lap),
+                                    "oracle_bc_mean_abs_holdout": float(oracle_bc_mean_abs),
+                                    "oracle_in_mean_abs_holdout": float(oracle_in_mean_abs),
+                                    "stability_ratio": stability_ratio,
+                                    "eval_time_us": eval_time_us,
+                                    "solve_time_us": solve_time_us,
+                                    "total_time_us": total_time_us,
+                                    "complexity_terms": comp["n_terms"],
+                                    "complexity_nodes": comp["n_nodes"],
+                                    "n_terms": comp["n_terms"],
+                                    "complex_count": int(complex_count),
+                                    "dcim_block_count": int(dcim_stats["dcim_block_count"]),
+                                    "dcim_pole_count": int(dcim_stats["dcim_pole_count"]),
+                                    "dcim_image_count": int(dcim_stats["dcim_image_count"]),
+                                    "max_abs_imag": float(dcim_stats["max_abs_imag"]),
+                                    "max_abs_weight": float(max_abs_weight),
+                                    "conditioning_ratio": float(cond_ratio),
+                                    "is_dcim_block_baseline": True,
+                                    "dcim_block_weight": float(dcim_block_weight),
+                                    "candidate_name": dcim_tag,
+                                    "dcim_variant_ids": [int(v) for v in dcim_variant_ids],
+                                    "speed_proxy": float(speed_proxy),
+                                }
+                                if holdout_nonfinite_flag:
+                                    metrics["holdout_nonfinite"] = True
+                                    metrics["holdout_nonfinite_fields"] = holdout_nonfinite_fields
+                                if use_gate_proxies and is_layered:
+                                    proxy_pts = build_proxy_stability_points(
+                                        bc_hold,
+                                        interior_hold,
+                                        int(verify_plan.samples.get("D_points", 128)),
+                                    )
+                                    proxy_metrics = {}
+                                    if use_gateA_proxy:
+                                        proxy_metrics.update(
+                                            proxy_gateA(
+                                                spec,
+                                                _eval_fn,
+                                                n_interior=int(verify_plan.samples.get("A_interior", 128)),
+                                                exclusion_radius=float(
+                                                    verify_plan.thresholds.get("laplacian_exclusion_radius", 5e-2)
+                                                ),
+                                                fd_h=float(verify_plan.thresholds.get("laplacian_fd_h", 2e-2)),
+                                                prefer_autograd=bool(
+                                                    verify_plan.thresholds.get("laplacian_prefer_autograd", 1.0)
+                                                ),
+                                                interface_band=float(
+                                                    verify_plan.thresholds.get("laplacian_interface_band", 0.0)
+                                                ),
+                                                device=device,
+                                                dtype=torch.float32,
+                                                seed=seed_gen + 1,
+                                                linf_tol=float(verify_plan.thresholds.get("laplacian_linf", 5e-3)),
+                                            )
+                                        )
                                     proxy_metrics.update(
-                                        proxy_gateA(
+                                        proxy_gateB(
                                             spec,
                                             _eval_fn,
-                                            n_interior=int(verify_plan.samples.get("A_interior", 128)),
-                                            exclusion_radius=float(
-                                                verify_plan.thresholds.get("laplacian_exclusion_radius", 5e-2)
-                                            ),
-                                            fd_h=float(verify_plan.thresholds.get("laplacian_fd_h", 2e-2)),
-                                            prefer_autograd=bool(
-                                                verify_plan.thresholds.get("laplacian_prefer_autograd", 1.0)
-                                            ),
-                                            interface_band=float(
-                                                verify_plan.thresholds.get("laplacian_interface_band", 0.0)
-                                            ),
+                                            n_xy=int(verify_plan.samples.get("B_boundary", 96)),
+                                            delta=layered_interface_delta,
                                             device=device,
                                             dtype=torch.float32,
-                                            seed=seed_gen + 1,
-                                            linf_tol=float(verify_plan.thresholds.get("laplacian_linf", 5e-3)),
+                                            seed=seed_gen + 3,
                                         )
                                     )
-                                proxy_metrics.update(
-                                    proxy_gateB(
-                                        spec,
-                                        _eval_fn,
-                                        n_xy=int(verify_plan.samples.get("B_boundary", 96)),
-                                        delta=layered_interface_delta,
-                                        device=device,
-                                        dtype=torch.float32,
-                                        seed=seed_gen + 3,
+                                    proxy_metrics.update(
+                                        proxy_gateC(
+                                            _eval_fn,
+                                            near_radii=(0.125, 0.5),
+                                            far_radii=(10.0, 20.0),
+                                            n_dir=int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96))),
+                                            device=device,
+                                            dtype=torch.float32,
+                                            seed=seed_gen + 5,
+                                        )
                                     )
-                                )
-                                proxy_metrics.update(
-                                    proxy_gateC(
-                                        _eval_fn,
-                                        near_radii=(0.125, 0.5),
-                                        far_radii=(10.0, 20.0),
-                                        n_dir=int(min(verify_plan.samples.get("C_far", 96), verify_plan.samples.get("C_near", 96))),
-                                        device=device,
-                                        dtype=torch.float32,
-                                        seed=seed_gen + 5,
+                                    proxy_metrics.update(
+                                        proxy_gateD(
+                                            _eval_fn,
+                                            proxy_pts,
+                                            delta=layered_stability_delta,
+                                            seed=seed_gen + 7,
+                                        )
                                     )
-                                )
-                                proxy_metrics.update(
-                                    proxy_gateD(
-                                        _eval_fn,
-                                        proxy_pts,
-                                        delta=layered_stability_delta,
-                                        seed=seed_gen + 7,
+                                    proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
+                                    proxy_score, score_sanitized = _proxy_score_with_sanitized(
+                                        proxy_metrics,
+                                        a_weight=proxyA_weight,
+                                        a_cap=proxyA_cap,
+                                        a_transform=proxyA_transform,
                                     )
+                                    proxy_metrics["proxy_score"] = proxy_score
+                                    if score_sanitized:
+                                        proxy_metrics["proxy_score_nonfinite_sanitized"] = True
+                                        _count_preflight("proxy_score_nonfinite_sanitized")
+                                    _count_preflight("proxy_computed_count")
+                                    metrics.update(proxy_metrics)
+                                speed_proxy = float(comp["n_terms"] + dcim_stats["dcim_block_count"] * 4)
+                                score_mid = (
+                                    w_bc * rel_bc
+                                    + w_pde * rel_lap
+                                    + w_complexity * comp["n_terms"]
+                                    + w_latency * (metrics["eval_time_us"] / 1e6)
+                                    + w_stability * stability_ratio
+                                    + w_speed_proxy * speed_proxy
                                 )
-                                proxy_metrics["proxy_fail_count"] = _proxy_fail_count(proxy_metrics, verify_plan.thresholds)
-                                proxy_score, score_sanitized = _proxy_score_with_sanitized(
-                                    proxy_metrics,
-                                    a_weight=proxyA_weight,
-                                    a_cap=proxyA_cap,
-                                    a_transform=proxyA_transform,
+                                if not _finite(score_mid):
+                                    _count_preflight("holdout_nonfinite_candidate_count")
+                                    _count_preflight("dcim_baseline_nonfinite_count")
+                                    _log_holdout_nonfinite(
+                                        gen_idx=gen,
+                                        program_idx=-1,
+                                        program=dcim_program,
+                                        elements=dcim_elements,
+                                        A_train=A_train_dcim,
+                                        V_train=V_train,
+                                        weights=weights,
+                                        pred_hold=pred_hold,
+                                        V_hold=V_hold,
+                                        V_hold_mid=V_hold_mid,
+                                        is_boundary_hold=is_boundary_hold,
+                                        lap=lap,
+                                        denom_in=oracle_in_mean_abs,
+                                        denom_lap=lap_denom,
+                                        reason="score_nonfinite_dcim",
+                                    )
+                                    metrics["holdout_nonfinite"] = True
+                                    score_mid = float(HOLDOUT_FAIL_VALUE)
+                                if not metrics.get("holdout_nonfinite") and math.isfinite(float(rel_bc)) and (
+                                    best_dcim_rel_bc is None or float(rel_bc) < best_dcim_rel_bc
+                                ):
+                                    best_dcim_rel_bc = float(rel_bc)
+                                if not metrics.get("holdout_nonfinite") and math.isfinite(float(rel_lap)) and (
+                                    best_dcim_rel_lap is None or float(rel_lap) < best_dcim_rel_lap
+                                ):
+                                    best_dcim_rel_lap = float(rel_lap)
+                                if not metrics.get("holdout_nonfinite") and math.isfinite(float(score_mid)) and (
+                                    best_dcim_score is None or float(score_mid) < best_dcim_score
+                                ):
+                                    best_dcim_score = float(score_mid)
+                                _count_preflight("mid_scored")
+                                fitted_candidates.append(
+                                    {
+                                        "program": dcim_program,
+                                        "elements": dcim_elements,
+                                        "weights": weights,
+                                        "metrics": metrics,
+                                        "score": float(score_mid),
+                                    }
                                 )
-                                proxy_metrics["proxy_score"] = proxy_score
-                                if score_sanitized:
-                                    proxy_metrics["proxy_score_nonfinite_sanitized"] = True
-                                    _count_preflight("proxy_score_nonfinite_sanitized")
-                                _count_preflight("proxy_computed_count")
-                                metrics.update(proxy_metrics)
-                            score_mid = (
-                                w_bc * rel_bc
-                                + w_pde * rel_lap
-                                + w_complexity * comp["n_terms"]
-                                + w_latency * (metrics["eval_time_us"] / 1e6)
-                                + w_stability * stability_ratio
-                            )
-                            if not _finite(score_mid):
-                                _count_preflight("holdout_nonfinite_candidate_count")
-                                _count_preflight("dcim_baseline_nonfinite_count")
-                                _log_holdout_nonfinite(
-                                    gen_idx=gen,
-                                    program_idx=-1,
-                                    program=dcim_program,
-                                    elements=dcim_elements,
-                                    A_train=A_train_dcim,
-                                    V_train=V_train,
-                                    weights=weights,
-                                    pred_hold=pred_hold,
-                                    V_hold=V_hold,
-                                    V_hold_mid=V_hold_mid,
-                                    is_boundary_hold=is_boundary_hold,
-                                    lap=lap,
-                                    denom_in=oracle_in_mean_abs,
-                                    denom_lap=lap_denom,
-                                    reason="score_nonfinite_dcim",
-                                )
-                                metrics["holdout_nonfinite"] = True
-                                score_mid = float(HOLDOUT_FAIL_VALUE)
-                            if not metrics.get("holdout_nonfinite") and math.isfinite(float(rel_bc)) and (
-                                best_dcim_rel_bc is None or float(rel_bc) < best_dcim_rel_bc
-                            ):
-                                best_dcim_rel_bc = float(rel_bc)
-                            if not metrics.get("holdout_nonfinite") and math.isfinite(float(rel_lap)) and (
-                                best_dcim_rel_lap is None or float(rel_lap) < best_dcim_rel_lap
-                            ):
-                                best_dcim_rel_lap = float(rel_lap)
-                            if not metrics.get("holdout_nonfinite") and math.isfinite(float(score_mid)) and (
-                                best_dcim_score is None or float(score_mid) < best_dcim_score
-                            ):
-                                best_dcim_score = float(score_mid)
-                            _count_preflight("mid_scored")
-                            fitted_candidates.append(
-                                {
-                                    "program": dcim_program,
-                                    "elements": dcim_elements,
-                                    "weights": weights,
-                                    "metrics": metrics,
-                                    "score": float(score_mid),
-                                }
-                            )
                 for rank, idx in enumerate(top_fast_idx):
                     program = programs[idx]
                     if is_layered:
@@ -2685,6 +3407,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             device,
                             strict=False,
                         )
+                    elements = _expand_complex_poles(
+                        elements,
+                        device=device,
+                        imag_thresh=complex_imag_thresh,
+                        pole_expand_max=pole_expand_max_eff,
+                        pole_imag_scales=pole_imag_scales,
+                        pole_depth_steps=pole_depth_steps,
+                        interface_planes=interface_planes,
+                        exclusion_radius=layered_exclusion_radius if is_layered else 0.0,
+                    )
+                    elements = _expand_conjugate_components(
+                        elements,
+                        device=device,
+                        imag_thresh=complex_imag_thresh,
+                    )
                     if not elements:
                         continue
 
@@ -2855,6 +3592,12 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                     comp = _complexity(program, elements)
                     complex_count = _count_complex_terms(elements, device=device)
+                    dcim_stats = _collect_dcim_stats(
+                        elements,
+                        device=device,
+                        imag_thresh=complex_imag_thresh,
+                    )
+                    speed_proxy = _speed_proxy(comp["n_terms"], dcim_stats)
                     metrics = {
                         "max_bc_err_holdout": max_bc,
                         "mean_bc_err_holdout": mean_bc,
@@ -2876,6 +3619,11 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         "complexity_nodes": comp["n_nodes"],
                         "n_terms": comp["n_terms"],
                         "complex_count": int(complex_count),
+                        "dcim_block_count": int(dcim_stats["dcim_block_count"]),
+                        "dcim_pole_count": int(dcim_stats["dcim_pole_count"]),
+                        "dcim_image_count": int(dcim_stats["dcim_image_count"]),
+                        "max_abs_imag": float(dcim_stats["max_abs_imag"]),
+                        "speed_proxy": float(speed_proxy),
                     }
                     if holdout_nonfinite_flag:
                         metrics["holdout_nonfinite"] = True
@@ -2890,6 +3638,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         + w_complexity * comp["n_terms"]
                         + w_latency * (metrics["eval_time_us"] / 1e6)
                         + w_stability * stability_ratio
+                        + w_speed_proxy * speed_proxy
                     )
                     if not _finite(score_mid):
                         _count_preflight("holdout_nonfinite_candidate_count")
@@ -3348,6 +4097,12 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
 
                         comp = _complexity(cand["program"], refine_elements)
                         complex_count = _count_complex_terms(refine_elements, device=device)
+                        dcim_stats = _collect_dcim_stats(
+                            refine_elements,
+                            device=device,
+                            imag_thresh=complex_imag_thresh,
+                        )
+                        speed_proxy = _speed_proxy(comp["n_terms"], dcim_stats)
                         metrics = {
                             "max_bc_err_holdout": max_bc,
                             "mean_bc_err_holdout": mean_bc,
@@ -3369,6 +4124,11 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             "complexity_nodes": comp["n_nodes"],
                             "n_terms": comp["n_terms"],
                             "complex_count": int(complex_count),
+                            "dcim_block_count": int(dcim_stats["dcim_block_count"]),
+                            "dcim_pole_count": int(dcim_stats["dcim_pole_count"]),
+                            "dcim_image_count": int(dcim_stats["dcim_image_count"]),
+                            "max_abs_imag": float(dcim_stats["max_abs_imag"]),
+                            "speed_proxy": float(speed_proxy),
                             "refine_applied": True,
                         }
                         score_mid = (
@@ -3377,6 +4137,7 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                             + w_complexity * comp["n_terms"]
                             + w_latency * (metrics["eval_time_us"] / 1e6)
                             + w_stability * stability_ratio
+                            + w_speed_proxy * speed_proxy
                         )
 
                         rel_bc_val = float(rel_bc)
@@ -3542,6 +4303,21 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                     entry = {"gen": int(gen), "counters": gen_counters.as_dict()}
                     if holdout_stats:
                         entry["holdout"] = dict(holdout_stats)
+                    cand_total = max(1, gen_counters.candidates_total)
+                    frac_complex = float(gen_counters.complex_candidates_total) / float(cand_total)
+                    frac_dcim = float(gen_counters.dcim_candidates_total) / float(cand_total)
+                    entry["fraction_complex_candidates"] = frac_complex
+                    entry["fraction_dcim_candidates"] = frac_dcim
+                    if gen_hist is not None:
+                        entry.update(
+                            {
+                                "dcim_block_count_hist": dict(gen_hist["dcim_block_count_hist"]),
+                                "dcim_pole_count_hist": dict(gen_hist["dcim_pole_count_hist"]),
+                                "max_abs_imag_depth_hist": dict(gen_hist["max_abs_imag_depth_hist"]),
+                                "weight_magnitude_hist": dict(gen_hist["weight_magnitude_hist"]),
+                                "condition_ratio_hist": dict(gen_hist["condition_ratio_hist"]),
+                            }
+                        )
                     per_gen_preflight.append(entry)
                     print(
                         "PREFLIGHT "
@@ -3551,6 +4327,25 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
                         f"fast_scored={gen_counters.fast_scored} "
                         f"verified_written={gen_counters.verified_written}"
                     )
+                    if prefer_dcim and is_layered:
+                        if frac_complex < dcim_guard_min_fraction:
+                            complex_guard_streak += 1
+                        else:
+                            complex_guard_streak = 0
+                        if frac_dcim < dcim_guard_min_fraction:
+                            dcim_guard_streak += 1
+                        else:
+                            dcim_guard_streak = 0
+                        if complex_guard_streak > dcim_guard_patience or dcim_guard_streak > dcim_guard_patience:
+                            msg = (
+                                "DCIM/complex emission guard tripped: "
+                                f"fraction_complex={frac_complex:.2%} "
+                                f"fraction_dcim={frac_dcim:.2%} "
+                                f"min={dcim_guard_min_fraction:.0%} "
+                                f"patience>{dcim_guard_patience}."
+                            )
+                            print(msg)
+                            raise RuntimeError(msg)
 
                 if ramp_check:
                     improved = False
@@ -3822,6 +4617,31 @@ def run_discovery(config_path: Path, *, debug: bool = False) -> int:
             "nonfinite_pred_fraction": float(preflight_counters.nonfinite_pred_count) / float(nonfinite_total),
             "per_gen": per_gen_preflight,
         }
+        cand_total = max(1, preflight_counters.candidates_total)
+        extra["fraction_complex_candidates"] = float(preflight_counters.complex_candidates_total) / float(cand_total)
+        extra["fraction_dcim_candidates"] = float(preflight_counters.dcim_candidates_total) / float(cand_total)
+        extra["dcim_block_count_hist"] = dict(agg_hist["dcim_block_count_hist"])
+        extra["dcim_pole_count_hist"] = dict(agg_hist["dcim_pole_count_hist"])
+        extra["max_abs_imag_depth_hist"] = dict(agg_hist["max_abs_imag_depth_hist"])
+        extra["weight_magnitude_hist"] = dict(agg_hist["weight_magnitude_hist"])
+        extra["condition_ratio_hist"] = dict(agg_hist["condition_ratio_hist"])
+        try:
+            probe_pts = torch.zeros((1, 3), device=device, dtype=torch.float32)
+            probe_query = OracleQuery(
+                spec=spec.to_json(),
+                points=probe_pts,
+                quantity=OracleQuantity.POTENTIAL,
+                requested_fidelity=fast_fidelity,
+                device=str(device),
+                dtype=normalize_dtype(torch.float32),
+                cache_policy=CachePolicy.OFF,
+                budget={},
+            )
+            baseline_backend = verifier._baseline_backend(spec.to_json(), fast_fidelity, probe_query)
+            if baseline_backend is not None:
+                extra["baseline_speed_backend_name"] = str(getattr(baseline_backend, "name", "unknown"))
+        except Exception:
+            pass
         if weights_reject_reasons:
             extra["weights_reject_reasons"] = sorted(weights_reject_reasons)
         if holdout_reject_reasons:

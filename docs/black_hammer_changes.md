@@ -111,3 +111,14 @@
   - `pytest -q tests/test_gate_proxies.py -vv -rs --maxfail=1`
   - `pytest -q tests/test_proxyA_transform.py -vv -rs --maxfail=1`
 - validate: proxy Gate B/D metrics and proxy_score remain finite under extreme magnitudes and large runs no longer emit NaN/Infinity proxy fields.
+
+## Phase 5: Complex/DCIM expansion + preflight diagnostics
+- change: added conjugate-pair complex components for DCIM pole/branch-cut bases; expanded complex pole clusters and multi-block DCIM variants; added speed proxy + DCIM diversity penalty into discovery scoring.
+- change: preflight now tracks complex/DCIM candidate fractions, pole/block/imag/weight histograms, and conditioning ratios with a guard for low complex/DCIM emission.
+- why: increase expressive complex/DCIM search coverage while keeping runs diagnosable and gate-aligned.
+- reproduce:
+  - `pytest -q electrodrive/images/tests/test_complex_pair_components.py -vv -rs --maxfail=1`
+  - `pytest -q electrodrive/images/tests/test_basis_dcim.py -k "multi_block_shape" -vv -rs --maxfail=1`
+  - `pytest -q tests/test_pole_expansion_determinism.py -vv -rs --maxfail=1`
+  - `pytest -q tests/test_proxy_score_sanity.py -vv -rs --maxfail=1`
+- validate: preflight reports `fraction_complex_candidates`/`fraction_dcim_candidates` plus DCIM histograms, and complex pair components match the GFDSL kernel on CUDA.

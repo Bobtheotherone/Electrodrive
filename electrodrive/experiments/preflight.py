@@ -12,6 +12,13 @@ class RunCounters:
     compiled_ok: int = 0
     compiled_empty_basis: int = 0
     compiled_failed: int = 0
+    candidates_total: int = 0
+    complex_candidates_total: int = 0
+    dcim_candidates_total: int = 0
+    complex_terms_total: int = 0
+    dcim_blocks_total: int = 0
+    dcim_poles_total: int = 0
+    dcim_images_total: int = 0
     assembled_ok: int = 0
     assembled_failed: int = 0
     solved_ok: int = 0
@@ -83,6 +90,8 @@ def summarize_to_stdout(counters: RunCounters) -> None:
         f" compiled_ok={c.compiled_ok}"
         f" empty_basis={c.compiled_empty_basis}"
         f" compiled_failed={c.compiled_failed}"
+        f" complex_candidates={c.complex_candidates_total}"
+        f" dcim_candidates={c.dcim_candidates_total}"
         f" solved_ok={c.solved_ok}"
         f" fast_scored={c.fast_scored}"
         f" verified_written={c.verified_written}"

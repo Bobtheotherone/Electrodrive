@@ -13,7 +13,13 @@ run:
   topk_final: 4
   fixed_spec: true
   use_dcim_block: true
-  dcim_block_max: 1
+  dcim_block_max: 24
+  dcim_block_variants: 3
+  dcim_block_combo_max: 2
+  dcim_exp_N: 8
+  pole_expand_max: 3
+  pole_prune_min_weight: 1.0e-3
+  conditioning_max_ratio: 1.0e8
   use_hi_oracle: false
   ramp_check: false
   allow_not_ready: true
@@ -50,6 +56,8 @@ reward:
   w_complexity: 0.02
   w_latency: 0.10
   w_stability: 0.10
+  w_speed_proxy: 0.05
+  w_diversity: 0.02
   stability_perturb_sigma: 1e-3
 
 model:

@@ -6,6 +6,7 @@ import torch
 
 from electrodrive.images.basis import generate_candidate_basis
 from electrodrive.images.basis_dcim import DCIMBlockBasis, dcim_basis_from_block
+from electrodrive.images.search import ImageSystem
 from electrodrive.layers import DCIMCompilerConfig, SpectralKernelSpec, compile_dcim, layerstack_from_spec
 from electrodrive.layers.dcim_compiler import _image_domain_potential, _reflected_potential
 from electrodrive.layers.rt_recursion import effective_reflection
@@ -184,3 +185,22 @@ def test_dcim_basis_against_oracle_speed_and_accuracy():
     rel_err = torch.linalg.norm(V_dcim - V_ref_oracle) / torch.linalg.norm(V_ref_oracle).clamp_min(1e-12)
     assert rel_err.item() < 0.2
     assert dcim_ms < oracle_ms * 2.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required.")
+def test_dcim_imagesystem_multi_block_shape_cuda() -> None:
+    spec = _three_layer_spec(eps2=4.0, h=0.4)
+    block, device, _ = _compile_block(spec)
+    elems = dcim_basis_from_block(block)
+    elems = elems[:4] + elems[:4]
+    weights = torch.ones(len(elems), device=device, dtype=torch.float32)
+    system = ImageSystem(elems, weights)
+    targets = torch.tensor(
+        [[0.2, -0.1, 0.4], [0.1, 0.3, 0.6], [0.0, -0.2, 0.8]],
+        device=device,
+        dtype=torch.float32,
+    )
+    V = system.potential(targets)
+    assert V.is_cuda
+    assert V.shape == (targets.shape[0],)
+    assert V.dtype in (torch.float32, torch.float64)

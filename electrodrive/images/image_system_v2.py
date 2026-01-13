@@ -45,9 +45,12 @@ class ImageSystemV2:
 
         self._point_real_pos: Optional[torch.Tensor] = None
         self._point_real_idx: Optional[torch.Tensor] = None
-        self._point_complex_pos: Optional[torch.Tensor] = None
-        self._point_complex_idx: Optional[torch.Tensor] = None
-        self._point_complex_z_imag: Optional[torch.Tensor] = None
+        self._point_complex_real_pos: Optional[torch.Tensor] = None
+        self._point_complex_real_idx: Optional[torch.Tensor] = None
+        self._point_complex_real_z_imag: Optional[torch.Tensor] = None
+        self._point_complex_imag_pos: Optional[torch.Tensor] = None
+        self._point_complex_imag_idx: Optional[torch.Tensor] = None
+        self._point_complex_imag_z_imag: Optional[torch.Tensor] = None
         self._dcim_elems: List[DCIMBlockBasis] = []
         self._dcim_idx: List[int] = []
         self._fallback_elems: List[ImageBasisElement] = []
@@ -58,9 +61,12 @@ class ImageSystemV2:
     def _pack_elements(self) -> None:
         point_real_pos: List[torch.Tensor] = []
         point_real_idx: List[int] = []
-        point_complex_pos: List[torch.Tensor] = []
-        point_complex_idx: List[int] = []
-        point_complex_z: List[torch.Tensor] = []
+        point_complex_real_pos: List[torch.Tensor] = []
+        point_complex_real_idx: List[int] = []
+        point_complex_real_z: List[torch.Tensor] = []
+        point_complex_imag_pos: List[torch.Tensor] = []
+        point_complex_imag_idx: List[int] = []
+        point_complex_imag_z: List[torch.Tensor] = []
 
         for idx, elem in enumerate(self.elements):
             if isinstance(elem, DCIMBlockBasis):
@@ -74,9 +80,26 @@ class ImageSystemV2:
                 if use_complex:
                     z_imag = elem.params.get("z_imag")
                     z_imag_t = torch.as_tensor(z_imag if z_imag is not None else 0.0, device=self.device, dtype=self.dtype).view(())
-                    point_complex_pos.append(pos)
-                    point_complex_z.append(z_imag_t)
-                    point_complex_idx.append(idx)
+                    component = elem.params.get("component")
+                    is_imag = False
+                    if component is not None:
+                        try:
+                            if torch.is_tensor(component):
+                                is_imag = bool(float(component.item()) >= 0.5)
+                            elif isinstance(component, (int, float)):
+                                is_imag = bool(float(component) >= 0.5)
+                            elif isinstance(component, str):
+                                is_imag = component.strip().lower().startswith("imag")
+                        except Exception:
+                            is_imag = False
+                    if is_imag:
+                        point_complex_imag_pos.append(pos)
+                        point_complex_imag_z.append(z_imag_t)
+                        point_complex_imag_idx.append(idx)
+                    else:
+                        point_complex_real_pos.append(pos)
+                        point_complex_real_z.append(z_imag_t)
+                        point_complex_real_idx.append(idx)
                 else:
                     point_real_pos.append(pos)
                     point_real_idx.append(idx)
@@ -88,10 +111,14 @@ class ImageSystemV2:
         if point_real_pos:
             self._point_real_pos = torch.stack(point_real_pos, dim=0).contiguous()
             self._point_real_idx = torch.tensor(point_real_idx, device=self.device, dtype=torch.long)
-        if point_complex_pos:
-            self._point_complex_pos = torch.stack(point_complex_pos, dim=0).contiguous()
-            self._point_complex_idx = torch.tensor(point_complex_idx, device=self.device, dtype=torch.long)
-            self._point_complex_z_imag = torch.stack(point_complex_z, dim=0).contiguous()
+        if point_complex_real_pos:
+            self._point_complex_real_pos = torch.stack(point_complex_real_pos, dim=0).contiguous()
+            self._point_complex_real_idx = torch.tensor(point_complex_real_idx, device=self.device, dtype=torch.long)
+            self._point_complex_real_z_imag = torch.stack(point_complex_real_z, dim=0).contiguous()
+        if point_complex_imag_pos:
+            self._point_complex_imag_pos = torch.stack(point_complex_imag_pos, dim=0).contiguous()
+            self._point_complex_imag_idx = torch.tensor(point_complex_imag_idx, device=self.device, dtype=torch.long)
+            self._point_complex_imag_z_imag = torch.stack(point_complex_imag_z, dim=0).contiguous()
 
     def _gather_weights(self, idx: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if idx is None:
@@ -120,23 +147,43 @@ class ImageSystemV2:
             if w is not None:
                 V = V + phi @ w
 
-        if self._point_complex_pos is not None and self._point_complex_z_imag is not None:
-            pos = self._point_complex_pos.to(dtype=compute_dtype)
-            w = self._gather_weights(self._point_complex_idx)
+        if self._point_complex_real_pos is not None and self._point_complex_real_z_imag is not None:
+            pos = self._point_complex_real_pos.to(dtype=compute_dtype)
+            w = self._gather_weights(self._point_complex_real_idx)
             if w is not None:
                 w = w.to(dtype=compute_dtype)
                 complex_real_dtype = torch.float64 if compute_dtype == torch.float64 else torch.float32
                 Xc = X.to(dtype=complex_real_dtype)
                 pos_c = pos.to(dtype=complex_real_dtype)
-                z_imag = self._point_complex_z_imag.to(dtype=complex_real_dtype)
+                z_imag = self._point_complex_real_z_imag.to(dtype=complex_real_dtype)
 
                 dx = Xc[:, None, 0] - pos_c[None, :, 0]
                 dy = Xc[:, None, 1] - pos_c[None, :, 1]
                 dz = Xc[:, None, 2] - pos_c[None, :, 2]
-                dz_complex = torch.complex(dz, z_imag.view(1, -1).expand_as(dz))
+                dz_complex = torch.complex(dz, -z_imag.view(1, -1).expand_as(dz))
                 r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
                 inv_r = 1.0 / torch.sqrt(r2_complex)
                 phi = 2.0 * inv_r.real
+                phi = (K_E * phi).to(dtype=compute_dtype)
+                V = V + phi @ w
+
+        if self._point_complex_imag_pos is not None and self._point_complex_imag_z_imag is not None:
+            pos = self._point_complex_imag_pos.to(dtype=compute_dtype)
+            w = self._gather_weights(self._point_complex_imag_idx)
+            if w is not None:
+                w = w.to(dtype=compute_dtype)
+                complex_real_dtype = torch.float64 if compute_dtype == torch.float64 else torch.float32
+                Xc = X.to(dtype=complex_real_dtype)
+                pos_c = pos.to(dtype=complex_real_dtype)
+                z_imag = self._point_complex_imag_z_imag.to(dtype=complex_real_dtype)
+
+                dx = Xc[:, None, 0] - pos_c[None, :, 0]
+                dy = Xc[:, None, 1] - pos_c[None, :, 1]
+                dz = Xc[:, None, 2] - pos_c[None, :, 2]
+                dz_complex = torch.complex(dz, -z_imag.view(1, -1).expand_as(dz))
+                r2_complex = dx * dx + dy * dy + dz_complex * dz_complex
+                inv_r = 1.0 / torch.sqrt(r2_complex)
+                phi = -2.0 * inv_r.imag
                 phi = (K_E * phi).to(dtype=compute_dtype)
                 V = V + phi @ w
 

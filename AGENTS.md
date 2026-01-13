@@ -167,10 +167,30 @@ A healthy run typically has:
 * `fast_scored > 0` every generation
 * `verified_written > 0` at least once per short run and frequently in longer runs
 * `nonfinite_pred_fraction ≈ 0`
+* `fraction_dcim_candidates` not tiny (push runs should show substantial DCIM presence)
+* `fraction_complex_candidates` not tiny (push runs should show substantial complex-image presence)
+* `baseline_speed_backend_name` (or equivalent) present and meaningful
 
 If these are violated, treat it as an operational or algorithmic diagnosis task:
 
 * Do not guess. Use preflight counters + first offender snapshot.
+
+### 5.3 DCIM/complex push sanity (mandatory for layered pushes)
+
+Preflight must include:
+
+* `fraction_dcim_candidates`
+* `fraction_complex_candidates`
+* `dcim_block_count_hist`
+* `dcim_pole_count_hist`
+* `max_abs_imag_depth_hist`
+* `weight_magnitude_hist` (or `max_abs_weight_hist`)
+* `baseline_speed_backend_name` (or equivalent)
+
+Operational rule:
+
+* If `fraction_dcim_candidates < 0.30` OR `fraction_complex_candidates < 0.30` for >3 consecutive generations in a push run,
+  treat as misconfiguration/bug and stop to fix representation emission (do NOT “just run longer”).
 
 ---
 
@@ -189,6 +209,7 @@ For layered dielectric discovery targeting strict verifier A–D, configs should
 * `run.layered_stability_delta: 1e-2` (perturbation magnitude)
 * `solver.fast_column_normalize: true`
 * `run.allow_not_ready: true` (avoid early termination during exploration)
+* Confirm speed baseline is real and distinct (avoid baseline==candidate situations that force speedup≈1); record the baseline backend name in preflight.
 
 **Do not edit verifier thresholds to make passing easier.**
 
